@@ -57,6 +57,48 @@ else:
         pass
 
 
+def grow_l2_flush():
+    """Size ``do_bench``'s L2 flush so it masks the operator's host dispatch.
+
+    ``triton.testing.do_bench`` asks the driver for its flush buffer, and the
+    drivers in this build hardcode 256 MB.  That is a property of the *machine*,
+    not of the operator: on devices where the flush masks less host dispatch
+    than a kernel launch costs, the reading stops being kernel time and becomes
+    dispatch time (see tools/README.md).  The driver method is
+    the only seam -- ``do_bench`` takes no cache argument -- so the override
+    goes on the driver instance, guarded so repeated calls are free.
+
+    Restricted to the Hygon backend, because the value is calibrated there and
+    nowhere else.  On Hygon a 256 MB flush masks only ~150-200 us while a
+    ``LibEntry``-routed Triton op costs ~215 us of host dispatch, so the reading
+    is host time until the flush is grown past ~384 MB.  On the NVIDIA parts
+    measured, 256 MB already converges -- a flush sweep there lands on the same
+    reading for 256 / 512 MB -- so raising it would move every operator's
+    reported number and buy nothing.  On any other vendor neither the problem
+    nor the value has been established, and an uncalibrated change to a shared
+    measurement is worse than the status quo.
+
+    Within Hygon the two guards below still apply: a driver without the method
+    is left alone (which keeps the Ascend ``do_bench_npu`` path out of this
+    entirely), and the override is idempotent.
+    """
+    if vendor_name != "hygon":
+        return
+
+    from triton.runtime.driver import driver as triton_driver
+
+    driver = triton_driver.active
+    if not hasattr(driver, "get_empty_cache_for_benchmark"):
+        return
+    size = consts.DEFAULT_L2_FLUSH_MB * 1024 * 1024
+    if getattr(driver, "_flag_train_l2_flush_bytes", None) == size:
+        return
+    driver.get_empty_cache_for_benchmark = lambda: torch.empty(
+        size // 4, dtype=torch.int, device="cuda"
+    )
+    driver._flag_train_l2_flush_bytes = size
+
+
 def get_iter_count(fn):
     if Config.mode == consts.BenchMode.OPERATOR:
         torch_device_fn.synchronize()
@@ -319,6 +361,7 @@ class Benchmark:
                     # active=Config.repetition,
                 )
             else:
+                grow_l2_flush()
                 do_bench = triton.testing.do_bench
                 latency = do_bench(
                     fn,

@@ -128,6 +128,9 @@ DEFAULT_BENCHMARK_WARMUP_MS = 25
 DEFAULT_BENCHMARK_REP_MS = 100
 DEFAULT_BENCHMARK_RETRIES = 10
 
+# Bound on the per-kernel memo of LibEntry.key results.
+_KEY_CACHE_LIMIT = 4096
+
 
 def _infer_tensor_dtypes(values: Iterable[Any]) -> Tuple[Any, ...]:
     """Return dtypes of tensor kernel arguments in their argument order.
@@ -160,12 +163,56 @@ def _infer_tensor_dtypes(values: Iterable[Any]) -> Tuple[Any, ...]:
     return tuple(dtypes)
 
 
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:  # a Triton build without TMA descriptors
+    TensorDescriptor = ()
+
+try:
+    from triton import knobs as _triton_knobs
+except ImportError:  # pragma: no cover - Triton always ships knobs
+    _triton_knobs = None
+
+# Resolved lazily and then cached.  Importing the hcu backend once per tensor
+# argument per launch costs more than the kernel dispatch it decorates.
+_hygon_spec_resolved = False
+_hygon_spec_hook = None
+
+
+def _hygon_tensor_specialization():
+    """The hcu backend's per-tensor specialization hook, or None when absent.
+
+    Only Hygon installs consult it.  The lookup walks an import and a
+    ``getattr`` on a class that never changes, so it is worth resolving once.
+    """
+    global _hygon_spec_resolved, _hygon_spec_hook
+    if not _hygon_spec_resolved:
+        _hygon_spec_resolved = True
+        if device.vendor_name == "hygon" and hasattr(triton.backends, "hcu"):
+            try:
+                from triton.backends.hcu.compiler import HIPBackend
+            except ImportError:
+                pass
+            else:
+                hook = getattr(HIPBackend, "get_tensor_specialization", None)
+                if callable(hook):
+                    _hygon_spec_hook = hook
+    return _hygon_spec_hook
+
+
+def _hygon_use_buffer_ops():
+    """Whether the hcu backend may assume 32-bit pointer ranges.
+
+    Part of the specialization identity, so it belongs in the cache signature;
+    read once per launch instead of once per tensor argument.
+    """
+    if _hygon_tensor_specialization() is None or _triton_knobs is None:
+        return False
+    return bool(_triton_knobs.hcu.use_buffer_ops)
+
+
 def _descriptor_cache_key(arg):
     """Normalize descriptors for both positional and keyword dispatch keys."""
-    try:
-        from triton.tools.tensor_descriptor import TensorDescriptor
-    except ImportError:
-        return arg
     if not isinstance(arg, TensorDescriptor):
         return arg
     return (
@@ -175,6 +222,34 @@ def _descriptor_cache_key(arg):
         tuple(arg.block_shape),
         getattr(arg, "padding", None),
     )
+
+
+def _spec_arg(arg, divisibility):
+    """Specialization identity of one kernel argument.
+
+    Tensors reduce to their dtype, alignment and the backend's own
+    specialization string; everything else to its type and value.
+    """
+    if hasattr(arg, "data_ptr"):
+        aligned = arg.data_ptr() % divisibility == 0
+        hook = _hygon_tensor_specialization()
+        if hook is not None:
+            return (arg.dtype, aligned, hook(arg))
+        return (arg.dtype, aligned)
+    return (type(arg), arg)
+
+
+def _dns_arg(arg):
+    """Identity of a ``do_not_specialize`` argument: dtype or integer width."""
+    if hasattr(arg, "data_ptr"):
+        return arg.dtype
+    if not isinstance(arg, int):
+        return type(arg)
+    if -(2**31) <= arg and arg <= 2**31 - 1:
+        return "i32"
+    if 2**63 <= arg and arg <= 2**64 - 1:
+        return "u64"
+    return "i64"
 
 
 class Cache(object):
@@ -1361,6 +1436,7 @@ class LibEntry(triton.KernelInterface):
         self.kernel_cache = tuple(dict() for _ in range(DEVICE_COUNT))
         self._has_flagtune_tuner = self._contains_flagtune_tuner(fn)
         self._cpu_cache = dict()
+        self._key_cache = dict()
 
         while not isinstance(fn, triton.runtime.JITFunction):
             fn = fn.fn
@@ -1415,43 +1491,55 @@ class LibEntry(triton.KernelInterface):
                 cache.clear()
             self._cpu_cache.clear()
 
+    def _spec_signature(self, spec_args):
+        """The inputs ``_spec_arg`` reads, gathered without calling the backend.
+
+        A tensor contributes its dtype, its address and the extent of the
+        allocation it points into.  Two live tensors sharing an address share an
+        allocation, so equal signatures imply equal specializations -- including
+        the "D"/"S" attributes the hcu backend derives from the pointer and the
+        storage size.  ``use_buffer_ops`` is read once here rather than per
+        argument because it is part of that backend's answer.
+        """
+        signature = []
+        for arg in spec_args:
+            arg = _descriptor_cache_key(arg)
+            if hasattr(arg, "data_ptr"):
+                signature.append(
+                    (arg.dtype, arg.data_ptr(), arg.untyped_storage().size())
+                )
+            else:
+                signature.append((type(arg), arg))
+        signature.append(_hygon_use_buffer_ops())
+        return tuple(signature)
+
     def key(self, spec_args, dns_args, const_args):
-        def spec_arg(arg):
-            if hasattr(arg, "data_ptr"):
-                if device.vendor_name == "hygon" and hasattr(triton.backends, "hcu"):
-                    try:
-                        from triton.backends.hcu.compiler import HIPBackend
-                    except ImportError:
-                        tensor_spec = None
-                    else:
-                        tensor_spec = getattr(
-                            HIPBackend, "get_tensor_specialization", None
-                        )
-                    if callable(tensor_spec):
-                        return (
-                            arg.dtype,
-                            arg.data_ptr() % self.divisibility == 0,
-                            tensor_spec(arg),
-                        )
-                return (arg.dtype, arg.data_ptr() % self.divisibility == 0)
-            return (type(arg), arg)
-
-        def dns_arg(arg):
-            if hasattr(arg, "data_ptr"):
-                return arg.dtype
-            if not isinstance(arg, int):
-                return type(arg)
-            if -(2**31) <= arg and arg <= 2**31 - 1:
-                return "i32"
-            if 2**63 <= arg and arg <= 2**64 - 1:
-                return "u64"
-            return "i64"
-
-        spec_key = [spec_arg(_descriptor_cache_key(arg)) for arg in spec_args]
-        dns_key = [dns_arg(_descriptor_cache_key(arg)) for arg in dns_args]
+        dns_key = tuple(_dns_arg(_descriptor_cache_key(arg)) for arg in dns_args)
         # const args passed by position
-        const_key = [_descriptor_cache_key(arg) for arg in const_args]
-        return tuple(spec_key + dns_key + const_key)
+        const_key = tuple(_descriptor_cache_key(arg) for arg in const_args)
+
+        # Rebuilding the key from scratch is most of the optimizer step's host
+        # time on a Hygon DCU.  The signature is cheap, and by construction of
+        # _spec_signature it determines the key exactly, so a hit can skip the
+        # backend specialization calls entirely.
+        cache = self._key_cache
+        signature = (self._spec_signature(spec_args), dns_key, const_key)
+        entry_key = cache.get(signature)
+        if entry_key is None:
+            entry_key = (
+                tuple(
+                    _spec_arg(_descriptor_cache_key(arg), self.divisibility)
+                    for arg in spec_args
+                )
+                + dns_key
+                + const_key
+            )
+            if len(cache) >= _KEY_CACHE_LIMIT:
+                # A training step reuses one set of tensors; unbounded growth
+                # would only come from callers cycling through shapes.
+                cache.clear()
+            cache[signature] = entry_key
+        return entry_key
 
     def run(self, *args, **kwargs):
         grid = kwargs["grid"]

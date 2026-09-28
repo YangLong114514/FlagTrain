@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import itertools
+import os
 from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from typing import List, Optional, Tuple
@@ -50,6 +51,16 @@ FP8_DTYPES = [get_fp8_dtype()]
 
 DEFAULT_WARMUP_TIME = 1000
 DEFAULT_ITER_TIME = 100
+
+# Size of the L2 flush ``triton.testing.do_bench`` runs before each timed
+# iteration.  The flush is what keeps one iteration's data out of the next one's
+# cache, but it is also what hides host-side dispatch: the timed window is a
+# GPU-stream interval, so dispatch that outlives the flush shows up as GPU idle
+# time inside it.  The driver hardcodes 256 MB, which on some devices masks only
+# ~140-200us -- less than a Triton op launched through ``LibEntry`` costs on the
+# host -- and the reading then reports dispatch, not kernel time.  Readings
+# converge once the flush is grown past ~384 MB.  See tools/README.md.
+DEFAULT_L2_FLUSH_MB = int(os.environ.get("FLAG_TRAIN_L2_FLUSH_MB", "384"))
 
 # LEGACY_SHAPES are maintained for legacy benchmark SIZE settings and may be removed in the future.
 # Do not reference this elsewhere.

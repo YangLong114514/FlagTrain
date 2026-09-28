@@ -39,17 +39,32 @@ def lamb_part1_kernel(
     b2,
     eps,
     decay,
-    w_l2_i_ptr,
-    u_l2_i_ptr,
+    max_coeff,
+    min_coeff,
+    norms_ptr,
+    counter_ptr,
+    lamb_coeff_ptr,
     mode: tl.constexpr,
+    REDUCE_BLOCK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Adam moment update plus per-program partial reduction of ||w||^2 and ||u||^2.
+    """Adam moment update, partial norm reduction and the trust ratio.
 
-    Mirrors ``lamb_cuda_kernel_part1`` in DeepSpeed: update the first/second
-    moments, build the Adam update vector ``update = m/denom + decay*w``, then
-    reduce the squared weight/update norms inside this program and emit one
-    pair of partial sums per program.
+    Mirrors ``lamb_cuda_kernel_part1`` and ``lamb_cuda_kernel_part2`` in
+    DeepSpeed: update the first/second moments, build the Adam update vector
+    ``update = m/denom + decay*w``, reduce the squared weight/update norms
+    inside this program, and emit one pair of partial sums per program.
+
+    DeepSpeed then launches a second kernel to fold those partials, because no
+    program can see another's result without one.  Here the arrival counter
+    supplies that ordering inside this kernel instead, which removes a launch
+    from the critical path of a step this small.  The program that completes the
+    count folds the partials, publishes the trust ratio, and resets the counter
+    so the scratch is ready for the next step.
+
+    ``acq_rel`` on the arrival makes each program's partial stores visible to
+    the one that completes the count, and that program's trust ratio visible to
+    the part 3 launch that follows on the stream.
     """
     pid = tle.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -78,35 +93,34 @@ def lamb_part1_kernel(
     reg_w = tl.sum(p * p)
     reg_u = tl.sum(update * update)
 
-    tl.store(w_l2_i_ptr + pid, reg_w)
-    tl.store(u_l2_i_ptr + pid, reg_u)
+    num_blocks = tle.num_programs(0)
+    tl.store(norms_ptr + pid, reg_w)
+    tl.store(norms_ptr + num_blocks + pid, reg_u)
 
+    if tl.atomic_add(counter_ptr, 1, sem="acq_rel") == num_blocks - 1:
+        red_offsets = tl.arange(0, REDUCE_BLOCK)
+        w_partial = tl.zeros((REDUCE_BLOCK,), dtype=tl.float32)
+        u_partial = tl.zeros((REDUCE_BLOCK,), dtype=tl.float32)
 
-@libentry()
-@triton.jit
-def lamb_part2_kernel(
-    num_blocks,
-    w_l2_i_ptr,
-    u_l2_i_ptr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Reduce the per-program partial norms down to a single scalar each.
+        for start in range(0, num_blocks, REDUCE_BLOCK):
+            idx = start + red_offsets
+            in_range = idx < num_blocks
+            w_partial += tl.load(norms_ptr + idx, mask=in_range, other=0.0)
+            u_partial += tl.load(norms_ptr + num_blocks + idx, mask=in_range, other=0.0)
 
-    Mirrors ``lamb_cuda_kernel_part2`` in DeepSpeed: a single program sums the
-    ``num_blocks`` partial sums and stores the result back at index 0.
-    """
-    offsets = tl.arange(0, BLOCK_SIZE)
-    w_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    u_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-
-    for start in range(0, num_blocks, BLOCK_SIZE):
-        idx = start + offsets
-        mask = idx < num_blocks
-        w_acc += tl.load(w_l2_i_ptr + idx, mask=mask, other=0.0)
-        u_acc += tl.load(u_l2_i_ptr + idx, mask=mask, other=0.0)
-
-    tl.store(w_l2_i_ptr, tl.sum(w_acc))
-    tl.store(u_l2_i_ptr, tl.sum(u_acc))
+        w_norm = tl.sqrt(tl.sum(w_partial))
+        u_norm = tl.sqrt(tl.sum(u_partial))
+        # Guard the division so a zero norm yields coeff == 1.0 (DeepSpeed leaves
+        # it unclamped in that case); tl.where evaluates both sides, so keep the
+        # denominator finite even when u_norm == 0.
+        u_denom = tl.where(u_norm == 0.0, 1.0, u_norm)
+        trust = w_norm / u_denom
+        trust = tl.minimum(tl.maximum(trust, min_coeff), max_coeff)
+        tl.store(
+            lamb_coeff_ptr,
+            tl.where((w_norm == 0.0) | (u_norm == 0.0), 1.0, trust),
+        )
+        tl.store(counter_ptr, 0)
 
 
 @libentry()
@@ -117,40 +131,25 @@ def lamb_part3_kernel(
     m_ptr,
     v_ptr,
     n,
-    max_coeff,
-    min_coeff,
     eps,
     step_size,
     decay,
-    w_l2_i_ptr,
-    u_l2_i_ptr,
     lamb_coeff_ptr,
     mode: tl.constexpr,
     HAS_P_COPY: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Compute the layer-wise trust ratio and apply the parameter update.
+    """Apply the parameter update scaled by the layer-wise trust ratio.
 
     Mirrors ``lamb_cuda_kernel_part3`` in DeepSpeed: ``trust = ||w|| / ||u||``
     (1.0 when either norm is zero), clamped to ``[min_coeff, max_coeff]``, then
     ``p = p - step_size * trust * update`` with ``update`` recomputed from the
-    already-updated moments.
+    already-updated moments.  The ratio itself is already folded over every
+    program by part 1, so this kernel only reads it.
     """
-    reg_w = tl.sqrt(tl.load(w_l2_i_ptr))
-    reg_u = tl.sqrt(tl.load(u_l2_i_ptr))
-
-    # Guard the division so a zero norm yields coeff == 1.0 (DeepSpeed leaves it
-    # unclamped in that case); tl.where evaluates both sides, so keep the
-    # denominator finite even when reg_u == 0.
-    denom = tl.where(reg_u == 0.0, 1.0, reg_u)
-    ratio = reg_w / denom
-    ratio = tl.minimum(tl.maximum(ratio, min_coeff), max_coeff)
-    lamb_coeff = tl.where((reg_w == 0.0) | (reg_u == 0.0), 1.0, ratio)
+    lamb_coeff = tl.load(lamb_coeff_ptr)
 
     pid = tle.program_id(0)
-    if pid == 0:
-        tl.store(lamb_coeff_ptr, lamb_coeff)
-
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n
 
@@ -216,7 +215,8 @@ def lamb(
         decay (float): weight decay added to the update vector.
 
     Returns:
-        Tensor: the per-layer trust ratio as a one-element fp32 tensor.
+        Tensor: the per-layer trust ratio as a one-element fp32 tensor. It is
+            allocated per call, so the caller may keep it.
     """
     logger.debug("TRAIN LAMB")
 
@@ -250,12 +250,21 @@ def lamb(
     BLOCK_SIZE = min(BLOCK_SIZE, 1024)
     num_blocks = triton.cdiv(n, BLOCK_SIZE)
 
-    w_l2_i = torch.empty((num_blocks,), dtype=torch.float32, device=p.device)
-    u_l2_i = torch.empty((num_blocks,), dtype=torch.float32, device=p.device)
+    # Reduction workspace, allocated per call.  A module-level pool keyed by
+    # (device, num_blocks) has no natural bound, so a caller cycling through
+    # element counts would grow it without limit; these three small allocations
+    # are the whole cost of not keeping one.  ``counter`` is the only buffer that
+    # must start at zero, and being the only zeroed one is why it costs a memset.
+    norms = torch.empty((2 * num_blocks,), dtype=torch.float32, device=p.device)
+    counter = torch.zeros((1,), dtype=torch.int32, device=p.device)
     lamb_coeff_val = torch.empty((1,), dtype=torch.float32, device=p.device)
+    reduce_block = min(max(triton.next_power_of_2(num_blocks), 32), 2048)
 
+    # ``p_copy_ptr`` is only dereferenced when HAS_P_COPY is true, so when the
+    # copy is not requested the parameter doubles as a stand-in pointer and no
+    # dummy tensor is allocated.
     has_p_copy = p_copy.numel() > 0
-    p_copy_in = p_copy if has_p_copy else torch.empty((0,), device=p.device)
+    p_copy_in = p_copy if has_p_copy else p
 
     with torch_device_fn.device(p.device):
         lamb_part1_kernel[(num_blocks,)](
@@ -269,18 +278,14 @@ def lamb(
             beta2,
             eps,
             decay,
-            w_l2_i,
-            u_l2_i,
+            max_coeff,
+            min_coeff,
+            norms,
+            counter,
+            lamb_coeff_val,
             mode=mode,
+            REDUCE_BLOCK=reduce_block,
             BLOCK_SIZE=BLOCK_SIZE,
-        )
-
-        reduce_block = min(max(triton.next_power_of_2(num_blocks), 32), 2048)
-        lamb_part2_kernel[(1,)](
-            num_blocks,
-            w_l2_i,
-            u_l2_i,
-            BLOCK_SIZE=reduce_block,
         )
 
         lamb_part3_kernel[(num_blocks,)](
@@ -289,13 +294,9 @@ def lamb(
             m,
             v,
             n,
-            max_coeff,
-            min_coeff,
             eps,
             step_size,
             decay,
-            w_l2_i,
-            u_l2_i,
             lamb_coeff_val,
             mode=mode,
             HAS_P_COPY=has_p_copy,
