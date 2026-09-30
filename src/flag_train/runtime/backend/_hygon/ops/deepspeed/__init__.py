@@ -11,20 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Hygon ``deepspeed`` operators.
 
-from backend_utils import VendorDescriptor  # noqa: E402
+Mirrors ``flag_train.deepspeed``: a specialised operator goes in the same-named
+module here as the generic one it replaces -- ``deepspeed/blocked_flash.py`` beside
+``flag_train/deepspeed/blocked_flash.py`` -- so which generic module an override
+belongs to is readable from the path.
 
-vendor_info = VendorDescriptor(
-    vendor_name="hygon",
-    device_name="cuda",
-    device_query_cmd="hy-smi",
-    triton_extra_name="hip",
-    tle_enabled=True,
-)
+Re-export the operator here, and then from ``ops/__init__.py``, which is the module
+``SpecOpRegistrar`` reads.
+"""
 
-CUSTOMIZED_UNUSED_OPS = ()
+from .blocked_flash import blocked_flash
 
-# Specialised operators live in ``ops/`` and are written over the generic ones by
-# ``SpecOpRegistrar`` when ``flag_train.deepspeed`` is imported. See ``ops/__init__.py``.
-
-__all__ = ["*"]
+__all__ = ["blocked_flash"]

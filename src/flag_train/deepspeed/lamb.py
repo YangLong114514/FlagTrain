@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-import flag_train
+from flag_train.runtime import device as runtime_device
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
@@ -226,8 +226,8 @@ def lamb(
     # tensor still has to be rejected: the kernels would be launched against
     # memory the accelerator cannot see.
     assert (
-        p.device.type == flag_train.device
-    ), f"lamb only supports {flag_train.device} tensors"
+        p.device.type == runtime_device.name
+    ), f"lamb only supports {runtime_device.name} tensors"
 
     n = p.numel()
     assert m.numel() == n and v.numel() == n and g.numel() == n

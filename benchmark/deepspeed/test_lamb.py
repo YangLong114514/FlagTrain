@@ -33,6 +33,7 @@ import pytest
 import torch
 
 import flag_train
+from flag_train.deepspeed import lamb
 
 from .. import base
 
@@ -220,7 +221,7 @@ def torch_op(p, p_copy, m, v, g):
 
 def train_op(p, p_copy, m, v, g):
     """The operator under test."""
-    return _call(flag_train.lamb, p, p_copy, m, v, g)
+    return _call(lamb, p, p_copy, m, v, g)
 
 
 @pytest.mark.lamb

@@ -17,6 +17,9 @@ Two oracles, because they fail differently:
 
 * ``lamb_ref`` -- a plain-torch composition of the same contract. It is the
   primary check and runs on any device, so the operator is testable off NVIDIA.
+  Under ``--ref cpu`` it is fed CPU operands and genuinely executes there, which
+  makes it an independent oracle rather than a second reading of the same device
+  arithmetic; see ``_reference_copy``.
 * DeepSpeed's ``fused_lamb`` -- the operator this implementation ports. It is an
   independent implementation and its version is recorded in
   ``_DEEPSPEED_VERSION``, as tests/deepspeed/README.md asks for, but it needs the
@@ -37,6 +40,7 @@ import pytest
 import torch
 
 import flag_train
+from flag_train.deepspeed import lamb
 
 from .. import accuracy_utils as utils
 
@@ -59,6 +63,24 @@ _DECAY = 0.01
 # ``deepspeed`` package and a CUDA device, so without a torch reference the
 # operator would be untestable off NVIDIA.
 # ---------------------------------------------------------------------------
+
+
+def _reference_copy(tensor):
+    """An independent copy of ``tensor``, on the device the reference must use.
+
+    ``--ref cpu`` pushes the reference *computation* onto the CPU, not merely its
+    result, so every operand ``lamb_ref`` is handed comes from here and no kernel
+    of the reference runs on the accelerator. That is what makes it an
+    independent oracle -- a reference evaluated by the same device arithmetic it
+    is checking can only confirm the arithmetic agrees with itself.
+    ``lamb_ref`` checks this rather than trusting it; the comparison helpers move
+    the operator's own output across afterwards.
+
+    ``lamb_ref`` steps its parameters in place, so the copy is not optional: on a
+    non-CPU reference ``to_reference`` returns its argument unchanged, and the
+    reference would then corrupt the operator's operands.
+    """
+    return utils.to_reference(tensor).clone()
 
 
 def lamb_ref(
@@ -85,6 +107,17 @@ def lamb_ref(
     operator's contract including the order of operations, since the two are
     compared bit-for-bit-ish rather than through a fuzzy formula.
     """
+    if utils.TO_CPU:
+        # ``--ref cpu`` promises the reference *computation* is on the CPU, not
+        # only its result. Asserting the precondition here rather than at the
+        # call sites means a test that forgets ``_reference_copy`` fails loudly
+        # instead of quietly becoming a second reading of the device arithmetic.
+        for name, operand in (("p", p), ("g", g), ("m", m), ("v", v)):
+            assert operand.device.type == "cpu", (
+                f"--ref cpu must run the reference on the CPU; {name} is on "
+                f"{operand.device}"
+            )
+
     p_old = p.clone()
     scaled_grad = g / grad_scale
     m_new = beta1 * m + (1 - beta1) * scaled_grad
@@ -166,9 +199,14 @@ requires_deepspeed_reference = pytest.mark.skipif(
 )
 
 
-def _no_p_copy(dtype):
-    """The empty placeholder that tells every implementation to skip the copy."""
-    return torch.empty((0,), dtype=dtype, device=flag_train.device)
+def _no_p_copy(dtype, device):
+    """The empty placeholder that tells every implementation to skip the copy.
+
+    It takes the parameter's device rather than the backend's, because under
+    ``--ref cpu`` the operator runs on the backend while the reference runs on
+    the CPU, and each is handed the placeholder built for its own operands.
+    """
+    return torch.empty((0,), dtype=dtype, device=device)
 
 
 def _step(
@@ -180,7 +218,7 @@ def _step(
     trust ratio, so callers pass tensors they own.
     """
     if p_copy is None:
-        p_copy = _no_p_copy(param.dtype)
+        p_copy = _no_p_copy(param.dtype, param.device)
     return op(
         param,
         p_copy,
@@ -243,10 +281,12 @@ def test_lamb(shape, mode, bias_correction):
 
     # Every implementation steps in place, so each runs on its own copies.
     train = [p.clone(), m.clone(), v.clone()]
-    train_coeff = _step(flag_train.lamb, *train, g, 1, mode, bias_correction)
+    train_coeff = _step(lamb, *train, g, 1, mode, bias_correction)
 
-    torch_ref = [p.clone(), m.clone(), v.clone()]
-    torch_coeff = _step(lamb_ref, *torch_ref, g, 1, mode, bias_correction)
+    torch_ref = [_reference_copy(p), _reference_copy(m), _reference_copy(v)]
+    torch_coeff = _step(
+        lamb_ref, *torch_ref, _reference_copy(g), 1, mode, bias_correction
+    )
     _assert_step_matches(train_coeff, *train, torch_coeff, *torch_ref, dtype)
 
     if _deepspeed_lamb is not None:
@@ -274,12 +314,26 @@ def test_lamb_p_copy(shape):
     m = torch.zeros(shape, dtype=dtype, device=flag_train.device)
     v = torch.zeros(shape, dtype=dtype, device=flag_train.device)
 
-    torch_p, torch_m, torch_v = p.clone(), m.clone(), v.clone()
-    torch_copy = torch.empty(shape, dtype=dtype, device=flag_train.device)
-    _step(lamb_ref, torch_p, torch_m, torch_v, g, 1, 1, 1, p_copy=torch_copy)
+    torch_p, torch_m, torch_v = (
+        _reference_copy(p),
+        _reference_copy(m),
+        _reference_copy(v),
+    )
+    torch_copy = torch.empty_like(torch_p)
+    _step(
+        lamb_ref,
+        torch_p,
+        torch_m,
+        torch_v,
+        _reference_copy(g),
+        1,
+        1,
+        1,
+        p_copy=torch_copy,
+    )
 
-    p_copy = torch.empty(shape, dtype=dtype, device=flag_train.device)
-    _step(flag_train.lamb, p, m, v, g, 1, 1, 1, p_copy=p_copy)
+    p_copy = torch.empty_like(p)
+    _step(lamb, p, m, v, g, 1, 1, 1, p_copy=p_copy)
 
     utils.train_assert_close(
         utils.to_reference(p_copy), utils.to_reference(torch_copy), dtype
@@ -306,11 +360,13 @@ def test_lamb_matches_reference(mode, bias_correction):
     train_params = [
         torch.randn(1024, dtype=dtype, device=flag_train.device) for _ in range(3)
     ]
-    ref_params = [p.clone() for p in train_params]
+    # Same values as the operator's operands -- ``to_reference`` copies rather
+    # than converts -- but on whichever device the reference is meant to run.
+    ref_params = [_reference_copy(p) for p in train_params]
     train_m = [torch.zeros_like(p) for p in train_params]
-    ref_m = [torch.zeros_like(p) for p in train_params]
+    ref_m = [torch.zeros_like(p) for p in ref_params]
     train_v = [torch.zeros_like(p) for p in train_params]
-    ref_v = [torch.zeros_like(p) for p in train_params]
+    ref_v = [torch.zeros_like(p) for p in ref_params]
 
     for step in range(1, 6):
         for i in range(len(train_params)):
@@ -321,13 +377,13 @@ def test_lamb_matches_reference(mode, bias_correction):
                 ref_params[i],
                 ref_m[i],
                 ref_v[i],
-                grad,
+                _reference_copy(grad),
                 step,
                 mode,
                 bias_correction,
             )
             _step(
-                flag_train.lamb,
+                lamb,
                 train_params[i],
                 train_m[i],
                 train_v[i],
@@ -368,7 +424,7 @@ def test_matches_deepspeed_oracle(mode, shape):
     v = torch.zeros(shape, dtype=dtype, device=flag_train.device)
 
     train = [p.clone(), m.clone(), v.clone()]
-    train_coeff = _step(flag_train.lamb, *train, g, 1, mode, 1)
+    train_coeff = _step(lamb, *train, g, 1, mode, 1)
 
     deepspeed = [p.clone(), m.clone(), v.clone()]
     deepspeed_coeff = _step(_deepspeed_lamb, *deepspeed, g, 1, mode, 1)
