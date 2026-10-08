@@ -9,6 +9,7 @@ from .lamb import lamb
 from .mixed_moe_gemm import mixed_moe_gemm
 from .packbits import packbits
 from .unpackbits import unpackbits
+from .wf6af16_linear import pack_weights_fp6, quantize_weights_fp6, wf6af16_linear
 
 __all__ = [
     "blocked_flash",
@@ -17,6 +18,9 @@ __all__ = [
     "mixed_moe_gemm",
     "packbits",
     "unpackbits",
+    "pack_weights_fp6",
+    "quantize_weights_fp6",
+    "wf6af16_linear",
 ]
 
 
