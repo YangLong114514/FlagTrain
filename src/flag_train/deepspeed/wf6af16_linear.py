@@ -136,7 +136,36 @@ def pack_weights_fp6(codes):
     return weights_2bit.contiguous(), weights_4bit.contiguous()
 
 
+def _gemm_configs():
+    """Autotune candidates for the GEMM kernel.
+
+    Small-``BLOCK_N`` entries serve the decode shapes (few tokens, where the
+    kernel is bandwidth-bound on the packed weights); the large tiles with
+    deeper pipelining serve the compute-bound prefill shapes.
+    """
+    configs = []
+    for block_m, block_n, block_k, warps, stages in [
+        (64, 16, 64, 4, 4),
+        (64, 32, 64, 4, 4),
+        (64, 64, 64, 4, 4),
+        (128, 64, 64, 4, 3),
+        (64, 128, 64, 4, 4),
+        (128, 128, 32, 8, 3),
+        (128, 128, 64, 8, 3),
+        (128, 256, 32, 8, 3),
+    ]:
+        configs.append(
+            triton.Config(
+                {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k},
+                num_warps=warps,
+                num_stages=stages,
+            )
+        )
+    return configs
+
+
 @libentry()
+@triton.autotune(configs=_gemm_configs(), key=["M", "N", "K", "split_k"])
 @triton.jit
 def wf6af16_linear_kernel(
     out_ptr,
@@ -173,7 +202,7 @@ def wf6af16_linear_kernel(
     m_mask = offs_m < M
     n_mask = offs_n < N
 
-    k_per_split = tl.cdiv(K, split_k)
+    k_per_split = K // split_k  # the wrapper guarantees split_k divides K
     k_start = pid_k * k_per_split
     k_end = tl.minimum(k_start + k_per_split, K)
 
@@ -188,23 +217,31 @@ def wf6af16_linear_kernel(
             other=0.0,
         )
 
-        # Unpack the 6-bit codes: the 2-bit slice holds the top 2 bits of the
-        # code (4 codes per byte), the 4-bit slice the low 4 bits (2 per byte).
-        # Masked lanes read nothing, so out-of-range byte offsets are never
-        # dereferenced even though k // 4 / k // 2 keep shrinking.
-        w2_bytes = tl.load(
-            w2_ptr + offs_m[:, None] * (K // 4) + (offs_k // 4)[None, :],
-            mask=m_mask[:, None] & k_mask[None, :],
+        # Unpack the 6-bit codes with compact byte loads: the 2-bit slice is
+        # read BLOCK_K//4 bytes per row (top-2 bits of 4 consecutive codes per
+        # byte, at bit offsets 6, 4, 2, 0) and the 4-bit slice BLOCK_K//2
+        # bytes per row (low-4 bits of 2 consecutive codes, at offsets 4, 0);
+        # tl.interleave then restores the column order. Garbage codes from
+        # tail bytes beyond k_end are harmless: the activation is zero there,
+        # so the dot product cancels them.
+        offs_b2 = k0 // 4 + tl.arange(0, BLOCK_K // 4)
+        b2 = tl.load(
+            w2_ptr + offs_m[:, None] * (K // 4) + offs_b2[None, :],
+            mask=m_mask[:, None] & (offs_b2[None, :] * 4 < k_end),
             other=0,
         ).to(tl.int32)
-        top2 = (w2_bytes >> (6 - 2 * (offs_k % 4))[None, :]) & 0x3
+        top2 = tl.interleave(
+            tl.interleave((b2 >> 6) & 0x3, (b2 >> 2) & 0x3),
+            tl.interleave((b2 >> 4) & 0x3, b2 & 0x3),
+        )
 
-        w4_bytes = tl.load(
-            w4_ptr + offs_m[:, None] * (K // 2) + (offs_k // 2)[None, :],
-            mask=m_mask[:, None] & k_mask[None, :],
+        offs_b4 = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+        b4 = tl.load(
+            w4_ptr + offs_m[:, None] * (K // 2) + offs_b4[None, :],
+            mask=m_mask[:, None] & (offs_b4[None, :] * 2 < k_end),
             other=0,
         ).to(tl.int32)
-        low4 = (w4_bytes >> (4 - 4 * (offs_k % 2))[None, :]) & 0xF
+        low4 = tl.interleave((b4 >> 4) & 0xF, b4 & 0xF)
 
         code = (top2 << 4) | low4
 
@@ -404,14 +441,14 @@ _SPLIT_K_MAP = [
 def _pick_split_k(tokens, out_channels, in_channels):
     """Choose split-K the way DeepSpeed does, falling back to 1.
 
-    The profiled map is consulted for small token counts; a candidate that
-    does not divide ``K`` evenly is rejected because each slice must cover the
-    same number of columns.
+    The profiled map is consulted for small token counts; a candidate whose
+    slices are not 4-column aligned is rejected because the kernel unpacks
+    four codes per byte and each slice must start on a byte boundary.
     """
     split_k = -1
     if tokens <= 768:
         split_k = _SPLIT_K_MAP[(tokens - 1) // 64].get(out_channels, -1)
-    if split_k <= 1 or in_channels % split_k != 0:
+    if split_k <= 1 or in_channels % (split_k * 4) != 0:
         return 1
     return split_k
 
@@ -471,14 +508,21 @@ def wf6af16_linear(
 
     if split_k is None:
         split_k = _pick_split_k(tokens, out_channels, in_channels)
+    elif in_channels % (split_k * 4) != 0:
+        # Each slice must start on a byte boundary (4 codes per byte).
+        logger.debug(
+            "wf6af16_linear: split_k=%d misaligns K=%d slices, using split_k=1",
+            split_k,
+            in_channels,
+        )
+        split_k = 1
 
-    BLOCK_M = 64
-    BLOCK_N = min(max(triton.next_power_of_2(tokens), 16), 64)
-    BLOCK_K = 64
-
-    grid = (
-        triton.cdiv(out_channels, BLOCK_M) * triton.cdiv(tokens, BLOCK_N) * split_k,
-    )
+    def grid(meta):
+        return (
+            triton.cdiv(out_channels, meta["BLOCK_M"])
+            * triton.cdiv(tokens, meta["BLOCK_N"])
+            * split_k,
+        )
 
     with torch_device_fn.device(hidden_states.device):
         if split_k == 1:
@@ -492,9 +536,6 @@ def wf6af16_linear(
                 tokens,
                 in_channels,
                 split_k,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                BLOCK_K=BLOCK_K,
                 SPLIT_K_MODE=False,
             )
         else:
@@ -513,9 +554,6 @@ def wf6af16_linear(
                 tokens,
                 in_channels,
                 split_k,
-                BLOCK_M=BLOCK_M,
-                BLOCK_N=BLOCK_N,
-                BLOCK_K=BLOCK_K,
                 SPLIT_K_MODE=True,
             )
             total = tokens * out_channels
