@@ -46,6 +46,7 @@ import triton
 import triton.language as tl
 
 import flag_train
+from flag_train import runtime
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
@@ -81,8 +82,35 @@ def _gemm_configs():
     return configs
 
 
+def _gemm_do_bench():
+    """Autotune bench function that skips configs exceeding platform limits.
+
+    MetaX's driver limits per-thread private memory (4 KB by default) and
+    rejects over-limit kernels at launch time with a plain ``RuntimeError``,
+    which the stock autotuner does not treat as "skip this config", so one
+    over-limit config would abort the whole tuning run. Report such configs
+    as infinitely slow instead. Other vendors keep the default benchmarker.
+    """
+    if runtime.device.vendor_name != "metax":
+        return None
+    bench = triton.runtime.driver.active.get_benchmarker()
+
+    def do_bench(kernel_call, quantiles):
+        try:
+            return bench(kernel_call, quantiles=quantiles)
+        except RuntimeError as e:
+            logger.debug("wf6af16_linear autotune: skipping config: %s", e)
+            return [float("inf"), float("inf"), float("inf")]
+
+    return do_bench
+
+
 @libentry()
-@triton.autotune(configs=_gemm_configs(), key=["M", "N", "K", "split_k"])
+@triton.autotune(
+    configs=_gemm_configs(),
+    key=["M", "N", "K", "split_k"],
+    do_bench=_gemm_do_bench(),
+)
 @triton.jit
 def wf6af16_linear_kernel(
     out_ptr,
