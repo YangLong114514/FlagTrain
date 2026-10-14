@@ -40,7 +40,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.deepspeed import wf6af16_linear
 
 from .. import accuracy_utils as utils
 
@@ -279,7 +278,7 @@ def _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=None):
     output = torch.empty(
         (tokens, out_channels), dtype=torch.float16, device=hidden.device
     )
-    return wf6af16_linear(
+    return flag_train.deepspeed.wf6af16_linear(
         output,
         hidden,
         weights_2bit,
