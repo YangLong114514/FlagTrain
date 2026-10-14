@@ -22,13 +22,17 @@ the top 2 bits of each 6-bit code (sign + highest exponent bit) live in
 ``weights_2bit``, the low 4 bits in ``weights_4bit``. The byte-level layout
 here is FlagTrain's own -- DeepSpeed interleaves bits across 32 threads to
 feed MMA fragments, which buys nothing in a Triton kernel -- so packed tensors
-must come from :func:`pack_weights_fp6`, not from DeepSpeed's
-``preprocess_weight``. Packing order is row-major and dense:
+must *not* come from DeepSpeed's ``preprocess_weight``. Packing order is
+row-major and dense:
 
 * ``weights_2bit[m, j]``: codes of columns ``4j..4j+3``, top-2 bits of column
   ``4j+i`` at bit positions ``6-2i``.
 * ``weights_4bit[m, j]``: codes of columns ``2j..2j+1``, low-4 bits of column
   ``2j+i`` at bit positions ``4-4i``.
+
+This module only carries the compute kernel; quantizing weights and packing
+them into this layout is input preparation, and reference helpers for it live
+with the tests (``tests/deepspeed/test_wf6af16_linear.py``).
 
 Dequantization mirrors the CUDA kernel bit-for-bit at the value level:
 ``code -> sign * 2^(e-3) * (1 + m/4)`` (with the ``e == 0`` subnormal branch
@@ -47,93 +51,6 @@ from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
-
-# FP6-E3M2, exponent bias 3, exponent 7 is a normal value (no inf/NaN), so the
-# largest magnitude is 2^4 * 1.75 = 28 and the smallest non-zero one is 2^-4.
-_FP6_ABS_MAX = 28.0
-
-
-def _fp6_e3m2_table(device=None):
-    """All 64 values representable in FP6-E3M2, indexed by the 6-bit code."""
-    codes = torch.arange(64, dtype=torch.int32, device=device)
-    sign = torch.where((codes >> 5) & 1 == 1, -1.0, 1.0)
-    e = ((codes >> 2) & 7).to(torch.float32)
-    m = (codes & 3).to(torch.float32)
-    mag = torch.where(
-        (codes >> 2) & 7 == 0,
-        m * 0.0625,
-        torch.exp2(e - 3.0) * (1.0 + m * 0.25),
-    )
-    return sign * mag
-
-
-def quantize_weights_fp6(weight):
-    """Quantize a 2D weight matrix to FP6-E3M2 codes with per-row scales.
-
-    Pure-torch replacement for the ``fp_quantize`` + ``preprocess_weight``
-    pair DeepSpeed runs through qtorch and a CUDA host function. Rounding is
-    to the nearest representable FP6 value.
-
-    Args:
-        weight (Tensor): fp16/fp32 weights of shape ``[out_channels, in_channels]``.
-
-    Returns:
-        (codes, scales): ``codes`` is a uint8 tensor of shape
-        ``[out_channels, in_channels]`` holding the 6-bit codes, ``scales``
-        is an fp16 tensor of shape ``[out_channels]``.
-    """
-    assert weight.dim() == 2, "weight must be 2-dimensional"
-    weight = weight.to(torch.float32)
-
-    amax = weight.abs().amax(dim=1)
-    scales = amax / _FP6_ABS_MAX
-    # A zero row has nothing to quantize; give it scale 1 so the codes stay 0.
-    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
-    scaled = weight / scales[:, None]
-
-    # Nearest-value lookup against the positive half of the code table.
-    table = _fp6_e3m2_table(device=weight.device)
-    positive = table[:32]  # codes 0..31 are the non-negative values
-    idx = torch.searchsorted(positive, scaled.abs().contiguous())
-    idx = idx.clamp(max=31)
-    lower = positive[(idx - 1).clamp(min=0)]
-    upper = positive[idx]
-    idx = torch.where(scaled.abs() - lower <= upper - scaled.abs(), idx - 1, idx)
-    idx = idx.clamp(min=0)
-    codes = torch.where(scaled < 0, idx | 0x20, idx)
-
-    return codes.to(torch.uint8), scales.to(torch.float16)
-
-
-def pack_weights_fp6(codes):
-    """Pack FP6 codes into the 2-bit and 4-bit slices the kernel consumes.
-
-    Args:
-        codes (Tensor): uint8 tensor of shape ``[out_channels, in_channels]``
-            with values in ``[0, 64)``, e.g. from :func:`quantize_weights_fp6`.
-
-    Returns:
-        (weights_2bit, weights_4bit): uint8 tensors of shapes
-        ``[out_channels, in_channels // 4]`` and
-        ``[out_channels, in_channels // 2]`` in the layout documented in the
-        module docstring.
-    """
-    assert codes.dim() == 2, "codes must be 2-dimensional"
-    out_channels, in_channels = codes.shape
-    assert in_channels % 4 == 0, "in_channels must be a multiple of 4"
-    assert codes.dtype == torch.uint8
-    assert int(codes.max()) < 64, "codes must be 6-bit values"
-
-    top2 = codes >> 4
-    low4 = codes & 0xF
-
-    t = top2.reshape(out_channels, in_channels // 4, 4).to(torch.uint8)
-    weights_2bit = (t[..., 0] << 6) | (t[..., 1] << 4) | (t[..., 2] << 2) | t[..., 3]
-
-    low = low4.reshape(out_channels, in_channels // 2, 2)
-    weights_4bit = (low[..., 0] << 4) | low[..., 1]
-
-    return weights_2bit.contiguous(), weights_4bit.contiguous()
 
 
 def _gemm_configs():
@@ -472,10 +389,10 @@ def wf6af16_linear(
     Args:
         output (Tensor): fp16 output, shape ``[tokens, out_channels]``.
         hidden_states (Tensor): fp16 activation, shape ``[tokens, in_channels]``.
-        weights_2bit (Tensor): uint8 2-bit slice from :func:`pack_weights_fp6`,
-            shape ``[out_channels, in_channels // 4]``.
-        weights_4bit (Tensor): uint8 4-bit slice from :func:`pack_weights_fp6`,
-            shape ``[out_channels, in_channels // 2]``.
+        weights_2bit (Tensor): uint8 2-bit slice in the layout documented in
+            the module docstring, shape ``[out_channels, in_channels // 4]``.
+        weights_4bit (Tensor): uint8 4-bit slice in the layout documented in
+            the module docstring, shape ``[out_channels, in_channels // 2]``.
         scale (Tensor): fp16 per-output-channel scales, shape ``[out_channels]``.
         out_channels (int, optional): inferred from ``scale`` when omitted.
         tokens (int, optional): inferred from ``hidden_states`` when omitted.
