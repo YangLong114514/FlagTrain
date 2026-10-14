@@ -41,13 +41,82 @@ import torch
 
 import flag_train
 from flag_train.deepspeed import wf6af16_linear
-from flag_train.deepspeed.wf6af16_linear import (
-    _fp6_e3m2_table,
-    pack_weights_fp6,
-    quantize_weights_fp6,
-)
 
 from .. import accuracy_utils as utils
+
+# ---------------------------------------------------------------------------
+# Input preparation helpers (torch is fine here: this is test code, not the
+# library's host path).
+#
+# ``pack_weights_fp6`` produces the dense row-major byte layout the kernel
+# documents in its module docstring; ``quantize_weights_fp6`` is a plain-torch
+# stand-in for DeepSpeed's qtorch-based ``fp_quantize``, rounding to the
+# nearest representable FP6-E3M2 value with one scale per row.
+# ---------------------------------------------------------------------------
+
+# FP6-E3M2, exponent bias 3, exponent 7 is a normal value (no inf/NaN), so the
+# largest magnitude is 2^4 * 1.75 = 28 and the smallest non-zero one is 2^-4.
+_FP6_ABS_MAX = 28.0
+
+
+def _fp6_e3m2_table(device=None):
+    """All 64 values representable in FP6-E3M2, indexed by the 6-bit code."""
+    codes = torch.arange(64, dtype=torch.int32, device=device)
+    sign = torch.where((codes >> 5) & 1 == 1, -1.0, 1.0)
+    e = ((codes >> 2) & 7).to(torch.float32)
+    m = (codes & 3).to(torch.float32)
+    mag = torch.where(
+        (codes >> 2) & 7 == 0,
+        m * 0.0625,
+        torch.exp2(e - 3.0) * (1.0 + m * 0.25),
+    )
+    return sign * mag
+
+
+def quantize_weights_fp6(weight):
+    """Quantize a 2D weight matrix to FP6-E3M2 codes with per-row scales."""
+    assert weight.dim() == 2, "weight must be 2-dimensional"
+    weight = weight.to(torch.float32)
+
+    amax = weight.abs().amax(dim=1)
+    scales = amax / _FP6_ABS_MAX
+    # A zero row has nothing to quantize; give it scale 1 so the codes stay 0.
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+    scaled = weight / scales[:, None]
+
+    # Nearest-value lookup against the positive half of the code table.
+    table = _fp6_e3m2_table(device=weight.device)
+    positive = table[:32]  # codes 0..31 are the non-negative values
+    idx = torch.searchsorted(positive, scaled.abs().contiguous())
+    idx = idx.clamp(max=31)
+    lower = positive[(idx - 1).clamp(min=0)]
+    upper = positive[idx]
+    idx = torch.where(scaled.abs() - lower <= upper - scaled.abs(), idx - 1, idx)
+    idx = idx.clamp(min=0)
+    codes = torch.where(scaled < 0, idx | 0x20, idx)
+
+    return codes.to(torch.uint8), scales.to(torch.float16)
+
+
+def pack_weights_fp6(codes):
+    """Pack FP6 codes into the 2-bit and 4-bit slices the kernel consumes."""
+    assert codes.dim() == 2, "codes must be 2-dimensional"
+    out_channels, in_channels = codes.shape
+    assert in_channels % 4 == 0, "in_channels must be a multiple of 4"
+    assert codes.dtype == torch.uint8
+    assert int(codes.max()) < 64, "codes must be 6-bit values"
+
+    top2 = codes >> 4
+    low4 = codes & 0xF
+
+    t = top2.reshape(out_channels, in_channels // 4, 4).to(torch.uint8)
+    weights_2bit = (t[..., 0] << 6) | (t[..., 1] << 4) | (t[..., 2] << 2) | t[..., 3]
+
+    low = low4.reshape(out_channels, in_channels // 2, 2)
+    weights_4bit = (low[..., 0] << 4) | low[..., 1]
+
+    return weights_2bit.contiguous(), weights_4bit.contiguous()
+
 
 # ---------------------------------------------------------------------------
 # Reference implementation

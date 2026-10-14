@@ -35,7 +35,6 @@ import torch
 
 import flag_train
 from flag_train.deepspeed import wf6af16_linear
-from flag_train.deepspeed.wf6af16_linear import _fp6_e3m2_table, pack_weights_fp6
 
 from .. import base
 
@@ -52,12 +51,48 @@ _WF6AF16_SHAPES = [
 ]
 
 # ---------------------------------------------------------------------------
+# Input preparation helpers (torch is fine here: this is benchmark setup code,
+# not the library's host path, and packing happens outside the timed region).
+# ---------------------------------------------------------------------------
+
+
+def _fp6_e3m2_table(device=None):
+    """All 64 values representable in FP6-E3M2, indexed by the 6-bit code."""
+    codes = torch.arange(64, dtype=torch.int32, device=device)
+    sign = torch.where((codes >> 5) & 1 == 1, -1.0, 1.0)
+    e = ((codes >> 2) & 7).to(torch.float32)
+    m = (codes & 3).to(torch.float32)
+    mag = torch.where(
+        (codes >> 2) & 7 == 0,
+        m * 0.0625,
+        torch.exp2(e - 3.0) * (1.0 + m * 0.25),
+    )
+    return sign * mag
+
+
+def _pack_weights_fp6(codes):
+    """Pack FP6 codes into the 2-bit and 4-bit slices the kernel consumes."""
+    out_channels, in_channels = codes.shape
+
+    top2 = codes >> 4
+    low4 = codes & 0xF
+
+    t = top2.reshape(out_channels, in_channels // 4, 4).to(torch.uint8)
+    weights_2bit = (t[..., 0] << 6) | (t[..., 1] << 4) | (t[..., 2] << 2) | t[..., 3]
+
+    low = low4.reshape(out_channels, in_channels // 2, 2)
+    weights_4bit = (low[..., 0] << 4) | low[..., 1]
+
+    return weights_2bit.contiguous(), weights_4bit.contiguous()
+
+
+# ---------------------------------------------------------------------------
 # Reference implementation
 # ---------------------------------------------------------------------------
 
 
 def _unpack_weights_fp6(weights_2bit, weights_4bit):
-    """Inverse of ``pack_weights_fp6``, composed from plain torch ops."""
+    """Inverse of ``_pack_weights_fp6``, composed from plain torch ops."""
     out_channels, packed_k = weights_2bit.shape
     in_channels = packed_k * 4
 
@@ -171,7 +206,7 @@ def wf6af16_input_fn(shape, dtype, device):
     scales = (torch.rand(out_channels, generator=gen) + 0.5).to(torch.float16)
     hidden = torch.randn(tokens, in_channels, generator=gen).to(dtype)
 
-    weights_2bit, weights_4bit = pack_weights_fp6(codes.to(device))
+    weights_2bit, weights_4bit = _pack_weights_fp6(codes.to(device))
 
     if _deepspeed_wf6af16 is not None:
         # DeepSpeed's packer wants the fake-quantized fp16 weights on CPU; the
