@@ -15,9 +15,11 @@
 
 The baseline follows ``_DEEPSPEED_BASELINE_VENDORS`` below:
 
-* on a listed backend, DeepSpeed's ``fused_lamb`` **is** the baseline. If it cannot
-  be built there the module raises rather than falling back -- measuring the torch
-  reference and reporting it under the same name would answer a different question;
+* on a listed backend, DeepSpeed's ``fused_lamb`` **is** the baseline when it can be
+  built. If it cannot be loaded there the module warns and falls back to
+  ``lamb_ref`` so the benchmark still runs -- the reported baseline name then says
+  which one was actually measured, so it never answers a different question under
+  the DeepSpeed name;
 * on any other backend the baseline is ``lamb_ref``, the plain-torch composition of
   the same contract, whether or not ``deepspeed`` is installed there. It is not a
   competitor, and the speedup there says how far the kernel is from *a* correct
@@ -28,6 +30,7 @@ blocked-flash benchmark there is nothing to pre-compute outside the timed region
 """
 
 import math
+import warnings
 
 import pytest
 import torch
@@ -137,16 +140,19 @@ def lamb_ref(
 
 # Backends whose baseline is DeepSpeed. fused_lamb ships as a CUDA op builder, so
 # only a backend that can compile and execute one can host it. On these the
-# baseline is not optional -- if it will not load, timing the torch reference and
-# reporting it under the DeepSpeed baseline's name would answer another question.
+# baseline is expected, not mandatory: if it fails to load we warn and fall back
+# to lamb_ref, and the reported baseline name records which one was measured.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
 
 
 def _load_deepspeed_lamb():
-    """DeepSpeed's fused_lamb, or ``None`` on a backend that does not use it.
+    """DeepSpeed's fused_lamb, or ``None`` when it could not be loaded.
 
     ``FusedLambBuilder`` JIT-compiles the CUDA source shipped inside the
     ``deepspeed`` package, then reuses the build cached under ``torch_extensions``.
+
+    On a backend in ``_DEEPSPEED_BASELINE_VENDORS`` a load failure is warned about
+    rather than raised: the benchmark still runs, with ``lamb_ref`` as the baseline.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
         return None
@@ -156,11 +162,13 @@ def _load_deepspeed_lamb():
 
         return FusedLambBuilder().load().lamb
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use DeepSpeed's fused_lamb as its "
-            f"baseline, but it could not be loaded: {exc!r}. Build deepspeed, or "
-            f"drop the backend from _DEEPSPEED_BASELINE_VENDORS."
-        ) from exc
+        warnings.warn(
+            f"{flag_train.vendor_name!r} is expected to use DeepSpeed's fused_lamb "
+            f"as its baseline, but it could not be loaded: {exc!r}. Falling back to "
+            f"lamb_ref; build deepspeed to enable the fused_lamb baseline.",
+            stacklevel=2,
+        )
+        return None
 
 
 # Resolved once, so the first-use JIT compile is not counted in the measurement.

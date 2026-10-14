@@ -13,23 +13,34 @@
 # limitations under the License.
 """Performance benchmark for the blocked (paged KV-cache) flash attention forward.
 
-The baseline is picked by what the platform can run:
+The baseline is picked by what the platform can run -- the same three tiers, in
+the same order and on the same predicates, that
+``tests/deepspeed/test_blocked_flash.py`` holds the operator to. A benchmark
+measuring against something the tests do not accept would be answering a
+different question, so the two files state one rule:
 
-* where ``flash_attn`` is installed (CUDA), the baseline is
-  ``flash_attn_varlen_func`` over the densely gathered KV -- a real competitor,
-  and the honest question is how the kernel compares to it;
-* everywhere else the baseline is ``blocked_flash_ref``, the plain-torch
-  composition over the same paged cache. It is not a competitor, and the speedup
-  there says how far the kernel is from *a* correct implementation.
+* on a backend that runs DeepSpeed's own blocked-flash kernel, that kernel is the
+  baseline. It is the kernel this port is a port *of*, which makes it the only
+  baseline that answers "what did the port cost", and it is *required*: if it
+  cannot be loaded the module raises rather than timing something else and
+  reporting it under that name;
+* on any other backend with ``flash_attn`` installed, ``flash_attn_varlen_func``
+  over the densely gathered KV -- a real competitor, and the honest question is
+  how the kernel compares to it;
+* failing both, ``blocked_flash_ref``, the plain-torch composition over the same
+  paged cache. It is not a competitor, and the speedup there says how far the
+  kernel is from *a* correct implementation rather than from the best one.
 
-Both wrappers take the same argument tuple, so the dense KV the first one needs
-is gathered in ``input_fn`` -- outside the timed region. Gathering it inside the
-baseline would charge flash-attn for a copy the blocked kernel exists to avoid.
+Every baseline takes the same argument tuple, so the dense KV the second one
+needs is gathered in ``input_fn`` -- outside the timed region. Gathering it
+inside the baseline would charge flash-attn for a copy the blocked kernel exists
+to avoid.
 """
 
 import pytest
 import torch
 
+import flag_train
 from flag_train.deepspeed import blocked_flash
 from flag_train.deepspeed.blocked_flash import (
     _ATOM_BLOCK_OFFSET,
@@ -168,6 +179,56 @@ def build_blocked_flash_atoms(seq_params, q_block_size, kv_block_size, device):
     )
 
 
+# The baseline, by platform. The same three-branch rule, in the same order and on
+# the same predicates, that tests/deepspeed/test_blocked_flash.py picks the oracle
+# it holds the operator to -- both files name the tier ``_ORACLE``, so a reader
+# comparing the two sees one rule rather than two that happen to resemble each
+# other. This file adds what a benchmark needs and the tests do not: the tier
+# decides what is *timed*, so the branch is exclusive here, where the tests run
+# every oracle they can.
+#
+# * on a backend that has DeepSpeed's own blocked-flash kernel, that kernel **is**
+#   the baseline -- it is the operator being ported, and measuring anything else
+#   answers a different question. If it cannot be loaded there the module raises
+#   rather than falling back;
+# * elsewhere `flash_attn_varlen_func` over the densely gathered KV, where the
+#   package is available -- a real competitor;
+# * and failing that the plain-torch composition over the same paged cache, which
+#   is not a competitor: the speedup says how far the kernel is from *a* correct
+#   implementation, not from the best one.
+_DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
+
+
+def _load_deepspeed_blocked_flash():
+    """``(BlockedFlashAttn, DtypeEnum)``, or ``None`` on a backend that does not use it.
+
+    The reference kernel is not compiled from source here: ``RaggedOpsBuilder``
+    links ``-lblockedflash`` against a prebuilt library that ships in the
+    ``dskernels`` package (``op_builder/ragged_ops.py``). So this needs that
+    package installed for the platform; a checkout without it cannot run the
+    baseline at all, and says so rather than measuring something else.
+    """
+    if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
+        return None
+
+    try:
+        from deepspeed.inference.v2.inference_utils import DtypeEnum
+        from deepspeed.inference.v2.kernels.ragged_ops import BlockedFlashAttn
+
+        return BlockedFlashAttn, DtypeEnum
+    except Exception as exc:
+        raise RuntimeError(
+            f"{flag_train.vendor_name!r} must use DeepSpeed's BlockedFlashAttn as "
+            f"its baseline, but it could not be loaded: {exc!r}. Its kernel ships "
+            f"prebuilt in the `dskernels` package (`op_builder/ragged_ops.py` links "
+            f"`-lblockedflash`), so install that for this platform, or drop the "
+            f"backend from _DEEPSPEED_BASELINE_VENDORS."
+        ) from exc
+
+
+# Resolved once, like the lamb benchmark's baseline.
+_deepspeed_blocked_flash = _load_deepspeed_blocked_flash()
+
 try:
     from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
@@ -175,11 +236,15 @@ try:
 except ImportError:
     _HAS_FLASH_ATTN = False
 
-_BASELINE = (
-    "flash_attn_varlen_func (dense KV)"
-    if _HAS_FLASH_ATTN
-    else "blocked_flash_ref (torch, paged KV)"
-)
+if _deepspeed_blocked_flash is not None:
+    _ORACLE = "deepspeed"
+    _BASELINE = "deepspeed BlockedFlashAttn"
+elif _HAS_FLASH_ATTN:
+    _ORACLE = "flash_attn"
+    _BASELINE = "flash_attn_varlen_func (dense KV)"
+else:
+    _ORACLE = "torch_ref"
+    _BASELINE = "blocked_flash_ref (torch, paged KV)"
 
 # (context_length, head_size, n_heads_q, n_heads_kv). Blocked attention needs
 # head_size <= 256 and a compute capability of 8.0 or better; the cache's block
@@ -203,6 +268,9 @@ _BLOCKED_FLASH_SHAPES = [
     (4096, 128, 64, 8),
 ]
 
+# The geometry for the tiers that do not constrain it. On the DeepSpeed tier the
+# KV block size is fixed by the baseline's kernel, so `_cache_geometry` returns
+# that instead of `_KV_BLOCK_SIZE` -- see there for why it is not negotiable.
 _Q_BLOCK_SIZE = 128
 _KV_BLOCK_SIZE = 64
 _SOFTMAX_SCALE = 1.0
@@ -219,6 +287,86 @@ class BlockedFlashBenchmark(base.GenericBenchmark):
         return []
 
 
+def _deepspeed_atoms(seq_params, q_block_size, kv_block_size, device):
+    """Atoms in the reference layout, for the DeepSpeed baseline.
+
+    Its kernel dereferences slot [0] as a *host pointer* to the block list, over
+    UVA, so that list has to live in pinned memory and every atom has to carry
+    the address of its own sequence's run. Our builder writes an offset there
+    instead -- a Triton kernel cannot dereference a host pointer
+    (blocked_flash.md §5) -- so this turns the offset back into the pointer the
+    baseline wants.
+
+    Returns:
+        tuple: ``(atoms, pinned)``. ``pinned`` is handed back because the atoms
+        point into it: letting it go would leave the kernel reading freed memory.
+    """
+    atoms, kv_block_idx = build_blocked_flash_atoms(
+        seq_params, q_block_size, kv_block_size, device
+    )
+    pinned = kv_block_idx.cpu().pin_memory()
+    base = pinned.data_ptr()
+    addresses = torch.tensor(
+        [base + 4 * offset for offset in atoms[:, 0].tolist()],
+        dtype=torch.int64,
+        device=device,
+    )
+    # A pointer is two int32 slots, low half first -- slot [0] then [1].
+    atoms[:, 0:2] = addresses.view(torch.int32).reshape(-1, 2)
+    return atoms, pinned
+
+
+# One kernel per (head_size, dtype), built on first use: the constructor is what
+# triggers ``RaggedOpsBuilder().load()``, and that must not land in the timed
+# region.
+_deepspeed_kernels = {}
+
+
+def _deepspeed_kernel(head_size, dtype):
+    key = (head_size, dtype)
+    if key not in _deepspeed_kernels:
+        BlockedFlashAttn, DtypeEnum = _deepspeed_blocked_flash
+        _deepspeed_kernels[key] = BlockedFlashAttn(head_size, DtypeEnum(dtype))
+    return _deepspeed_kernels[key]
+
+
+def _deepspeed_geometry(head_size):
+    """``(q_block_size, kv_block_size)`` DeepSpeed's kernel is *built* for.
+
+    Neither is a parameter of its launcher. ``blocked_flash.cpp`` takes the row
+    pitch from ``k.stride(1)``, but the number of tokens in a cache block never
+    comes off the tensor at all: it is a template argument of the kernel, fixed
+    upstream by these two helpers -- which is why upstream's own test calls them
+    rather than choosing either value.
+
+    Handed a cache built at another block size, the kernel walks it at the wrong
+    pitch and reads the wrong tokens. Measured on an A100 at head_size 64, a
+    64-token block moves this baseline's own output by 5.7 where the operator
+    under test differs from the reference by 2e-3 -- so the two are not computing
+    the same thing, and a ratio between them would be a ratio between two
+    different questions.
+    """
+    from deepspeed.inference.v2.kernels.ragged_ops.blocked_flash.blocked_flash import (
+        get_kv_block_size,
+        get_q_block_size,
+    )
+
+    return get_q_block_size(head_size), get_kv_block_size(head_size)
+
+
+def _cache_geometry(head_size):
+    """``(q_block_size, kv_block_size)`` to build this case's cache and atoms with.
+
+    On the DeepSpeed tier the geometry is not free, so that tier picks it; on the
+    others nothing constrains it and the module defaults stand. The shape list
+    mixes head sizes, and the two tiers want different block sizes for the same
+    head size -- which is exactly why this is per-shape rather than a constant.
+    """
+    if _deepspeed_blocked_flash is not None:
+        return _deepspeed_geometry(head_size)
+    return _Q_BLOCK_SIZE, _KV_BLOCK_SIZE
+
+
 def blocked_flash_input_fn(shape, dtype, device):
     """One prompt of ``context_length`` tokens against its own paged KV-cache.
 
@@ -226,34 +374,44 @@ def blocked_flash_input_fn(shape, dtype, device):
     blocked operator ignores those.
     """
     n_tokens, head_size, n_heads_q, n_heads_kv = shape
+    q_block_size, kv_block_size = _cache_geometry(head_size)
 
     q = torch.randn((n_tokens, n_heads_q * head_size), dtype=dtype, device=device)
     kv = torch.randn((n_tokens, 2 * n_heads_kv * head_size), dtype=dtype, device=device)
     out = torch.empty_like(q)
 
     # A single sequence, so the cache holds exactly the prompt's own KV.
-    n_blocks = (n_tokens + _KV_BLOCK_SIZE - 1) // _KV_BLOCK_SIZE
+    n_blocks = (n_tokens + kv_block_size - 1) // kv_block_size
     padded = torch.zeros(
-        (n_blocks * _KV_BLOCK_SIZE, 2 * n_heads_kv * head_size),
+        (n_blocks * kv_block_size, 2 * n_heads_kv * head_size),
         dtype=dtype,
         device=device,
     )
     padded[:n_tokens] = kv
-    paged = padded.reshape(n_blocks, _KV_BLOCK_SIZE, 2 * n_heads_kv * head_size)
+    paged = padded.reshape(n_blocks, kv_block_size, 2 * n_heads_kv * head_size)
     k_cache = (
         paged[:, :, : n_heads_kv * head_size]
-        .reshape(n_blocks, _KV_BLOCK_SIZE, n_heads_kv, head_size)
+        .reshape(n_blocks, kv_block_size, n_heads_kv, head_size)
         .contiguous()
     )
     v_cache = (
         paged[:, :, n_heads_kv * head_size :]
-        .reshape(n_blocks, _KV_BLOCK_SIZE, n_heads_kv, head_size)
+        .reshape(n_blocks, kv_block_size, n_heads_kv, head_size)
         .contiguous()
     )
 
     atoms, kv_block_idx = build_blocked_flash_atoms(
-        [(n_tokens, 0)], _Q_BLOCK_SIZE, _KV_BLOCK_SIZE, device
+        [(n_tokens, 0)], q_block_size, kv_block_size, device
     )
+
+    # The DeepSpeed baseline reads atoms carrying host pointers instead; built
+    # here, outside the timed region, like the dense KV above.
+    if _deepspeed_blocked_flash is not None:
+        deepspeed_atoms, deepspeed_pinned = _deepspeed_atoms(
+            [(n_tokens, 0)], q_block_size, kv_block_size, device
+        )
+    else:
+        deepspeed_atoms, deepspeed_pinned = None, None
 
     cu_seqlens = torch.tensor([0, n_tokens], dtype=torch.int32, device=device)
     yield (
@@ -269,13 +427,43 @@ def blocked_flash_input_fn(shape, dtype, device):
         cu_seqlens,
         n_tokens,
         n_tokens,
+        deepspeed_atoms,
+        deepspeed_pinned,
+        q_block_size,
     )
 
 
 def torch_op(
-    out, q, k, v, atoms, kv_block_idx, dense_k, dense_v, cu_q, cu_kv, max_q, max_kv
+    out,
+    q,
+    k,
+    v,
+    atoms,
+    kv_block_idx,
+    dense_k,
+    dense_v,
+    cu_q,
+    cu_kv,
+    max_q,
+    max_kv,
+    deepspeed_atoms,
+    deepspeed_pinned,
+    q_block_size,
 ):
-    """Baseline, chosen by platform. See the module docstring."""
+    """Baseline, chosen by platform. See the module docstring.
+
+    ``q_block_size`` is the operator under test's to use; a baseline works its own
+    geometry out, and the two tiers want different ones for the same head size.
+    It is taken and ignored rather than left out so that both ops are handed the
+    same tuple.
+    """
+    if _deepspeed_blocked_flash is not None:
+        # Same paged tensors as the operator under test -- this baseline needs no
+        # dense gather, it reads the cache the way ours does -- plus the atoms
+        # that carry host pointers.
+        return _deepspeed_kernel(k.size(-1), out.dtype)(
+            out, q, k, v, deepspeed_atoms, _SOFTMAX_SCALE
+        )
     if _HAS_FLASH_ATTN:
         head_size = k.size(-1)
         # Read off the tensors rather than module constants, so the GQA rows
@@ -297,23 +485,42 @@ def torch_op(
 
 
 def train_op(
-    out, q, k, v, atoms, kv_block_idx, dense_k, dense_v, cu_q, cu_kv, max_q, max_kv
+    out,
+    q,
+    k,
+    v,
+    atoms,
+    kv_block_idx,
+    dense_k,
+    dense_v,
+    cu_q,
+    cu_kv,
+    max_q,
+    max_kv,
+    deepspeed_atoms,
+    deepspeed_pinned,
+    q_block_size,
 ):
     """The operator under test; the dense KV is the baseline's concern, not ours.
 
-    ``q_block_size`` is handed over because ``input_fn`` built these atoms with
-    it: knowing the bound lets the operator skip a per-call device sync (~50 us
-    on an A100) that would otherwise be charged against the kernel, which at the
-    small shapes here is several times the kernel's own time.
+    ``q_block_size`` comes from ``input_fn``, which built these atoms with it:
+    knowing the bound lets the operator skip a per-call device sync (~50 us on an
+    A100) that would otherwise be charged against the kernel, which at the small
+    shapes here is several times the kernel's own time. It is read from the tuple
+    rather than taken from the module constant because on the DeepSpeed tier the
+    geometry is the baseline's to choose, and the atoms agree with whichever one
+    ``input_fn`` used.
     """
     return blocked_flash(
-        out, q, k, v, atoms, kv_block_idx, _SOFTMAX_SCALE, q_block_size=_Q_BLOCK_SIZE
+        out, q, k, v, atoms, kv_block_idx, _SOFTMAX_SCALE, q_block_size=q_block_size
     )
 
 
 @pytest.mark.blocked_flash
 def test_blocked_flash_perf():
-    print(f"\nBaseline: {_BASELINE}")
+    # The tier first, so a run whose numbers moved says whether the baseline it
+    # moved against is the one the platform was supposed to pick.
+    print(f"\nOracle: {_ORACLE}\nBaseline: {_BASELINE}")
 
     bench = BlockedFlashBenchmark(
         input_fn=blocked_flash_input_fn,

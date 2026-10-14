@@ -1,0 +1,45 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Label a PR from its diff, before anything reads the labels.
+#
+# pull_request_target runs in the base repository's context, so this works for
+# PRs from forks too (which is where the write access to labels comes from).
+# unittest.yaml waits for this workflow to finish before it reads labels, so a
+# vendor job can never be skipped just because triage had not run yet.
+#
+# The rules live in .github/labeler.yml; the labels themselves must already
+# exist in the repository.
+
+name: triage
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - id: labeler
+        uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d  # v6.2.0
+        with:
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"
+          # Remove labels the diff no longer justifies, so a stale vendor/*
+          # cannot keep scheduling a backend.
+          sync-labels: true

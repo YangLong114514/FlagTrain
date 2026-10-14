@@ -78,6 +78,114 @@ _ATOM_UNUSED = tl.constexpr(7)
 # log2(e): the kernel's softmax runs on exp2, so this rides on the qk scale.
 _LOG2E = 1.4426950408889634
 
+# The widest KV tile the inner loop walks, in rows. Measured, not derived -- see
+# where it is used for the numbers and for what it is not.
+_BLOCK_N_MAX = 64
+
+
+@triton.jit
+def _kv_tile(
+    q,
+    k_ptr,
+    v_ptr,
+    block_row_base,
+    offs_n,
+    kv_pos,
+    total_extent,
+    global_q_pos,
+    qk_scale,
+    m_i,
+    l_i,
+    acc,
+    k_row_stride,
+    hk,
+    offs_d,
+    d_mask,
+    MASKED: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """One ``BLOCK_N``-wide KV tile, folded into the running softmax state.
+
+    The outer kernel walks the KV in two loops, and this is the body of both: a
+    peeled one where neither mask can fire, so ``MASKED`` is false and the loads
+    carry only the head-size mask, and a remainder where they can. Splitting the
+    body out rather than repeating it keeps the two in step -- they differ in
+    exactly one place, which is why the difference is a ``constexpr`` here and
+    not a second copy of the arithmetic.
+
+    Returns the updated ``(m_i, l_i, acc)``: Triton has no mutable state across
+    calls, so the running max, the running denominator and the accumulator travel
+    in and out explicitly.
+    """
+    n_mask = kv_pos < total_extent
+
+    if MASKED:
+        k = tl.load(
+            k_ptr
+            + block_row_base
+            + offs_n[:, None] * k_row_stride
+            + hk * HEAD_SIZE
+            + offs_d[None, :],
+            mask=n_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+    else:
+        k = tl.load(
+            k_ptr
+            + block_row_base
+            + offs_n[:, None] * k_row_stride
+            + hk * HEAD_SIZE
+            + offs_d[None, :],
+            mask=d_mask[None, :],
+            other=0.0,
+        )
+
+    qk = tl.dot(q, tl.trans(k)) * qk_scale
+    if MASKED:
+        if IS_CAUSAL:
+            # A query attends to every KV position up to and including its own.
+            qk = tl.where(kv_pos[None, :] <= global_q_pos[:, None], qk, float("-inf"))
+        qk = tl.where(n_mask[None, :], qk, float("-inf"))
+
+    m_new = tl.maximum(m_i, tl.max(qk, 1))
+    alpha = tl.exp2(m_i - m_new)
+    p = tl.exp2(qk - m_new[:, None])
+
+    if MASKED:
+        v = tl.load(
+            v_ptr
+            + block_row_base
+            + offs_n[:, None] * k_row_stride
+            + hk * HEAD_SIZE
+            + offs_d[None, :],
+            mask=n_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+    else:
+        v = tl.load(
+            v_ptr
+            + block_row_base
+            + offs_n[:, None] * k_row_stride
+            + hk * HEAD_SIZE
+            + offs_d[None, :],
+            mask=d_mask[None, :],
+            other=0.0,
+        )
+
+    l_i = l_i * alpha + tl.sum(p, 1)
+    # ``p`` is rounded into the compute dtype here, which costs about 5e-4 of
+    # absolute accuracy. That is deliberate: the bar for this operator is the
+    # reference implementation's own tolerance
+    # (``inference_test_utils.get_tolerances``: atol 2e-3 for fp16, 3.2e-2 for
+    # bf16), which this clears with room to spare. Carrying the rounding residual
+    # in a second dot would meet a much tighter atol but costs ~23% of the
+    # speedup -- a bad trade against the stated requirement.
+    acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+
+    return m_new, l_i, acc
+
 
 @libentry()
 @triton.jit
@@ -138,58 +246,85 @@ def _blocked_flash_fwd_kernel(
     l_i = tl.zeros((BLOCK_M,), tl.float32)
     acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
-    for b in range(0, kv_blocks):
+    # How many leading blocks neither mask can touch, so the loop below can walk
+    # them without either. A block covers KV positions
+    # ``[b * KV_BLOCK_SIZE, (b + 1) * KV_BLOCK_SIZE)``, and two separate things
+    # have to hold for the masks to be dead:
+    #
+    #   * the block is fully inside the atom's window -- ``kv_pos < total_extent``
+    #     cannot fire -- which is ``(b + 1) * KV_BLOCK_SIZE <= total_extent``;
+    #   * it sits entirely at or before the atom's first query row, so the causal
+    #     comparison ``kv_pos <= global_q_pos`` cannot fire either.
+    #
+    # Each is taken from the atom's own fields rather than from an assumption
+    # about how the atom was built: ``total_extent`` is what the atom declares,
+    # not ``kv_blocks * KV_BLOCK_SIZE``, so a caller who hands over more blocks
+    # than the window needs still gets the masked loop for the excess.
+    #
+    # Worth the two loops: the masks cost about 8% of the kernel each, but about
+    # 28% together -- they interact, and only skipping both realises it. On a
+    # 4096-token prompt this is 94% of the block visits.
+    peeled = total_extent // KV_BLOCK_SIZE
+    if IS_CAUSAL:
+        peeled = tl.minimum(peeled, (global_q_idx + 1) // KV_BLOCK_SIZE)
+
+    for b in range(0, peeled):
         block = tl.load(block_idx_ptr + block_offset + b)
         block_row_base = block * k_row_stride * KV_BLOCK_SIZE
-
-        # A KV block holds kv_block_size tokens; walk it in BLOCK_N tiles so the
-        # tile does not have to know the cache's block size.
         for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
             offs_n = t0 + tl.arange(0, BLOCK_N)
             kv_pos = b * KV_BLOCK_SIZE + offs_n
-            n_mask = kv_pos < total_extent
-
-            k_ptrs = (
-                k_ptr
-                + block_row_base
-                + offs_n[:, None] * k_row_stride
-                + hk * HEAD_SIZE
-                + offs_d[None, :]
+            m_i, l_i, acc = _kv_tile(
+                q,
+                k_ptr,
+                v_ptr,
+                block_row_base,
+                offs_n,
+                kv_pos,
+                total_extent,
+                global_q_pos,
+                qk_scale,
+                m_i,
+                l_i,
+                acc,
+                k_row_stride,
+                hk,
+                offs_d,
+                d_mask,
+                MASKED=False,
+                IS_CAUSAL=IS_CAUSAL,
+                HEAD_SIZE=HEAD_SIZE,
+                BLOCK_N=BLOCK_N,
             )
-            k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
 
-            qk = tl.dot(q, tl.trans(k)) * qk_scale
-            if IS_CAUSAL:
-                # A query attends to every KV position up to and including its own.
-                qk = tl.where(
-                    kv_pos[None, :] <= global_q_pos[:, None], qk, float("-inf")
-                )
-            qk = tl.where(n_mask[None, :], qk, float("-inf"))
-
-            m_new = tl.maximum(m_i, tl.max(qk, 1))
-            alpha = tl.exp2(m_i - m_new)
-            p = tl.exp2(qk - m_new[:, None])
-
-            v_ptrs = (
-                v_ptr
-                + block_row_base
-                + offs_n[:, None] * k_row_stride
-                + hk * HEAD_SIZE
-                + offs_d[None, :]
+    for b in range(peeled, kv_blocks):
+        block = tl.load(block_idx_ptr + block_offset + b)
+        block_row_base = block * k_row_stride * KV_BLOCK_SIZE
+        for t0 in range(0, KV_BLOCK_SIZE, BLOCK_N):
+            offs_n = t0 + tl.arange(0, BLOCK_N)
+            kv_pos = b * KV_BLOCK_SIZE + offs_n
+            m_i, l_i, acc = _kv_tile(
+                q,
+                k_ptr,
+                v_ptr,
+                block_row_base,
+                offs_n,
+                kv_pos,
+                total_extent,
+                global_q_pos,
+                qk_scale,
+                m_i,
+                l_i,
+                acc,
+                k_row_stride,
+                hk,
+                offs_d,
+                d_mask,
+                MASKED=True,
+                IS_CAUSAL=IS_CAUSAL,
+                HEAD_SIZE=HEAD_SIZE,
+                BLOCK_N=BLOCK_N,
             )
-            v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
-
-            l_i = l_i * alpha + tl.sum(p, 1)
-            # ``p`` is rounded into the compute dtype here, which costs about
-            # 5e-4 of absolute accuracy. That is deliberate: the bar for this
-            # operator is the reference implementation's own tolerance
-            # (``inference_test_utils.get_tolerances``: atol 2e-3 for fp16,
-            # 3.2e-2 for bf16), which this clears with room to spare. Carrying
-            # the rounding residual in a second dot would meet a much tighter
-            # atol but costs ~23% of the speedup -- a bad trade against the
-            # stated requirement.
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-            m_i = m_new
 
     # A row whose keys were all masked out has no contribution to renormalize.
     l_i = tl.where(l_i == 0.0, 1.0, l_i)
@@ -322,28 +457,51 @@ def blocked_flash(
         raise ValueError("key cache must be contiguous across the block dimension")
 
     if q_block_size is None:
-        # ``int()`` because the constants are constexpr for the kernel's benefit
-        # and torch will not index a tensor with one; ``item()`` is the sync.
-        q_len_max = (
-            int(attention_atoms[:, int(_ATOM_Q_LEN)].max().item()) if num_atoms else 0
-        )
+        # The whole record rather than a reduction over one column: eight int32
+        # costs nothing worth saving, while selecting a column adds a kernel of
+        # its own -- measured 22.0 us against 36.7 us for
+        # ``attention_atoms[:, q_len].max().item()`` on an A100, the round trip
+        # to the host being the expensive part either way. ``int()`` because the
+        # constants are constexpr for the kernel's benefit and torch will not
+        # index a tensor with one.
+        rows = attention_atoms.detach().to("cpu").tolist()
+        q_len_max = max((row[int(_ATOM_Q_LEN)] for row in rows), default=0)
     else:
         q_len_max = q_block_size
 
     # One program per (atom, query head), so the query tile has to span the widest
-    # atom in the batch -- the rest mask off their padding. BLOCK_N is the KV tile
-    # walked inside a single cache block, capped at 128: past the block size a
-    # wider tile only masks off more. BLOCK_D is the whole head, padded up.
+    # atom in the batch -- the rest mask off their padding. BLOCK_D is the whole
+    # head, padded up. Neither can give: a narrower BLOCK_M drops query rows and a
+    # narrower BLOCK_D drops head dimensions, both silently.
     #
-    # These three decide the kernel's shared-memory footprint, which is the one
-    # limit that actually bites. A program holds BLOCK_M*BLOCK_D queries,
-    # BLOCK_N*BLOCK_D keys and values, and BLOCK_M*BLOCK_N of fp32 scores at
-    # once; at head_size 256 that is 208 KB for a 128-row tile against the A100's
-    # 163 KB, so the launch fails with OutOfResources and the case needs smaller
-    # atoms. None of the three is a caller-facing knob -- the atom builder is what
-    # moves BLOCK_M, via q_block_size.
+    # BLOCK_N is the one free to move, and 64 is where it measures best. A100,
+    # one sequence per shape, head_size 64 -- where the cache's block is 128, so
+    # the tile is a choice rather than forced by the block size -- min of three,
+    # the two tiles interleaved so a drift in clocks cannot favour either:
+    #
+    #     tokens       128     512    1024    2048    4096
+    #     BLOCK_N=64  15.9    32.7    61.6   133.4   398.1  us
+    #     BLOCK_N=128 16.7    38.2    73.4   160.3   469.3  us
+    #     ratio       1.05    1.17    1.19    1.20    1.18
+    #
+    # It is worth being explicit that this is *not* an occupancy effect, which is
+    # what it looks like from the arithmetic: Triton allocates 48 KB at either
+    # tile for this head size, three CTAs per SM, so the two are resident alike
+    # and the win is inside the program. Nor is it the ``tl.trans`` on the key --
+    # loading the key pre-transposed instead costs nothing (62.3 against 61.7 us
+    # at the same tiling) -- nor the warp count, which is flat from 4 to 8. And 32
+    # is worse than 64 (442.5 against 398.1 us), so 64 is a peak rather than the
+    # first step of a direction.
+    #
+    # The tile is also held to the cache block size, and taken as the largest
+    # power of two *below* it rather than rounded up to the nearest. The inner
+    # loop's lane mask is ``kv_pos < total_extent``, which says nothing about the
+    # block boundary, so a tile wider than the block would read rows belonging to
+    # the next physical block and attend to KV the query was never given. For the
+    # power-of-two block sizes a cache actually has, the two agree; for a block
+    # size that is not one, rounding up was the bug.
     BLOCK_M = max(triton.next_power_of_2(q_len_max), 16)
-    BLOCK_N = min(triton.next_power_of_2(kv_block_size), 128)
+    BLOCK_N = min(1 << (int(kv_block_size).bit_length() - 1), _BLOCK_N_MAX)
     BLOCK_D = triton.next_power_of_2(head_size)
 
     # Size the CTA to the accumulator. ``acc`` is BLOCK_M x BLOCK_D of fp32 and

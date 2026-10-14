@@ -1,0 +1,58 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Rules for actions/labeler, applied by .github/workflows/triage.yaml.
+#
+# The vendor/* labels are the gates for the multi-vendor test matrix in
+# .github/workflows/unittest.yaml: a backend is scheduled only when its label
+# is on the PR (unless it is nvidia, which runs on every PR). The label and
+# the path must stay in step with .github/backends.json, which pairs each
+# vendor with the label and the runner.
+#
+# Every label below must exist in the repository before triage can apply it --
+# actions/labeler does not create them.
+
+vendor/NVIDIA:
+  - changed-files:
+      - any-glob-to-any-file: src/flag_train/runtime/backend/_nvidia/**
+
+vendor/Ascend:
+  - changed-files:
+      - any-glob-to-any-file: src/flag_train/runtime/backend/_ascend/**
+
+vendor/Hygon:
+  - changed-files:
+      - any-glob-to-any-file: src/flag_train/runtime/backend/_hygon/**
+
+vendor/Iluvatar:
+  - changed-files:
+      - any-glob-to-any-file: src/flag_train/runtime/backend/_iluvatar/**
+
+vendor/MetaX:
+  - changed-files:
+      - any-glob-to-any-file: src/flag_train/runtime/backend/_metax/**
+
+vendor/THead:
+  - changed-files:
+      - any-glob-to-any-file: src/flag_train/runtime/backend/_thead/**
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file: tests/**
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - docs/**
+          - "**/*.md"

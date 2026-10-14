@@ -13,13 +13,10 @@
 # limitations under the License.
 """Hygon ``deepspeed`` operators.
 
-Mirrors ``flag_train.deepspeed``: a specialised operator goes in the same-named
-module here as the generic one it replaces -- ``deepspeed/blocked_flash.py`` beside
-``flag_train/deepspeed/blocked_flash.py`` -- so which generic module an override
-belongs to is readable from the path.
-
-Re-export the operator here, and then from ``ops/__init__.py``, which is the module
-``SpecOpRegistrar`` reads.
+A specialised operator goes in the same-named module here as the generic one it
+replaces -- ``deepspeed/blocked_flash.py`` beside
+``flag_train/deepspeed/blocked_flash.py`` -- and is listed in ``__all__`` below,
+which is what ``SpecOpRegistrar`` registers.
 """
 
 from .blocked_flash import blocked_flash

@@ -15,17 +15,12 @@
 
 The subpackages here mirror ``flag_train``'s, so which generic module an override
 belongs to is readable from the path: an override for
-``flag_train.deepspeed.<name>`` is defined in ``deepspeed/<name>.py``, re-exported
-by ``deepspeed/__init__.py`` and then by this file -- the module
-``SpecOpRegistrar`` reads.
+``flag_train.deepspeed.<name>`` lives in ``deepspeed/<name>.py`` and is re-exported
+by ``deepspeed/__init__.py`` -- so a new operator is one module beside it plus one
+line in its ``__all__``, and this file stays untouched.
 
-``SpecOpRegistrar`` collects this module's functions by name --
-``inspect.getmembers(..., inspect.isfunction)``, with no filtering -- and writes
-each one over the same-named generic implementation, so re-export the operators
-and nothing else: any other function bound here would be registered as an operator
-too.
+``SpecOpRegistrar`` reads this module and every subpackage below it, taking each
+package's operators from its ``__all__`` and writing each one over the same-named
+generic implementation -- so an operator is registered by listing it in the
+``__all__`` of the package that re-exports it.
 """
-
-from .deepspeed import blocked_flash
-
-__all__ = ["blocked_flash"]

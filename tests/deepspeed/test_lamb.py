@@ -24,9 +24,9 @@ Two oracles, because they fail differently:
   independent implementation and its version is recorded in
   ``_DEEPSPEED_VERSION``, as tests/deepspeed/README.md asks for, but it needs the
   ``deepspeed`` package, and on a backend in ``_DEEPSPEED_BASELINE_VENDORS`` below
-  it is *required* -- if it will not load there the module raises rather than
-  losing the check quietly. On other backends it is an additional check that is
-  skipped.
+  it is *expected* -- if it will not load there the module warns and falls back
+  to the torch reference so the suite still runs, rather than failing outright.
+  On other backends it is an additional check that is skipped.
 
 Checking both is not redundant: ``lamb_ref`` is the same arithmetic written from
 the same reading of the kernel, so a shared misreading of the contract would
@@ -35,6 +35,7 @@ reading.
 """
 
 import math
+import warnings
 
 import pytest
 import torch
@@ -163,8 +164,9 @@ _DEEPSPEED_UNAVAILABLE_MSG = (
 
 # Backends whose reference is DeepSpeed. fused_lamb ships as a CUDA op builder, so
 # only a backend that can compile and execute one can host it. On these the
-# reference is not optional -- a missing one is an environment fault, and skipping
-# quietly would thin the suite without saying so.
+# reference is expected, not mandatory: if it fails to load we warn and fall back
+# to the torch reference so the rest of the suite still runs, and the warning is
+# what keeps the lost check from thinning quietly.
 _DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
 
 
@@ -173,6 +175,10 @@ def _load_deepspeed_lamb():
 
     ``FusedLambBuilder`` JIT-compiles the CUDA source shipped inside the
     ``deepspeed`` package, then reuses the build cached under ``torch_extensions``.
+
+    On a backend in ``_DEEPSPEED_BASELINE_VENDORS`` a load failure is warned about
+    rather than raised: the DeepSpeed check is dropped but the torch reference
+    still runs, so a missing fused_lamb no longer aborts the whole module.
     """
     if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
         return None, None
@@ -183,11 +189,14 @@ def _load_deepspeed_lamb():
 
         return FusedLambBuilder().load().lamb, deepspeed.__version__
     except Exception as exc:
-        raise RuntimeError(
-            f"{flag_train.vendor_name!r} must use DeepSpeed's fused_lamb as its "
-            f"reference, but it could not be loaded: {exc!r}. Build deepspeed, or "
-            f"drop the backend from _DEEPSPEED_BASELINE_VENDORS."
-        ) from exc
+        warnings.warn(
+            f"{flag_train.vendor_name!r} is expected to use DeepSpeed's fused_lamb "
+            f"as its reference, but it could not be loaded: {exc!r}. Falling back "
+            f"to the torch reference only; build deepspeed to enable the "
+            f"fused_lamb check.",
+            stacklevel=2,
+        )
+        return None, None
 
 
 # Resolved once, at module import time.

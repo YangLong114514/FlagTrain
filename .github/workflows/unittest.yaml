@@ -1,0 +1,207 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The correctness suites, on every platform the repository has a backend for.
+#
+# `preprocess` decides two things and hands them to `backend-tests`, which runs
+# .github/workflows/backend-test.yaml once per selected backend:
+#
+#   1. what to run -- tools/ci_checks/select_changed_tests.py maps the PR's
+#      diff onto the operators it touches (`test_targets`), and answers
+#      `run_gpu` (false for a docs-only change);
+#   2. where to run it -- .github/backends.json is the single source of truth
+#      for the platforms, and a backend is selected when
+#
+#        enabled && (!label_gated || the PR carries its `label`)
+#
+#      so nvidia (label_gated false) runs on every PR that touches code, and
+#      each vendor runs only when triage has put its `vendor/*` label on the
+#      PR (see .github/labeler.yml). Every vendor entry ships `enabled: false`
+#      until its runner is registered; flipping that one field is all it takes
+#      to bring a platform online.
+#
+# The fields read from backends.json:
+#   backend, vendor, runner_label   identity and where the job is scheduled
+#   gpu_check                       script that waits for a free accelerator
+#   container{image, options, runs_on}
+#                                   the vendor runtime image a vendor job runs
+#                                   in; nvidia has none (it builds its own)
+#   label_gated                     whether a `vendor/*` label is required
+#   prebuilt_env                    whether that image already ships torch and
+#                                   the triton stack (false only for thead)
+#   enabled                         master switch per backend
+#
+# `unittest-required` is the always-running gate to require in branch
+# protection: the per-backend jobs are conditional, and GitHub does not count
+# a skipped job as passed, so requiring one directly would leave PRs pending.
+
+name: unit-test
+
+permissions:
+  contents: read
+  # The wait-for-triage step lists workflow runs, and that endpoint requires
+  # actions:read; without it GitHub answers 404 ("Not Found") rather than 403,
+  # which reads like a missing workflow.
+  actions: read
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches: ["main", "dev"]
+
+  pull_request:
+    branches: ["main"]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  preprocess:
+    # GitHub-hosted: this job only reads the PR's metadata, diff and labels.
+    # It must not consume a self-hosted runner, and it cannot need one: the
+    # vendor runners are gated by labels this job computes.
+    runs-on: ubuntu-latest
+    concurrency:
+      group: unit-test-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    outputs:
+      backend_matrix: ${{ steps.build-backend-matrix.outputs.matrix }}
+      test_targets: ${{ steps.select.outputs.test_targets }}
+      bench_targets: ${{ steps.select.outputs.bench_targets }}
+      changed_ops: ${{ steps.select.outputs.changed_ops }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # changed-files diffs against the PR base, and the selector's
+          # git-diff fallback walks base..head; neither works in a shallow
+          # clone.
+          fetch-depth: 0
+
+      - id: changed-files
+        if: github.event_name != 'workflow_dispatch'
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96  # v47.0.6
+
+      # Wait for triage before reading labels, so a vendor backend cannot be
+      # skipped merely because labeling had not happened yet. Only PRs are
+      # labelled, so only PRs wait -- on push/dispatch there is no triage run
+      # to wait for.
+      #
+      # Best-effort on purpose: the lookup needs triage.yaml to exist on the
+      # default branch, so the first PR that carries the file (this one, and
+      # any PR branched before triage lands) gets a 404 here. Failing the test
+      # job over that would be worse than what it costs -- labels read at their
+      # current value, so at worst one run schedules fewer backends, and the
+      # vendor entries are disabled until their runners exist anyway.
+      - id: wait-for-triage
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: ArcticLampyrid/action-wait-for-workflow@ff297b23789206858260877c4b83026d90c6db8c  # v1.3.0
+        with:
+          workflow: .github/workflows/triage.yaml
+
+      - id: get-labels
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            if (context.eventName !== 'pull_request') {
+              return '[]';
+            }
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+            console.log('Labels:', labels.map(label => label.name));
+            return JSON.stringify(labels.map(label => label.name));
+
+      # What to test: the operators this diff touches, or everything when the
+      # diff cannot be mapped (push, manual runs) -- and run_gpu=false for a
+      # change that cannot affect a kernel.
+      - id: select
+        shell: bash
+        env:
+          ALL_CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          python3 tools/ci_checks/select_changed_tests.py \
+            --event-name "${{ github.event_name }}" \
+            --changed-files "${ALL_CHANGED_FILES}"
+
+      # Where to test: filter backends.json as described in the header.
+      - id: build-backend-matrix
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const backends = JSON.parse(fs.readFileSync('.github/backends.json', 'utf8'));
+            const labels = JSON.parse(${{ steps.get-labels.outputs.result }} || '[]');
+            const runGpu = '${{ steps.select.outputs.run_gpu }}' === 'true';
+            const filtered = backends.filter(b =>
+              b.enabled &&
+              (!b.label_gated || labels.includes(b.label)) &&
+              (b.backend !== 'nvidia-cuda133' || runGpu));
+            const matrix = {
+              backend: filtered.map(b => b.backend),
+              include: filtered.map(b => ({
+                backend: b.backend,
+                vendor: b.vendor,
+                runner_label: b.runner_label,
+                gpu_check: b.gpu_check,
+                container_image: (b.container && b.container.image) || '',
+                container_options: (b.container && b.container.options) || '',
+                runs_on: (b.container && b.container.runs_on) || b.runner_label,
+                // workflow_call inputs are strings; hand the boolean over as
+                // one rather than relying on coercion.
+                prebuilt_env: String(b.prebuilt_env !== false),
+              }))
+            };
+            console.log('Backends selected:', JSON.stringify(matrix.backend));
+            core.setOutput('matrix', JSON.stringify(matrix));
+
+  backend-tests:
+    needs: preprocess
+    if: fromJSON(needs.preprocess.outputs.backend_matrix).backend[0] != null
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preprocess.outputs.backend_matrix) }}
+    uses: ./.github/workflows/backend-test.yaml
+    with:
+      backend: ${{ matrix.backend }}
+      vendor: ${{ matrix.vendor }}
+      runner_label: ${{ matrix.runner_label }}
+      runs_on: ${{ matrix.runs_on }}
+      gpu_check: ${{ matrix.gpu_check }}
+      container_image: ${{ matrix.container_image }}
+      container_options: ${{ matrix.container_options }}
+      test_targets: ${{ needs.preprocess.outputs.test_targets }}
+      bench_targets: ${{ needs.preprocess.outputs.bench_targets }}
+      prebuilt_env: ${{ matrix.prebuilt_env }}
+
+  # Gate job: the per-backend jobs are conditional (label-gated vendors,
+  # nvidia skipped for docs-only diffs), and GitHub does not count "skipped" as
+  # "passed" for a required check. Require this job instead; it always runs and
+  # treats an upstream skip as a pass.
+  unittest-required:
+    needs: [preprocess, backend-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs passed
+        shell: bash
+        run: |
+          echo '${{ toJSON(needs) }}' | jq .
+          failed=$(echo '${{ toJSON(needs) }}' | jq -r \
+            '[.[] | select(.result != "success" and .result != "skipped")] | length')
+          if [ "$failed" != "0" ]; then
+            echo "::error::One or more required jobs failed"
+            exit 1
+          fi

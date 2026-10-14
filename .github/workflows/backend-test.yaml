@@ -1,0 +1,309 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Run the suites on one backend. Called once per selected backend by
+# .github/workflows/unittest.yaml, which decides the inputs from
+# .github/backends.json.
+#
+# Two job shapes, because the platforms are not alike:
+#
+#   test-nvidia   builds .github/docker/gpu-runner.Dockerfile on the runner and
+#                 runs everything inside that image. The environment is what
+#                 the branch describes -- no registry round-trip, no push step
+#                 to keep in sync -- and Docker's layer cache makes the rebuild
+#                 cheap. Runs three stages: correctness against the device
+#                 reference, a quick pass whose reference is the CPU
+#                 (--ref=cpu --quick), and the performance suites.
+#
+#   test-container the vendor runtime images already ship that vendor's torch
+#                 and triton, so the job is a `container:` job on the vendor's
+#                 runner and tools/setup_env.sh only adds FlagTrain and the test
+#                 dependencies. thead is the exception (prebuilt_env false):
+#                 its image is the vendor's own, and setup_env.sh installs the
+#                 vendor stack from backends.yaml first.
+#
+# Neither shape uses a secret: a fork's PR builds and tests exactly like a
+# branch here.
+
+name: backend-test
+
+on:
+  workflow_call:
+    inputs:
+      backend:
+        description: "Backend key from .github/backends.json"
+        required: true
+        type: string
+      vendor:
+        description: "Vendor name (nvidia, ascend, ...)"
+        required: true
+        type: string
+      runner_label:
+        description: "Runner label the backend is registered under"
+        required: true
+        type: string
+      runs_on:
+        description: "Runner the job is scheduled on (container runners are host-specific)"
+        required: true
+        type: string
+      gpu_check:
+        description: "Script that waits for a free accelerator; empty skips the check"
+        required: false
+        type: string
+        default: ""
+      container_image:
+        description: "Vendor runtime image; empty means the nvidia (build-on-runner) shape"
+        required: false
+        type: string
+        default: ""
+      container_options:
+        description: "docker run options for that image"
+        required: false
+        type: string
+        default: ""
+      test_targets:
+        description: "pytest paths, or __ALL__"
+        required: false
+        type: string
+        default: "__ALL__"
+      bench_targets:
+        description: "benchmark paths, or __ALL__ (empty means no perf stage)"
+        required: false
+        type: string
+        default: ""
+      prebuilt_env:
+        description: "'true' when the image already ships torch and triton"
+        required: false
+        type: string
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  test-nvidia:
+    if: inputs.backend == 'nvidia-cuda133'
+    # The nvidia-cuda133 machine: the runner_label in .github/backends.json
+    # (h20), and the host the image's driver and toolkit versions were chosen
+    # for.
+    runs-on: ${{ inputs.runner_label }}
+    # A cold image build (apt cuda-toolkit, torch, flagtree) plus the DeepSpeed
+    # JIT builds on their first run; warm runs finish in a few minutes. This is
+    # the ceiling for a stuck run, not the expected duration.
+    timeout-minutes: 120
+    concurrency:
+      group: op-test-${{ inputs.backend }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      IMAGE: flagtrain-ci:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Check GPU availability
+        shell: bash
+        # The machine is shared, so wait for a card with >= 30 GB free (the
+        # script prints the per-GPU table and "Available GPUs: ...", and gives
+        # up after 10 minutes rather than holding the runner forever).
+        run: bash tools/gpu_check_nvidia.sh
+
+      - name: Build the CI image
+        shell: bash
+        # No --pull: the base image is pinned to a release tag, and re-pulling
+        # it every run would discard the layer cache that makes rebuilds
+        # cheap. If the base is ever re-tagged under the same name, remove the
+        # image on the runner once (docker rmi) so it is fetched again.
+        run: |
+          docker build \
+            -f .github/docker/gpu-runner.Dockerfile \
+            -t "${IMAGE}" \
+            .
+
+      - name: Run the correctness and performance suites
+        shell: bash
+        env:
+          TEST_TARGETS: ${{ inputs.test_targets }}
+          BENCH_TARGETS: ${{ inputs.bench_targets }}
+        run: |
+          # The image is the environment and the workspace is the code under
+          # test: the checkout is bind-mounted and pytest runs from it.
+          # pytest.ini puts src/ on sys.path, so nothing needs installing, and
+          # the suite's own imports (flag_train, its vendor backends) resolve
+          # from the mount.
+          #
+          # Everything the run writes goes outside the workspace, because the
+          # container runs as root while the workspace belongs to the runner
+          # user: root-owned files left behind would block the next job's
+          # checkout on a reused self-hosted workspace.
+          #   - results  -> $RUNNER_TEMP, uploaded as an artifact below
+          #   - caches   -> $FLAGTRAIN_CI_CACHE (override it if /tmp is small)
+          cache_root="${FLAGTRAIN_CI_CACHE:-/tmp/flagtrain-ci-cache}"
+          results="${RUNNER_TEMP}/flagtrain-results"
+          mkdir -p "${cache_root}/torch-extensions" "${cache_root}/triton-cache" "${results}"
+
+          # The two cache mounts are why the image pins TORCH_EXTENSIONS_DIR
+          # and TRITON_CACHE_DIR: DeepSpeed's JIT op builds (minutes) and
+          # Triton's compiled kernels survive between jobs on this machine.
+          # The DeepSpeed side is keyed by op name and nvcc flags, not by
+          # version — clear ${cache_root}/torch-extensions when the deepspeed
+          # pin in backends.yaml moves.
+          docker_opts=(--rm --gpus all --shm-size=2g
+            -v "${GITHUB_WORKSPACE}:/work"
+            -v "${results}:/out"
+            -v "${cache_root}/torch-extensions:/opt/torch-extensions"
+            -v "${cache_root}/triton-cache:/opt/triton-cache"
+            -e PYTHONDONTWRITEBYTECODE=1)
+
+          # Scoped PRs fail fast (-x), like FlagGems' per-PR test-op.sh; a full
+          # run (push to main, manual dispatch, infra-only diff) keeps going and
+          # reports every failure.
+          if [ "${TEST_TARGETS}" = "__ALL__" ] || [ -z "${TEST_TARGETS}" ]; then
+            test_targets="tests/"
+            extra_opts=""
+            fail_fast=false
+          else
+            test_targets="${TEST_TARGETS}"
+            extra_opts="-x"
+            fail_fast=true
+          fi
+
+          failures=0
+
+          # Correctness, device reference.
+          echo "correctness targets: ${test_targets}"
+          docker run "${docker_opts[@]}" -w /work "${IMAGE}" \
+            pytest -v -p no:cacheprovider ${extra_opts} \
+              --record json --output /out/accuracy_result.json \
+              ${test_targets} || failures=$((failures + 1))
+          if [ "${fail_fast}" = "true" ] && [ "${failures}" -ne 0 ]; then exit 1; fi
+
+          # Correctness, quick-CPU reference: FlagGems' second functional pass,
+          # where the reference runs on the CPU (--ref=cpu) with reduced shapes
+          # (--quick).
+          echo "quick-cpu targets: ${test_targets} (--ref=cpu --quick)"
+          docker run "${docker_opts[@]}" -w /work "${IMAGE}" \
+            pytest -v -p no:cacheprovider ${extra_opts} \
+              ${test_targets} --ref=cpu --quick || failures=$((failures + 1))
+          if [ "${fail_fast}" = "true" ] && [ "${failures}" -ne 0 ]; then exit 1; fi
+
+          # Performance, FlagGems' mode: --level core --record log. Runs with
+          # /out as the working dir so the log lands outside the workspace.
+          if [ "${BENCH_TARGETS}" = "__ALL__" ]; then
+            bench_targets="benchmark/deepspeed/"
+          else
+            bench_targets="${BENCH_TARGETS}"
+          fi
+          if [ -n "${bench_targets}" ]; then
+            bench_abs=""
+            for b in ${bench_targets}; do bench_abs="${bench_abs} /work/${b}"; done
+            echo "performance targets: ${bench_targets}"
+            docker run "${docker_opts[@]}" -w /out "${IMAGE}" \
+              pytest -v -p no:cacheprovider ${extra_opts} --level core \
+                --record log ${bench_abs} || failures=$((failures + 1))
+          else
+            echo "no performance targets for this change; skipping the performance suites"
+          fi
+
+          if [ "${failures}" -ne 0 ]; then
+            echo "::error::${failures} correctness/performance suite(s) failed"
+            exit 1
+          fi
+
+      - name: Upload the accuracy report
+        # Always: a failing run's report is what says which case failed.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: accuracy-result
+          path: ${{ runner.temp }}/flagtrain-results/accuracy_result.json
+          if-no-files-found: ignore
+
+  test-container:
+    if: inputs.backend != 'nvidia-cuda133'
+    runs-on: ${{ inputs.runs_on }}
+    container:
+      image: ${{ inputs.container_image }}
+      options: ${{ inputs.container_options }}
+    # A cold run pulls the image, installs FlagTrain's dependencies and pays
+    # the Triton/DeepSpeed compile on first use; 180 minutes is the ceiling for
+    # a stuck job, not the expected duration.
+    timeout-minutes: 180
+    concurrency:
+      group: op-test-${{ inputs.backend }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        # --login so the runtime image's /etc/profile.d environment (vendor
+        # SDK paths, the FlagOS venv) is in effect for every step.
+        shell: bash --login -e -o pipefail {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        # A reused self-hosted workspace can fail this (stale skip-worktree
+        # bits, root-owned leftovers); the retry action below handles it.
+        continue-on-error: true
+
+      # Fully-qualified remote ref rather than ./.github/actions/...: on the
+      # vendor runners (k8s-novolume style, like FlagGems') local action refs
+      # do not resolve against the workspace. The action is on main, and the
+      # vendor entries stay disabled until their runners exist, so the ref is
+      # resolvable before any of them runs.
+      - uses: flagos-ai/FlagTrain/.github/actions/checkout-retry@main
+        with:
+          fetch-depth: "1"
+
+      - name: Install FlagTrain and the test dependencies
+        run: |
+          if [ "${{ inputs.prebuilt_env }}" = "true" ]; then
+            bash tools/setup_env.sh "${{ inputs.backend }}" --prebuilt
+          else
+            bash tools/setup_env.sh "${{ inputs.backend }}" --no-prebuilt
+          fi
+
+      - name: Check accelerator availability
+        if: inputs.gpu_check != ''
+        run: bash ${{ inputs.gpu_check }}
+
+      - name: Run the correctness suites
+        env:
+          TEST_TARGETS: ${{ inputs.test_targets }}
+        run: |
+          # Correctness against the device reference, scoped to the operators
+          # this PR touched. The nvidia job additionally runs the quick-CPU
+          # pass and the performance suites; add those stages here the same
+          # way (docker-free: pytest runs in the image already) once a vendor
+          # is online and its runtime is known.
+          if [ "${TEST_TARGETS}" = "__ALL__" ] || [ -z "${TEST_TARGETS}" ]; then
+            test_targets="tests/"
+            extra_opts=""
+          else
+            test_targets="${TEST_TARGETS}"
+            extra_opts="-x"
+          fi
+          echo "correctness targets: ${test_targets}"
+
+          # Results go to $RUNNER_TEMP, not the workspace: the container runs
+          # as root and a reused self-hosted workspace must not collect
+          # root-owned files.
+          results="${RUNNER_TEMP}/flagtrain-results"
+          mkdir -p "${results}"
+          pytest -v -p no:cacheprovider ${extra_opts} \
+            --record json --output "${results}/accuracy_result.json" \
+            ${test_targets}
+
+      - name: Upload the accuracy report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: accuracy-result-${{ inputs.backend }}
+          path: ${{ runner.temp }}/flagtrain-results/accuracy_result.json
+          if-no-files-found: ignore

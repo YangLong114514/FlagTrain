@@ -1,0 +1,86 @@
+pypi_base: "https://resource.flagos.net/repository/flagos-pypi-{vendor}/simple"
+mirror: "https://mirrors.aliyun.com/pypi/simple"
+
+# Per-platform version pins. For the five vendor platforms the FlagOS runtime
+# image (harbor.baai.ac.cn/flagos-runtime/flagos-runtime-<backend>:2.2.0) is
+# what the CI container runs, and these fields document the stack inside it;
+# tools/setup_env.sh installs them only with --no-prebuilt, which today means
+# thead (its image is the vendor's own, with no FlagOS stack). Values come from
+# FlagGems' src/flag_gems/backends.yaml and build-infra's configs.yaml /
+# runtime/*.md, which are also where the drift between a pin here and the
+# version in a prebuilt image is resolved: the image wins, we install nothing.
+#
+# `env:` is applied by tools/setup_env.sh with $VAR expanded against the
+# running environment (a value that still holds an unexpanded $VAR after that
+# is skipped with a warning rather than written out literally).
+backends:
+  nvidia-cuda133:
+    python: "3.12"
+    cmake_backend: CUDA
+    triton: triton==3.6.0
+    flagtree: flagtree==0.7.0
+    env:
+      PATH: /usr/local/cuda/bin:$PATH
+      LD_LIBRARY_PATH: /usr/local/cuda-13.3/compat:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+    deps:
+      - torch==2.11.0+cu130
+      - torchaudio==2.11.0+cu130
+      - torchvision==0.26.0+cu130
+      - deepspeed==0.19.7
+      - deepspeed-kernels==0.0.1
+
+  ascend-cann900:
+    python: "3.11"
+    cmake_backend: NPU
+    triton: triton==3.5.0
+    flagtree: flagtree==0.7.0+ascend3.5
+    env_source:
+      - /usr/local/Ascend/cann/set_env.sh
+    deps:
+      - torch==2.10.0+cpu
+      - torch-npu==2.10.0
+
+  hygon:
+    python: "3.10"
+    triton: triton==3.5.1+das.opt1.dtk2604.torch290
+    flagtree: flagtree==0.7.0+hcu3.6
+    env:
+      TRITON_HIP_CLANG_PATH: /opt/dtk-26.04/aillvm/bin/clang-18
+    env_source:
+      - /opt/dtk-26.04/env.sh
+    deps:
+      - torch==2.9.0+das.opt1.dtk2604
+
+  iluvatar:
+    python: "3.12"
+    cmake_backend: IX
+    triton: triton==3.2.0+corex.4.5.0.20260804
+    flagtree: flagtree==0.7.0+iluvatar3.6
+    env:
+      COREX_ROOT: /usr/local/corex
+      PATH: $COREX_ROOT/bin:$PATH
+      LD_LIBRARY_PATH: $COREX_ROOT/lib:$LD_LIBRARY_PATH
+      CPATH: /usr/local/cuda-10.2/include
+    deps:
+      - torch==2.10.0+corex.4.5.0.20260804
+      - numpy<2
+
+  metax-maca3810:
+    python: "3.12"
+    triton: triton==3.6.0+metax3.8.1.0
+    flagtree: flagtree==0.7.0+metax3.6
+    env:
+      MACA_PATH: /opt/maca
+      PATH: /opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH
+      LD_LIBRARY_PATH: /opt/maca/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
+    deps:
+      - torch==2.10.0+metax3.8.1.0
+
+  thead:
+    python: "3.12"
+    triton: triton==3.6.0+v0.2.0.ppu2.1.1
+    flagtree: flagtree==0.7.0+ppu3.6
+    env_source:
+      - /usr/local/PPU_SDK/envsetup.sh
+    deps:
+      - torch==2.10.0+v0.1.0.ppu2.1.1

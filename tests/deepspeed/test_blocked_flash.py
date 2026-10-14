@@ -13,24 +13,37 @@
 # limitations under the License.
 """Correctness tests for the blocked (paged KV-cache) flash attention forward.
 
-Two oracles, because they fail differently:
+Which implementation this port is *answerable to* is picked by the same
+three-tier rule ``benchmark/deepspeed/test_blocked_flash.py`` picks its baseline
+by, branch for branch, and both files name the tier ``_ORACLE`` so the two
+suites describe one rule instead of two. See the comment above ``_ORACLE``.
+
+Three implementations are compared against, because they fail differently:
 
 * ``blocked_flash_ref`` -- a plain-torch composition that reads the *same*
-  atoms and the *same* paged cache. It is the primary check and runs on any
+  atoms and the *same* paged cache. It is checked on every tier and runs on any
   device, so the operator is testable off NVIDIA.
+* DeepSpeed's ``BlockedFlashAttn`` -- the kernel this port is a port *of*, run on
+  the same paged cache and atoms. It cannot express ``is_causal=False``, which is
+  this port's own extension.
 * ``flash_attn_varlen_func`` -- the oracle DeepSpeed's own
-  ``test_blocked_flash.py`` uses, over the densely gathered KV. It is an
-  independent implementation of the contract, but it ships with the CUDA-only
-  ``flash_attn`` package, so it is an additional check that is skipped where it
-  is unavailable. Its version is recorded in ``_FLASH_ATTN_VERSION``, as
-  tests/deepspeed/README.md asks for.
+  ``test_blocked_flash.py`` uses, over the densely gathered KV -- an independent
+  implementation of the contract. Its version is recorded in
+  ``_FLASH_ATTN_VERSION``, as tests/deepspeed/README.md asks for.
 
-The second one is not implied by the first: both could be wrong the same way
-about the paging, which the dense reference cannot see by construction.
+The tier decides which oracle the port is *measured against*. It does not
+suppress the others, and that is not a contradiction: none of the three implies
+another. The two paged oracles could be wrong the same way about the paging,
+which the dense one cannot see by construction, and all three could share a
+misreading of the causal offset that only ``blocked_flash_ref`` states outright.
+So every oracle that can run does run, and the tier's job is narrower -- it says
+which *absence* is a fault, so that a tier losing its oracle gets reported rather
+than getting quietly thinner.
 
 Cases are seeded, so a failure reproduces rather than depending on the draw.
 """
 
+import ctypes
 import importlib
 
 import pytest
@@ -45,12 +58,61 @@ from flag_train.deepspeed.blocked_flash import (
     _ATOM_PTR_HIGH,
     _ATOM_Q_LEN,
     _ATOM_Q_START,
+    _ATOM_STRIDE,
     _ATOM_TOTAL_EXTENT,
     _ATOM_UNUSED,
 )
 
 from .. import accuracy_utils as utils
 from ..conftest import TO_CPU
+
+# Which oracle this platform is answerable to, by availability rather than by
+# preference:
+#
+#   1. a backend in ``_DEEPSPEED_BASELINE_VENDORS`` runs DeepSpeed's own kernel.
+#      It is the kernel this port is a port *of*, and it is *required*: the
+#      loader below raises rather than letting the tier disappear quietly.
+#   2. any other backend with ``flash_attn`` installed runs
+#      ``flash_attn_varlen_func``. Requiring it costs nothing to state, because a
+#      backend reaches this tier only *because* the import succeeded.
+#   3. a backend with neither falls back to ``blocked_flash_ref``, the plain-torch
+#      composition -- which asks nothing of the platform, and is also checked on
+#      the two tiers above.
+#
+# Tiers 1 and 2 are therefore the ones a backend can be *held* to, and tier 3 is
+# the floor. ``_ORACLE`` below is computed from this same three-branch shape,
+# in this same order, as the benchmark's baseline choice -- the rule lives in two
+# files because the suites are separate, and the shared vocabulary is what makes
+# a divergence between them legible.
+#
+# The reference kernel is not compiled from source here: ``RaggedOpsBuilder``
+# links ``-lblockedflash`` against a prebuilt library shipped in the ``dskernels``
+# package (``op_builder/ragged_ops.py``).
+_DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
+
+
+def _load_deepspeed_blocked_flash():
+    """``(BlockedFlashAttn, DtypeEnum)``, or ``None`` on a backend that does not use it."""
+    if flag_train.vendor_name not in _DEEPSPEED_BASELINE_VENDORS:
+        return None
+
+    try:
+        from deepspeed.inference.v2.inference_utils import DtypeEnum
+        from deepspeed.inference.v2.kernels.ragged_ops import BlockedFlashAttn
+
+        return BlockedFlashAttn, DtypeEnum
+    except Exception as exc:
+        raise RuntimeError(
+            f"{flag_train.vendor_name!r} must use DeepSpeed's BlockedFlashAttn as "
+            f"its oracle, but it could not be loaded: {exc!r}. Its kernel ships "
+            f"prebuilt in the `dskernels` package (`op_builder/ragged_ops.py` links "
+            f"`-lblockedflash`), so install that for this platform, or drop the "
+            f"backend from _DEEPSPEED_BASELINE_VENDORS."
+        ) from exc
+
+
+# Resolved once, at module import time.
+_deepspeed_blocked_flash = _load_deepspeed_blocked_flash()
 
 try:
     import flash_attn
@@ -66,6 +128,15 @@ needs_flash_attn = pytest.mark.skipif(
     not _HAS_FLASH_ATTN, reason="flash_attn is not installed (CUDA-only oracle)"
 )
 
+# The tier, named. Compared by name rather than by identity so the two pinning
+# tests below, and the benchmark's printed line, all say the same word.
+if _deepspeed_blocked_flash is not None:
+    _ORACLE = "deepspeed"
+elif _HAS_FLASH_ATTN:
+    _ORACLE = "flash_attn"
+else:
+    _ORACLE = "torch_ref"
+
 # Tolerances come from the reference implementation, not from this repository's
 # generic per-dtype table: ``inference_test_utils.get_tolerances`` in DeepSpeed is
 # what the operator being ported is actually held to, and it is considerably
@@ -75,7 +146,7 @@ needs_flash_attn = pytest.mark.skipif(
 # rounded into the compute dtype before the PV dot, which costs ~5e-4 of absolute
 # accuracy for fp16 and more for bf16's eight mantissa bits.
 #
-# The same pair covers both oracles. The ``flash_attn`` cross-check is a
+# The same pair covers every oracle. The ``flash_attn`` cross-check is a
 # comparison between two independent fp16 kernels and is bounded by the same
 # argument, so it needs no separate tolerance.
 _TOLERANCES = {
@@ -122,9 +193,11 @@ _KV_BLOCK_SIZE = 64
 #
 # A plain-torch composition of the same contract, reading the *same* atoms and
 # the *same* paged cache as the kernel -- so it checks the paging and the causal
-# offset rather than restating the kernel's tiling. It is the primary oracle, and
-# it runs on any device, which is what makes the operator testable off NVIDIA:
-# the dense oracle below is CUDA-only.
+# offset rather than restating the kernel's tiling. It is checked on every tier,
+# and it runs on any device, which is what makes the operator testable off
+# NVIDIA: the dense oracle below is CUDA-only. It is also the only one of the
+# three that can be pushed onto the CPU under ``--ref cpu``, which is what makes
+# it the oracle on a backend that has neither of the other two.
 #
 # !! KEEP IN SYNC with benchmark/deepspeed/test_blocked_flash.py !!
 #
@@ -244,6 +317,73 @@ def build_blocked_flash_atoms(seq_params, q_block_size, kv_block_size, device):
     )
 
 
+def _deepspeed_atoms(seq_params, q_block_size, kv_block_size, device):
+    """Atoms in the reference layout, for the DeepSpeed oracle.
+
+    Its kernel dereferences slot [0] as a *host pointer* to the block list, over
+    UVA, so the list has to live in pinned memory and each atom has to carry the
+    address of its own sequence's run. ``build_blocked_flash_atoms`` writes an
+    offset there instead -- a Triton kernel cannot dereference a host pointer
+    (blocked_flash.md §5) -- so this turns the offset back into the pointer.
+
+    Returns:
+        tuple: ``(atoms, pinned)``. ``pinned`` comes back because the atoms point
+        into it: letting it go would leave the kernel reading freed memory.
+    """
+    atoms, kv_block_idx = build_blocked_flash_atoms(
+        seq_params, q_block_size, kv_block_size, device
+    )
+    pinned = kv_block_idx.cpu().pin_memory()
+    base = pinned.data_ptr()
+    addresses = torch.tensor(
+        [base + 4 * offset for offset in atoms[:, 0].tolist()],
+        dtype=torch.int64,
+        device=device,
+    )
+    atoms[:, 0:2] = addresses.view(torch.int32).reshape(-1, 2)
+    return atoms, pinned
+
+
+_deepspeed_kernels = {}
+
+
+def _deepspeed_kernel(head_size, dtype):
+    """One kernel per (head_size, dtype); the constructor is what loads the op."""
+    key = (head_size, dtype)
+    if key not in _deepspeed_kernels:
+        BlockedFlashAttn, DtypeEnum = _deepspeed_blocked_flash
+        _deepspeed_kernels[key] = BlockedFlashAttn(head_size, DtypeEnum(dtype))
+    return _deepspeed_kernels[key]
+
+
+def _deepspeed_geometry(head_size):
+    """``(q_block_size, kv_block_size)`` DeepSpeed's kernel is *built* for.
+
+    Neither is a parameter of its launcher. ``blocked_flash.cpp`` sets
+    ``k_row_stride`` from ``k.stride(1)``, so the row pitch is read off the tensor
+    -- but the number of tokens in a cache block never is, because it is a
+    template argument of the kernel. Upstream fixes it with these two helpers,
+    which is why its own test calls them rather than choosing either value.
+
+    This matters here because the cache this suite pages is sized by
+    ``kv_block_size``, which the test chooses freely. Handed a cache whose block
+    size is not the one the kernel was built for, the kernel walks it at the
+    wrong pitch: it reads the wrong tokens, and since the block list it follows
+    then runs off the end of the sequence's blocks, it can touch memory that is
+    not the sequence's at all. So the geometry is a precondition of asking this
+    oracle anything, not a preference.
+
+    Imported lazily: the module is only reachable when the oracle loaded, which
+    is the only situation that calls this.
+    """
+    from deepspeed.inference.v2.kernels.ragged_ops.blocked_flash.blocked_flash import (
+        get_kv_block_size,
+        get_q_block_size,
+    )
+
+    return get_q_block_size(head_size), get_kv_block_size(head_size)
+
+
 def _dense_reference(
     q,
     k,
@@ -283,11 +423,20 @@ def _run_case(
     is_causal=True,
     permute_blocks=False,
     out_pad_columns=0,
+    require_deepspeed=False,
 ):
-    """Page the KV for ``seq_params``, run the operator, and check both oracles.
+    """Page the KV for ``seq_params``, run the operator, and check every oracle.
 
     ``permute_blocks`` and ``out_pad_columns`` exist to reach states the rest of
     the suite never produces -- see the tests that set them.
+
+    ``require_deepspeed`` asserts that the DeepSpeed oracle was actually
+    compared. It is off by default because most cases cannot be: the kernel is
+    templated on a fixed cache block size, so it only answers for a cache built
+    the way it expects (see ``_deepspeed_geometry``), and the suite deliberately
+    varies that size. A caller that means to prove the tier-1 comparison still
+    happens has to say so, or a case that quietly landed outside the geometry
+    would report success for a comparison that never ran.
     """
     device = flag_train.device
     # Seeded per case, so a failure reproduces instead of depending on the draw.
@@ -425,9 +574,15 @@ def _run_case(
 
     _assert_close(out, ref, dtype, rtol, atol)
 
-    # ``flash_attn_varlen_func`` is CUDA-only, so it cannot serve as the CPU
-    # reference; ``--ref cpu`` runs without it.
-    if _HAS_FLASH_ATTN and not TO_CPU:
+    # ``flash_attn_varlen_func`` over the densely gathered KV, checked whenever
+    # the package imported -- ``--ref cpu`` included. ``--ref cpu`` moves the
+    # operands of the *reference* to the CPU; this is not the reference. It is a
+    # device oracle comparing two device tensors, and ``q``/``k_cache``/
+    # ``v_cache`` stay on the device under either mode, because the CPU path
+    # below copies them rather than rebinding them. Gating this on ``TO_CPU``
+    # would let the oracle a ``flash_attn`` backend is *answerable to* disappear
+    # under a flag that says nothing about that backend.
+    if _HAS_FLASH_ATTN:
         run_kvs = torch.cat(full_kvs, dim=0)
         dense = _dense_reference(
             q,
@@ -443,6 +598,75 @@ def _run_case(
             causal=is_causal,
         )
         _assert_close(out, dense, dtype, rtol, atol)
+
+    # The reference implementation's own kernel, on the same inputs -- the oracle
+    # this port is answerable to. Checked whenever it loaded, which on the
+    # backends that require it is always.
+    #
+    # Two cases it cannot express, and they are different in kind:
+    #
+    # * ``is_causal=False``, which the reference class hardcodes to causal -- it
+    #   has no way to say what this port's ``is_causal`` extension says. That is
+    #   this port having *more* than the kernel.
+    # * a cache whose ``q_block_size``/``kv_block_size`` are not the ones the
+    #   kernel was built for (``_deepspeed_geometry``). That is this port having
+    #   *different* geometry: the kernel would answer about a cache that is not
+    #   this one, and read past the sequence's blocks doing it, so the comparison
+    #   is refused rather than attempted.
+    #
+    # The second is also why ``require_deepspeed`` exists: for the ordinary
+    # parametrized cases a refusal is correct, but a case whose whole purpose is
+    # to prove tier 1 is still reached must not be able to pass by being refused.
+    deepspeed_geometry_ok = _deepspeed_blocked_flash is not None and (
+        _deepspeed_geometry(head_size) == (q_block_size, kv_block_size)
+    )
+    if require_deepspeed and not (deepspeed_geometry_ok and is_causal):
+        raise AssertionError(
+            f"case (head_size={head_size}, q_block_size={q_block_size}, "
+            f"kv_block_size={kv_block_size}, is_causal={is_causal}) asks for the "
+            f"DeepSpeed oracle to be compared, but it is one the oracle cannot "
+            f"express. Pick the geometry from _deepspeed_geometry, and keep "
+            f"is_causal True."
+        )
+    if deepspeed_geometry_ok and is_causal:
+        deepspeed_atoms, deepspeed_pinned = _deepspeed_atoms(
+            seq_params, q_block_size, kv_block_size, device
+        )
+        reference_out = torch.zeros_like(out)
+        _deepspeed_kernel(head_size, dtype)(
+            reference_out, q, k_cache, v_cache, deepspeed_atoms, softmax_scale
+        )
+        _assert_close(reference_out, ref, dtype, rtol, atol)
+
+
+@pytest.mark.blocked_flash
+def test_matches_deepspeed_oracle():
+    """Pin tier 1 -- DeepSpeed's own kernel -- explicitly.
+
+    A tier that quietly stopped being reached would thin the suite without
+    saying so. On a backend in ``_DEEPSPEED_BASELINE_VENDORS`` the load itself
+    cannot fail quietly, because the module raises at import; what this catches
+    is the *comparison* ceasing to happen. That is not hypothetical -- it is what
+    happened while this test shared its name with the tier-2 test below -- and
+    ``require_deepspeed`` is what keeps it from coming back, since every other
+    case in the suite declines this oracle on geometry for good reason.
+
+    The skip serves the backends where tier 1 does not apply at all.
+    """
+    if _deepspeed_blocked_flash is None:
+        pytest.skip(f"tier 1 is not this backend's oracle; this one is {_ORACLE!r}")
+
+    # Ask the oracle which geometry it can answer for, rather than assuming one:
+    # the case has to be inside it or ``require_deepspeed`` refuses.
+    q_block_size, kv_block_size = _deepspeed_geometry(_HEAD_SIZE)
+    _run_case(
+        [(332, 628)],
+        n_heads_q=32,
+        n_heads_kv=32,
+        q_block_size=q_block_size,
+        kv_block_size=kv_block_size,
+        require_deepspeed=True,
+    )
 
 
 @pytest.mark.blocked_flash
@@ -483,10 +707,16 @@ def test_continuation(seq_params):
 )
 def test_head_size(head_size, q_block_size):
     """64 and 128 are the sizes models use; 256 is the launcher's validated
-    ceiling. 256 only fits the shared-memory budget with a narrow query tile --
-    the kernel holds BLOCK_M * BLOCK_D of queries and BLOCK_N * BLOCK_D of keys
-    at once, so at head_size 256 a 128-row tile asks for 208 KB against the
-    A100's 163 KB. The tilings are the operator's own; this test follows them.
+    ceiling, exercised at a narrow query tile.
+
+    256 *used* to need one: the kernel holds BLOCK_M * BLOCK_D of queries and
+    BLOCK_N * BLOCK_D of keys at once, and with the KV tile capped at 128 a
+    128-row tile asked for 224 KB against the A100's 163 KB -- measured, and it
+    did fail with OutOfResources. Capping the KV tile at 64 brings the same case
+    to 144 KB, which launches, so the narrow tile here is no longer a
+    requirement. It is kept because a second query tile is worth covering, not
+    because the wide one is unavailable; see ``_BLOCK_N_MAX`` in
+    ``flag_train.deepspeed.blocked_flash``.
     """
     _run_case(
         [(128, 128), (192, 38), (1, 814)],
@@ -498,7 +728,7 @@ def test_head_size(head_size, q_block_size):
 @pytest.mark.blocked_flash
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 def test_dtype(dtype):
-    """Both dtypes the launcher accepts must clear both oracles."""
+    """Both dtypes the launcher accepts must clear every oracle."""
     _run_case([(128, 128), (192, 38), (1, 814)], dtype=dtype)
 
 
@@ -555,10 +785,332 @@ def test_fully_composed():
 @pytest.mark.blocked_flash
 @needs_flash_attn
 @pytest.mark.parametrize("seq_params", [(332, 628), (64, 128)])
-def test_matches_deepspeed_oracle(seq_params):
-    """Pin the flash-attn oracle explicitly, so a run that quietly stopped
-    reaching it (flash_attn missing) is visible rather than silently thinner."""
+def test_matches_flash_attn_oracle(seq_params):
+    """Pin tier 2 -- ``flash_attn_varlen_func`` -- explicitly, so a run that
+    quietly stopped reaching it is visible rather than silently thinner.
+
+    The name has to be its own. This test used to be spelled
+    ``test_matches_deepspeed_oracle``, which is the tier-1 test's name, and a
+    second ``def`` of a module-level name *replaces* the first: pytest collects
+    what the module holds, not what it defined, so the tier-1 pin was not merely
+    unreachable, it was never collected. One pin per tier, one name per pin.
+    """
     _run_case([seq_params])
+
+
+# ---------------------------------------------------------------------------
+# Atom layout: checking what cannot be read, and converting what can
+#
+# Slot [0] is an offset into ``kv_block_idx`` in this port and a host pointer
+# upstream, so the two layouts are not interchangeable even though the rest of
+# the record is byte-identical. The kernel indexes with slot [0] unguarded, so
+# handing it the wrong layout is an illegal memory access rather than a wrong
+# number -- and an illegal access does not fail one test, it takes the CUDA
+# context down, so every later test in the same process fails for a reason that
+# has nothing to do with it. That is how a single wrong cache block size turned
+# into 37 failures across this file.
+#
+# Both tools below live here rather than in the operator module, on the rule
+# COMPATIBILITY.md §0 states: a name kept in the package for the tests' benefit is
+# the shape that let the previous ``BlockedFlashAttn`` rot unnoticed. They check
+# and translate an operator's *arguments*, which makes them the caller's tools.
+# The operator does not guard itself -- a check on every call costs a device sync,
+# measured at ~45 us on an A100, more than the kernel at the shapes it serves --
+# so validation is a caller's step, once per atom tensor.
+# ---------------------------------------------------------------------------
+
+
+def _host_atoms(attention_atoms):
+    """``attention_atoms`` as a list of host rows -- one transfer, one sync.
+
+    Whole rows rather than the columns a caller happens to want: the record is
+    eight int32, so moving all of it costs nothing worth saving, while selecting
+    columns first would add a kernel of its own and the round trip is the
+    expensive part.
+
+    ``tolist()`` rather than ``numpy()``: the fields are int32 and are meant to be
+    read back as such, so a value DeepSpeed stored as the low half of a pointer
+    comes back *negative* rather than as a large positive number, which is what
+    makes the range check below able to see it at all.
+    """
+    return attention_atoms.detach().to("cpu").tolist()
+
+
+def _check_atom_bounds(rows, numel):
+    """Raise unless every atom's block window lies inside ``kv_block_idx``.
+
+    Slot ``[0]`` is an *offset into ``kv_block_idx``* in this port and a 64-bit
+    *host pointer* upstream (see the operator module's docstring). Handed
+    upstream's atoms, the kernel would read ``kv_block_idx[-1354760192]`` -- an
+    illegal memory access that takes the CUDA context down with it, so every later
+    test in the same process fails for a reason unrelated to itself.
+
+    The check is host-side because the alternative is worse. Clamping in the
+    kernel would avoid the fault but answer *silently*, which for a wrong layout
+    is the failure mode hardest to notice; and a device-side flag would need a
+    sync to read back, which is the cost the caller is trying to pay only once.
+    """
+    for index, row in enumerate(rows):
+        offset = row[int(_ATOM_BLOCK_OFFSET)]
+        count = row[int(_ATOM_KV_BLOCKS)]
+        if offset < 0 or offset + count > numel:
+            raise ValueError(
+                f"attention_atoms[{index}] addresses kv_block_idx out of range: "
+                f"slot {int(_ATOM_BLOCK_OFFSET)} is {offset} and slot "
+                f"{int(_ATOM_KV_BLOCKS)} is {count}, against a kv_block_idx of "
+                f"{numel} element(s). Slot {int(_ATOM_BLOCK_OFFSET)} is an offset "
+                f"into kv_block_idx here; DeepSpeed's atoms put the low and high "
+                f"halves of a host pointer in slots "
+                f"[{int(_ATOM_BLOCK_OFFSET)}, {int(_ATOM_PTR_HIGH)}] instead. Pass "
+                f"those through from_deepspeed_atoms() first."
+            )
+
+
+def validate_attention_atoms(attention_atoms, kv_block_idx):
+    """Check that ``attention_atoms`` are laid out the way ``blocked_flash`` reads them.
+
+    Costs one device sync, so call it once per atom tensor rather than per step.
+    The operator does not call it: it cannot afford to, and a caller that built
+    the atoms knows which layout it built them in.
+
+    Raises:
+        ValueError: if the atoms' block windows do not fit ``kv_block_idx``,
+            which is what DeepSpeed-layout atoms look like from here.
+    """
+    if attention_atoms.dim() != 2 or attention_atoms.size(1) != int(_ATOM_STRIDE):
+        raise ValueError(
+            f"attention_atoms must be [num_atoms, {int(_ATOM_STRIDE)}] int32, got "
+            f"{tuple(attention_atoms.shape)}"
+        )
+    _check_atom_bounds(_host_atoms(attention_atoms), kv_block_idx.numel())
+
+
+def from_deepspeed_atoms(attention_atoms, device=None):
+    """Convert DeepSpeed-layout atoms into the layout ``blocked_flash`` reads.
+
+    DeepSpeed's atoms carry a 64-bit *host pointer* to their block list across
+    slots ``[0]`` and ``[1]``, in pinned memory it dereferences over UVA. A Triton
+    kernel cannot follow that pointer, so this port addresses a device tensor
+    instead (see the operator module's docstring). Everything else about the
+    layout is identical, which is why this is a translation of one field rather
+    than of the record.
+
+    The atoms of one sequence share a pointer, so the lists are deduplicated by
+    address: the result is one run per sequence, the shape
+    ``build_blocked_flash_atoms`` produces, and for atoms built from the same
+    cache the two agree exactly. Deduplicating is not just tidiness -- it is what
+    makes the two agree, since the port's own builder emits one run per sequence
+    too, with each sequence's atoms sharing an offset.
+
+    Args:
+        attention_atoms (Tensor): ``[num_atoms, 8]`` int32 atoms in DeepSpeed's
+            layout, on the device or in the pinned host buffer they came in.
+        device (optional): where to put the result. Defaults to this tensor's
+            device, falling back to the active backend when it is a host buffer.
+
+    Returns:
+        tuple: ``(atoms, kv_block_idx)``, ready to pass to ``blocked_flash``.
+
+    The pointer must still be live: this reads through it, so the buffer the
+    atoms point into has to outlive the call. That is the same obligation
+    DeepSpeed's own kernel carries, which is why its atom builder hands the
+    buffer back to the caller to hold.
+    """
+    if device is None:
+        device = (
+            attention_atoms.device
+            if attention_atoms.device.type != "cpu"
+            else flag_train.device
+        )
+
+    host = attention_atoms.detach().to("cpu", torch.int32)
+    rows = host.tolist()
+
+    def address_of(row):
+        return ((row[int(_ATOM_PTR_HIGH)] & 0xFFFFFFFF) << 32) | (
+            row[int(_ATOM_BLOCK_OFFSET)] & 0xFFFFFFFF
+        )
+
+    addresses = [address_of(row) for row in rows]
+
+    # A sequence's atoms share one pointer but *not* one ``kv_blocks``: an atom's
+    # KV window is sized to the history its own query rows can see, so the last
+    # atom of a sequence reads more blocks than the first (measured on a
+    # three-atom sequence: 2, then 3). Sizing the run by whichever atom claims the
+    # address first would cut it short and silently drop the blocks only the later
+    # atoms asked for -- so each run is sized to the longest window read from it.
+    lengths = {}
+    order = []
+    for address, row in zip(addresses, rows):
+        if address not in lengths:
+            lengths[address] = 0
+            order.append(address)
+        lengths[address] = max(lengths[address], row[int(_ATOM_KV_BLOCKS)])
+
+    blocks = []
+    offset_of = {}
+    for address in order:
+        offset_of[address] = len(blocks)
+        if lengths[address]:
+            blocks.extend(
+                ctypes.cast(
+                    address, ctypes.POINTER(ctypes.c_int32 * lengths[address])
+                ).contents
+            )
+
+    converted = host.clone()
+    converted[:, int(_ATOM_BLOCK_OFFSET)] = torch.tensor(
+        [offset_of[address] for address in addresses], dtype=torch.int32
+    )
+    converted[:, int(_ATOM_PTR_HIGH)] = 0
+
+    return (
+        converted.contiguous().to(device=device),
+        torch.tensor(blocks, dtype=torch.int32, device=device),
+    )
+
+
+def _page_one_case(seq_params, head_size=_HEAD_SIZE, n_heads_q=16, n_heads_kv=16):
+    """Query and paged cache for one case, with every sequence starting empty.
+
+    Only what the conversion test below needs: it goes on to build both atom
+    layouts from this cache -- ``build_blocked_flash_atoms`` for the one this port
+    reads, ``_deepspeed_atoms`` for the one upstream writes -- and compares them
+    after a round trip through ``from_deepspeed_atoms``.
+    """
+    device = flag_train.device
+    torch.manual_seed(0)
+    total_q = sum(q_len for q_len, _ in seq_params)
+    n_blocks = sum(
+        (h + q + _KV_BLOCK_SIZE - 1) // _KV_BLOCK_SIZE for q, h in seq_params
+    )
+    qkv = torch.randn(
+        (total_q, (n_heads_q + 2 * n_heads_kv) * head_size),
+        dtype=torch.float16,
+        device=device,
+    )
+    q = qkv[:, : n_heads_q * head_size]
+    inflight = qkv[:, n_heads_q * head_size :]
+    k_cache = torch.zeros(
+        (n_blocks, _KV_BLOCK_SIZE, n_heads_kv, head_size),
+        dtype=torch.float16,
+        device=device,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    first, cursor = 0, 0
+    for q_len, h_len in seq_params:
+        # One sequence, no history, so the cache is exactly its own KV and the
+        # case stays about the atom layout rather than about the paging.
+        assert h_len == 0
+        cur = inflight[cursor : cursor + q_len]
+        cursor += q_len
+        n_seq_blocks = (q_len + _KV_BLOCK_SIZE - 1) // _KV_BLOCK_SIZE
+        padded = torch.zeros(
+            (n_seq_blocks * _KV_BLOCK_SIZE, 2 * n_heads_kv * head_size),
+            dtype=torch.float16,
+            device=device,
+        )
+        padded[:q_len] = cur
+        paged = padded.reshape(n_seq_blocks, _KV_BLOCK_SIZE, 2 * n_heads_kv * head_size)
+        k_cache[first : first + n_seq_blocks] = paged[
+            :, :, : n_heads_kv * head_size
+        ].reshape(n_seq_blocks, _KV_BLOCK_SIZE, n_heads_kv, head_size)
+        v_cache[first : first + n_seq_blocks] = paged[
+            :, :, n_heads_kv * head_size :
+        ].reshape(n_seq_blocks, _KV_BLOCK_SIZE, n_heads_kv, head_size)
+        first += n_seq_blocks
+    return q, k_cache, v_cache
+
+
+@pytest.mark.blocked_flash
+def test_validate_attention_atoms_refuses_upstreams_layout():
+    """The validator must reject upstream's layout, and name the atom it rejected.
+
+    This is what stands between a wrong atom layout and the kernel. Slot [0] is an
+    index into ``kv_block_idx`` here and a 64-bit host pointer upstream, and the
+    kernel uses it unguarded -- so upstream's atoms are an illegal memory access
+    rather than a wrong number: the negative value a pointer's low half reads as
+    sent the kernel to ``kv_block_idx[-1354760192]``, which takes the CUDA context
+    down and fails every later test in the process for a reason of its own.
+
+    Note what this test does *not* do: hand upstream's atoms to ``blocked_flash``.
+    The operator does not check the layout -- a check on every call costs a device
+    sync, measured at ~45 us on an A100, more than the kernel at the shapes it
+    serves -- so that call would fault, and the fault is the thing being avoided.
+    Validation is the caller's step, which is why it is a function here and not a
+    guard in the operator.
+    """
+    device = flag_train.device
+    seq = [(128, 0), (192, 0), (1, 0)]
+    atoms, kv_block_idx = build_blocked_flash_atoms(
+        seq, _Q_BLOCK_SIZE, _KV_BLOCK_SIZE, device
+    )
+    deepspeed_atoms, _ = _deepspeed_atoms(seq, _Q_BLOCK_SIZE, _KV_BLOCK_SIZE, device)
+
+    with pytest.raises(ValueError, match="out of range"):
+        validate_attention_atoms(deepspeed_atoms, kv_block_idx)
+
+    # And it is the layout it objected to, not everything: this port's own atoms
+    # pass the same check.
+    validate_attention_atoms(atoms, kv_block_idx)
+
+
+@pytest.mark.blocked_flash
+def test_from_deepspeed_atoms_reproduces_this_ports_atoms():
+    """The translation must land on exactly what this port builds for itself.
+
+    ``_deepspeed_atoms`` is the same cache expressed upstream's way, so a
+    conversion that is right has to return the *same* atoms and the same
+    ``kv_block_idx`` -- not merely an equivalent pair. Comparing the two
+    constructions is therefore a stronger check than running both, and it holds
+    the deduplication honest too: upstream's atoms share one pointer per sequence,
+    and collapsing them wrongly would show up here as a different block list.
+    """
+    device = flag_train.device
+    seq = [(128, 0), (192, 0), (1, 0)]
+    ours, our_blocks = build_blocked_flash_atoms(
+        seq, _Q_BLOCK_SIZE, _KV_BLOCK_SIZE, device
+    )
+    deepspeed_atoms, _ = _deepspeed_atoms(seq, _Q_BLOCK_SIZE, _KV_BLOCK_SIZE, device)
+
+    converted, converted_blocks = from_deepspeed_atoms(deepspeed_atoms)
+
+    assert torch.equal(converted_blocks, our_blocks)
+    assert torch.equal(converted, ours)
+    # Slot [1] held the pointer's high half and means nothing in this layout.
+    assert converted[:, int(_ATOM_PTR_HIGH)].eq(0).all()
+    validate_attention_atoms(converted, converted_blocks)
+
+
+@pytest.mark.blocked_flash
+def test_converted_atoms_drive_the_operator():
+    """End to end: upstream's atoms, translated, must produce the right answer."""
+    device = flag_train.device
+    seq = [(128, 0), (192, 0), (1, 0)]
+    q, k_cache, v_cache = _page_one_case(seq)
+    deepspeed_atoms, _ = _deepspeed_atoms(seq, _Q_BLOCK_SIZE, _KV_BLOCK_SIZE, device)
+    ref_atoms, ref_blocks = build_blocked_flash_atoms(
+        seq, _Q_BLOCK_SIZE, _KV_BLOCK_SIZE, device
+    )
+
+    total_q = sum(q_len for q_len, _ in seq)
+    ref = torch.zeros((total_q, 16 * _HEAD_SIZE), dtype=torch.float16, device=device)
+    blocked_flash_ref(ref, q, k_cache, v_cache, ref_atoms, ref_blocks, 1.0)
+
+    converted, converted_blocks = from_deepspeed_atoms(deepspeed_atoms)
+    out = torch.zeros_like(ref)
+    blocked_flash(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        converted,
+        converted_blocks,
+        1.0,
+        q_block_size=_Q_BLOCK_SIZE,
+    )
+
+    _assert_close(out, ref, torch.float16, *_TOLERANCES[torch.float16])
 
 
 # ---------------------------------------------------------------------------

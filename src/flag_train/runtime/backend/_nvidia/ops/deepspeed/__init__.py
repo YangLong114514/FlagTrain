@@ -19,10 +19,10 @@ module here as the generic one it replaces -- ``deepspeed/lamb.py`` beside
 is readable from the path.
 
 Empty on purpose: the generic implementations are the NVIDIA ones, so nothing in
-``flag_train.deepspeed`` needs a kernel of its own here yet. To specialise one,
-define it under this package, re-export it here (``from .lamb import lamb``), then
-re-export it from ``ops/__init__.py``, which is the module ``SpecOpRegistrar``
-reads.
+``flag_train.deepspeed`` needs a kernel of its own here yet -- hence the empty
+``__all__``. To specialise one, define it under this package, re-export it here
+(``from .lamb import lamb``) and list it in ``__all__``, which is what
+``SpecOpRegistrar`` registers.
 """
 
 __all__ = []

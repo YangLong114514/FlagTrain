@@ -11,17 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Backend ``deepspeed`` operators.
+"""Ascend ``deepspeed`` operators.
 
-Mirrors ``flag_train.deepspeed``: a specialised operator goes in the same-named
-module here as the generic one it replaces -- ``deepspeed/lamb.py`` beside
-``flag_train/deepspeed/lamb.py`` -- so which generic module an override belongs to
-is readable from the path.
-
-Empty on purpose: nothing in ``flag_train.deepspeed`` needs a kernel of its own
-here yet. To specialise one, define it under this package, re-export it here
-(``from .lamb import lamb``), then re-export it from ``ops/__init__.py``, which is
-the module ``SpecOpRegistrar`` reads.
+A specialised operator goes in the same-named module here as the generic one it
+replaces -- ``deepspeed/blocked_flash.py`` beside
+``flag_train/deepspeed/blocked_flash.py`` -- and is listed in ``__all__`` below,
+which is what ``SpecOpRegistrar`` registers.
 """
 
-__all__ = []
+from .blocked_flash import blocked_flash
+
+__all__ = ["blocked_flash"]

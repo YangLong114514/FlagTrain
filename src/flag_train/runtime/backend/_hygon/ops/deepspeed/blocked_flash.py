@@ -41,10 +41,10 @@ implementation used by both, so a backend cannot accept something another
 rejects. ``AtomBuilder`` and ``RaggedBatchWrapper`` are *not* imported: they live
 in the test files now, and neither implementation of this kernel calls them.
 
-Registration is by name. ``_hygon/ops/deepspeed/__init__.py`` re-exports this
-module's ``blocked_flash``, and ``SpecOpRegistrar`` writes it over the same-named
-generic function in ``flag_train.deepspeed`` when that package is imported -- the
-namespace the tests and the benchmark read the operator from.
+Registration is by name. ``_hygon/ops/__init__.py`` re-exports this module's
+``blocked_flash`` straight from here, and ``SpecOpRegistrar`` writes it over the
+same-named generic function in ``flag_train.deepspeed`` when that package is
+imported -- the namespace the tests and the benchmark read the operator from.
 """
 
 import functools

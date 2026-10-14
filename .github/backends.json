@@ -1,0 +1,96 @@
+[
+  {
+    "backend": "nvidia-cuda133",
+    "vendor": "nvidia",
+    "runner_label": "h20",
+    "command_aliases": ["h20", "a100"],
+    "label": "vendor/NVIDIA",
+    "gpu_check": "tools/gpu_check_nvidia.sh",
+    "label_gated": false,
+    "prebuilt_env": false,
+    "enabled": true,
+    "note": "Runs natively on the h20 runner: the job builds .github/docker/gpu-runner.Dockerfile there and runs pytest inside it, so there is no container: block and prebuilt_env does not apply."
+  },
+  {
+    "backend": "ascend-cann900",
+    "vendor": "ascend",
+    "runner_label": "cann9",
+    "command_aliases": ["ascend", "cann9"],
+    "label": "vendor/Ascend",
+    "gpu_check": "tools/gpu_check_ascend.sh",
+    "label_gated": true,
+    "prebuilt_env": true,
+    "enabled": false,
+    "container": {
+      "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-ascend-cann9.0.0:2.2.0",
+      "options": "--device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 --device=/dev/davinci_manager --device=/dev/devmm_svm --device=/dev/hisi_hdc -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /etc/ascend_install.info:/etc/ascend_install.info --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
+      "runs_on": "cann9"
+    },
+    "note": "FlagGems runs ascend natively on cann9; the device/mount set above is the standard Ascend container one and has NOT been tried here -- verify it on the runner when enabling, and fall back to FlagGems' native job (setup_env.sh in the job instead of a container) if the runner cannot start containers with NPUs."
+  },
+  {
+    "backend": "hygon",
+    "vendor": "hygon",
+    "runner_label": "hygon",
+    "command_aliases": ["hygon"],
+    "label": "vendor/Hygon",
+    "gpu_check": "tools/gpu_check_hygon.sh",
+    "label_gated": true,
+    "prebuilt_env": true,
+    "enabled": false,
+    "container": {
+      "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-hygon-dtk26.04:2.2.0",
+      "options": "--device /dev/kfd --device /dev/mkfd --device /dev/dri --group-add video --security-opt seccomp=unconfined --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
+      "runs_on": "hygon-bw1000-0"
+    }
+  },
+  {
+    "backend": "iluvatar",
+    "vendor": "iluvatar",
+    "runner_label": "iluvatar",
+    "command_aliases": ["iluvatar"],
+    "label": "vendor/Iluvatar",
+    "gpu_check": "tools/gpu_check_iluvatar.sh",
+    "label_gated": true,
+    "prebuilt_env": true,
+    "enabled": false,
+    "container": {
+      "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-iluvatar-corex4.5.0:2.2.0",
+      "options": "--device /dev/iluvatar0 --device /dev/itrctl --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
+      "runs_on": "iluvatar-bi-v150-0"
+    }
+  },
+  {
+    "backend": "metax-maca3810",
+    "vendor": "metax",
+    "runner_label": "maca381",
+    "command_aliases": ["metax", "maca381"],
+    "label": "vendor/MetaX",
+    "gpu_check": "tools/gpu_check_metax.sh",
+    "label_gated": true,
+    "prebuilt_env": true,
+    "enabled": false,
+    "container": {
+      "image": "harbor.baai.ac.cn/flagos-runtime/flagos-runtime-metax-maca3.8.1.3:2.2.0",
+      "options": "--device /dev/mxcd --device /dev/dri --group-add video",
+      "runs_on": "metax-mxc550-0"
+    }
+  },
+  {
+    "backend": "thead",
+    "vendor": "thead",
+    "runner_label": "flagcicd-810e",
+    "command_aliases": ["thead", "ppu"],
+    "label": "vendor/THead",
+    "gpu_check": "tools/gpu_check_thead.sh",
+    "label_gated": true,
+    "prebuilt_env": false,
+    "enabled": false,
+    "container": {
+      "image": "pkg.flytiger-eco.com/docker_release/pytorch:v2.1.1-2.10.0-ubuntu24.04-cuda13.0-py312",
+      "options": "--device=/dev/alixpu --device=/dev/alixpu_ctl --device=/dev/alixpu_ppu0 --device=/dev/alixpu_ppu1 --device=/dev/alixpu_ppu2 --device=/dev/alixpu_ppu3 --device=/dev/alixpu_ppu4 --device=/dev/alixpu_ppu5 --device=/dev/alixpu_ppu6 --device=/dev/alixpu_ppu7 --device=/dev/alixpu_ppu8 --device=/dev/alixpu_ppu9 --device=/dev/alixpu_ppu10 --device=/dev/alixpu_ppu11 --device=/dev/alixpu_ppu12 --device=/dev/alixpu_ppu13 --device=/dev/alixpu_ppu14 --device=/dev/alixpu_ppu15 --shm-size=256g --ulimit memlock=-1 --ulimit stack=67108864",
+      "runs_on": "flagcicd-810e"
+    },
+    "note": "No FlagOS runtime image exists for this vendor, so prebuilt_env is false: setup_env.sh --no-prebuilt installs the PPU torch and flagtree from backends.yaml out of the vendor index (resource.flagos.net/repository/flagos-pypi-thead/simple) inside the vendor's own pytorch image."
+  }
+]

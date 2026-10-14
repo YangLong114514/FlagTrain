@@ -1,0 +1,93 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Code style — runs the same .pre-commit-config.yaml contributors run
+# locally (`pre-commit install`), so CI and the working copy cannot drift.
+#
+# Unconditional by design: `code-style` has no `if:` and no label gate, so it
+# can be required in branch protection directly (a check that is sometimes
+# skipped stays "Expected" forever and blocks merges).
+#
+# Runs on GitHub-hosted ubuntu-latest rather than a self-hosted runner: the
+# job needs only python and git, and this keeps it off the machine the GPU
+# tests use. The hook repos are gitcode.com mirrors, which the runner must be
+# able to reach; if that link proves unreliable from GitHub-hosted runners,
+# switch runs-on to the in-network runner label used for CPU work (one line).
+
+name: linter
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  code-style:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      # pre-commit builds one virtualenv per hook repo (black, isort, flake8,
+      # clang-format) and keeps them under PRE_COMMIT_HOME. Putting it inside
+      # the workspace makes it cacheable; the restore/save pair below carries
+      # it between runs so the ~2-3 minute venv build happens only when the
+      # hook revs change. Without it, pre-commit would rebuild them every run.
+      PRE_COMMIT_HOME: ${{ github.workspace }}/.pre-commit-cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Restore the pre-commit hook environments
+        id: pre-commit-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ env.PRE_COMMIT_HOME }}
+          # Keyed on the config, so bumping a hook rev rebuilds only what
+          # changed; the prefix fallback keeps the other hooks warm.
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-${{ runner.os }}-
+
+      - name: Install pre-commit
+        shell: bash
+        run: pip install pre-commit
+
+      - name: Run pre-commit
+        shell: bash
+        # KNOWN GAP: this step fails on the three local hooks in
+        # .pre-commit-config.yaml — sort-exports, check-init-exports and
+        # check-operators-yaml — because they call tools/ci_checks/*.py, which
+        # this repository does not carry (they were copied from FlagGems along
+        # with the rest of the config). Drop those hooks, or add the scripts,
+        # before making this job a required check.
+        run: pre-commit run --all-files --show-diff-on-failure --color=always
+
+      - name: Save the pre-commit hook environments
+        # Also on failure: a run that got as far as building environments
+        # should leave them cached for the next one. A cache hit means this
+        # save would be a no-op anyway.
+        if: always() && steps.pre-commit-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ env.PRE_COMMIT_HOME }}
+          key: ${{ steps.pre-commit-cache.outputs.cache-primary-key }}

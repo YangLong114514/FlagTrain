@@ -17,12 +17,59 @@ import functools
 import importlib
 import inspect
 import os
+import pkgutil
 import sys
 from pathlib import Path
 
 from ..common import vendors
 from . import backend_utils
 from .backend_utils import BackendEventBase
+
+
+def operator_functions(module):
+    """Return the ``(name, function)`` pairs ``module`` offers as operators.
+
+    ``__all__`` is the opt-in: a package that declares one offers exactly the
+    names it lists, in that order, so a helper bound in the same ``__init__.py``
+    is not registered as an operator by accident. A package without one falls
+    back to every function it binds.
+    """
+    members = inspect.getmembers(module, inspect.isfunction)
+    declared = getattr(module, "__all__", None)
+    if declared is None:
+        return members
+    bound = dict(members)
+    unbound = [name for name in declared if name not in bound]
+    if unbound:
+        print(
+            f"[Note] {module.__name__}.__all__ lists {unbound}, which are not "
+            "functions bound there; they are not registered as operators."
+        )
+    return [(name, bound[name]) for name in declared if name in bound]
+
+
+def iter_package_functions(module):
+    """Yield ``(name, function)`` for ``module`` and every subpackage below it.
+
+    ``ops/`` is a package of packages -- an operator lives in
+    ``ops/<generic_pkg>/<name>.py`` and is re-exported by that subpackage's
+    ``__init__.py`` -- so reading the top-level module alone misses every
+    specialised operator: importing the parent does not import its subpackages,
+    and only the parent was being read.
+
+    A subpackage yields after its parent, and subpackages are visited in name
+    order, so a name re-exported at two levels resolves to the deeper one, and
+    which of the two wins does not depend on the filesystem.
+    """
+    if module is None:
+        return
+    yield from operator_functions(module)
+    for _, sub_name, is_pkg in sorted(pkgutil.iter_modules(module.__path__)):
+        if not is_pkg:
+            continue
+        yield from iter_package_functions(
+            importlib.import_module(f"{module.__name__}.{sub_name}")
+        )
 
 
 class BackendState:
@@ -96,7 +143,7 @@ class TritonVersionEvent(BackendEventBase):
         }.get(dir_name, None)
 
     def get_functions_from_module(self, module):
-        return inspect.getmembers(module, inspect.isfunction) if module else []
+        return list(iter_package_functions(module))
 
     def get_version_spec_module(self):
         module_name = f"triton_{self.version}"
@@ -149,7 +196,7 @@ class BackendArchEvent(BackendEventBase):
         return self.has_arch
 
     def get_functions_from_module(self, module):
-        return inspect.getmembers(module, inspect.isfunction) if module else []
+        return list(iter_package_functions(module))
 
     def get_heuristics_configs(self):
         try:
@@ -226,24 +273,15 @@ class BackendArchEvent(BackendEventBase):
         return self.get_arch_ops()
 
     def get_arch_ops(self):
-        arch_specialized_ops = []
         sys.path.append(self.current_arch_path)
         ops_module = getattr(self.arch_module, "ops", None)
-        try:
-            if ops_module is None:
-                ops_module = importlib.import_module(f"{self.arch}.ops")
-        except Exception:
+        if ops_module is None:
             try:
-                sys.path.append(self.current_arch_path)
                 ops_module = importlib.import_module(f"{self.arch}.ops")
-                arch_specialized_ops.extend(self.get_functions_from_module(ops_module))
             except Exception as err_msg:
                 self.error_msgs.append(err_msg)
-
-        if ops_module is not None:
-            arch_specialized_ops.extend(self.get_functions_from_module(ops_module))
-
-        return arch_specialized_ops
+                return []
+        return self.get_functions_from_module(ops_module)
 
 
 class SpecOpRegistrar:
@@ -347,7 +385,9 @@ fn = torch.{_state.device_name}
 
     # SPACEMIT CPU backend needs special device guard handling
     if vendor_name == "spacemit":
-        backends_module = importlib.import_module("flag_train.runtime.backend._spacemit")
+        backends_module = importlib.import_module(
+            "flag_train.runtime.backend._spacemit"
+        )
         setattr(
             _state.torch_device_object,
             "_DeviceGuard",
@@ -403,13 +443,8 @@ def get_customized_ops(vendor_name=None):
     import_vendor_extra_lib(vendor_name)
     if _state.customized_ops is not None:
         return _state.customized_ops
-    _state.customized_ops = []
-    if _state.ops_module is not None:
-        ops = inspect.getmembers(_state.ops_module, inspect.isfunction)
-        _state.customized_ops += ops
-    if _state.fused_module is not None:
-        fused_ops = inspect.getmembers(_state.fused_module, inspect.isfunction)
-        _state.customized_ops += fused_ops
+    _state.customized_ops = list(iter_package_functions(_state.ops_module))
+    _state.customized_ops += iter_package_functions(_state.fused_module)
     return _state.customized_ops
 
 
