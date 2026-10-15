@@ -60,7 +60,15 @@ def _gemm_configs():
     Small-``BLOCK_N`` entries serve the decode shapes (few tokens, where the
     kernel is bandwidth-bound on the packed weights); the large tiles with
     deeper pipelining serve the compute-bound prefill shapes.
+
+    On MetaX every candidate runs with ``num_stages=1``: the MACA backend's
+    software pipeliner intermittently produces wrong tiles for this kernel
+    when ``num_stages > 1`` (the activation load's predicate depends on the
+    loop bound ``k_end``, which the pipeliner mishandles), and the corruption
+    is silent -- the same compiled binary flips between right and wrong
+    results across launches. Single-stage compilation avoids the buggy path.
     """
+    metax = runtime.device.vendor_name == "metax"
     configs = []
     for block_m, block_n, block_k, warps, stages in [
         (64, 16, 64, 4, 4),
@@ -76,7 +84,7 @@ def _gemm_configs():
             triton.Config(
                 {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k},
                 num_warps=warps,
-                num_stages=stages,
+                num_stages=1 if metax else stages,
             )
         )
     return configs
