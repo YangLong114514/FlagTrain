@@ -46,6 +46,7 @@ import triton
 import triton.language as tl
 
 import flag_train
+from flag_train import runtime
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
@@ -82,17 +83,16 @@ def _gemm_configs():
 
 
 def _gemm_do_bench():
-    """Autotune bench function that skips configs a backend rejects at launch.
+    """Autotune bench function that skips configs exceeding platform limits.
 
-    Some backends refuse otherwise-legal configs at launch time: MetaX's
-    driver, for example, caps per-thread private memory (4 KB by default) and
-    rejects over-limit kernels with a plain ``RuntimeError``, which the stock
-    autotuner does not treat as "skip this config", so one over-limit config
-    would abort the whole tuning run. Report such configs as infinitely slow
-    instead. The check is deliberately vendor-neutral: a config that raises
-    ``RuntimeError`` at launch is unusable on any backend, and on backends
-    where this never happens the wrapper costs nothing.
+    MetaX's driver limits per-thread private memory (4 KB by default) and
+    rejects over-limit kernels at launch time with a plain ``RuntimeError``,
+    which the stock autotuner does not treat as "skip this config", so one
+    over-limit config would abort the whole tuning run. Report such configs
+    as infinitely slow instead. Other vendors keep the default benchmarker.
     """
+    if runtime.device.vendor_name != "metax":
+        return None
     bench = triton.runtime.driver.active.get_benchmarker()
 
     def do_bench(kernel_call, quantiles):
@@ -154,18 +154,11 @@ def wf6af16_linear_kernel(
     acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
     for k0 in range(k_start, k_end, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < k_end
 
-        # The activation load clamps its column index instead of masking on
-        # it: the lane stays in-bounds (reading at most the last column again)
-        # without a loop-variant predicate on the load. Some Triton backends
-        # miscompile pipelined (num_stages > 1) loads whose predicate depends
-        # on the loop bound, producing intermittently wrong tiles; the clamp
-        # keeps the load statically predicable on every backend. The duplicate
-        # lanes contribute nothing because the matching weight codes are
-        # zeroed below.
         a = tl.load(
-            a_ptr + offs_n[:, None] * K + tl.minimum(offs_k, K - 1)[None, :],
-            mask=n_mask[:, None],
+            a_ptr + offs_n[:, None] * K + offs_k[None, :],
+            mask=n_mask[:, None] & k_mask[None, :],
             other=0.0,
         )
 
@@ -173,7 +166,9 @@ def wf6af16_linear_kernel(
         # read BLOCK_K//4 bytes per row (top-2 bits of 4 consecutive codes per
         # byte, at bit offsets 6, 4, 2, 0) and the 4-bit slice BLOCK_K//2
         # bytes per row (low-4 bits of 2 consecutive codes, at offsets 4, 0);
-        # tl.interleave then restores the column order.
+        # tl.interleave then restores the column order. Garbage codes from
+        # tail bytes beyond k_end are harmless: the activation is zero there,
+        # so the dot product cancels them.
         offs_b2 = k0 // 4 + tl.arange(0, BLOCK_K // 4)
         b2 = tl.load(
             w2_ptr + offs_m[:, None] * (K // 4) + offs_b2[None, :],
@@ -193,10 +188,7 @@ def wf6af16_linear_kernel(
         ).to(tl.int32)
         low4 = tl.interleave((b4 >> 4) & 0xF, b4 & 0xF)
 
-        # Codes past k_end (a byte holding a mix of in-range and tail columns
-        # survives the byte-level masks above) are forced to code 0, which
-        # dequantizes to exactly +0.0, so tail lanes add nothing to the dot.
-        code = tl.where(offs_k[None, :] < k_end, (top2 << 4) | low4, 0)
+        code = (top2 << 4) | low4
 
         # FP6-E3M2 dequantization, bias 3, exponent 7 kept as a normal value:
         # value = sign * 2^(e-3) * (1 + m/4), subnormal branch m * 2^-4. Every
