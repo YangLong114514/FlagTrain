@@ -58,7 +58,10 @@ def _gemm_configs():
 
     Small-``BLOCK_N`` entries serve the decode shapes (few tokens, where the
     kernel is bandwidth-bound on the packed weights); the large tiles with
-    deeper pipelining serve the compute-bound prefill shapes.
+    deeper pipelining serve the compute-bound prefill shapes. The (16, 16) /
+    (64, 16) and (32, 128) tiles were the winners of a sweep on MetaX's C550
+    that also measured faster on NVIDIA (H20), so they are part of the generic
+    space.
 
     The bare kernel is also wrapped by vendor backends with their own tuning
     (see e.g. ``runtime/backend/_metax/ops/deepspeed/wf6af16_linear.py``), so
@@ -66,10 +69,14 @@ def _gemm_configs():
     """
     configs = []
     for block_m, block_n, block_k, warps, stages in [
+        (16, 16, 64, 2, 2),
+        (64, 16, 64, 4, 2),
         (64, 16, 64, 4, 4),
         (64, 32, 64, 4, 4),
         (64, 64, 64, 4, 4),
         (128, 64, 64, 4, 3),
+        (32, 128, 64, 4, 3),
+        (32, 128, 64, 8, 3),
         (64, 128, 64, 4, 4),
         (128, 128, 32, 8, 3),
         (128, 128, 64, 8, 3),
@@ -100,6 +107,7 @@ def _wf6af16_linear_gemm(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K_MODE: tl.constexpr,
+    WIDE_LOAD: tl.constexpr,
 ):
     """One tile of ``C = (W * scales) @ A^T`` with FP6 weights unpacked inline.
 
@@ -136,30 +144,63 @@ def _wf6af16_linear_gemm(
             other=0.0,
         )
 
-        # Unpack the 6-bit codes with compact byte loads: the 2-bit slice is
-        # read BLOCK_K//4 bytes per row (top-2 bits of 4 consecutive codes per
-        # byte, at bit offsets 6, 4, 2, 0) and the 4-bit slice BLOCK_K//2
-        # bytes per row (low-4 bits of 2 consecutive codes, at offsets 4, 0);
-        # tl.interleave then restores the column order. Garbage codes from
-        # tail bytes beyond k_end are harmless: the activation is zero there,
-        # so the dot product cancels them.
-        offs_b2 = k0 // 4 + tl.arange(0, BLOCK_K // 4)
-        b2 = tl.load(
-            w2_ptr + offs_m[:, None] * (K // 4) + offs_b2[None, :],
-            mask=m_mask[:, None] & (offs_b2[None, :] * 4 < k_end),
-            other=0,
-        ).to(tl.int32)
+        # Unpack the 6-bit codes with compact loads. The byte path reads the
+        # 2-bit slice BLOCK_K//4 bytes per row (top-2 bits of 4 consecutive
+        # codes per byte, at bit offsets 6, 4, 2, 0) and the 4-bit slice
+        # BLOCK_K//2 bytes per row (low-4 bits of 2 consecutive codes, at
+        # offsets 4, 0). With WIDE_LOAD the slices are instead read as uint32
+        # words (one word per 16 / 8 columns) and the bytes are extracted in
+        # registers -- fewer, wider load instructions. Either way
+        # tl.interleave restores the column order, and garbage codes from tail
+        # bytes beyond k_end are harmless: the activation is zero there, so
+        # the dot product cancels them.
+        if WIDE_LOAD:
+            offs_w2 = k0 // 16 + tl.arange(0, BLOCK_K // 16)
+            w2w = tl.load(
+                tl.cast(w2_ptr, tl.pointer_type(tl.uint32))
+                + offs_m[:, None] * (K // 16)
+                + offs_w2[None, :],
+                mask=m_mask[:, None] & (offs_w2[None, :] * 16 < k_end),
+                other=0,
+            ).to(tl.int32, bitcast=True)
+            # byte b of word w covers columns 16w+4b .. 16w+4b+3; the nested
+            # interleave restores that column order.
+            b2 = tl.interleave(
+                tl.interleave(w2w & 0xFF, (w2w >> 16) & 0xFF),
+                tl.interleave((w2w >> 8) & 0xFF, (w2w >> 24) & 0xFF),
+            )
+        else:
+            offs_b2 = k0 // 4 + tl.arange(0, BLOCK_K // 4)
+            b2 = tl.load(
+                w2_ptr + offs_m[:, None] * (K // 4) + offs_b2[None, :],
+                mask=m_mask[:, None] & (offs_b2[None, :] * 4 < k_end),
+                other=0,
+            ).to(tl.int32)
         top2 = tl.interleave(
             tl.interleave((b2 >> 6) & 0x3, (b2 >> 2) & 0x3),
             tl.interleave((b2 >> 4) & 0x3, b2 & 0x3),
         )
 
-        offs_b4 = k0 // 2 + tl.arange(0, BLOCK_K // 2)
-        b4 = tl.load(
-            w4_ptr + offs_m[:, None] * (K // 2) + offs_b4[None, :],
-            mask=m_mask[:, None] & (offs_b4[None, :] * 2 < k_end),
-            other=0,
-        ).to(tl.int32)
+        if WIDE_LOAD:
+            offs_w4 = k0 // 8 + tl.arange(0, BLOCK_K // 8)
+            w4w = tl.load(
+                tl.cast(w4_ptr, tl.pointer_type(tl.uint32))
+                + offs_m[:, None] * (K // 8)
+                + offs_w4[None, :],
+                mask=m_mask[:, None] & (offs_w4[None, :] * 8 < k_end),
+                other=0,
+            ).to(tl.int32, bitcast=True)
+            b4 = tl.interleave(
+                tl.interleave(w4w & 0xFF, (w4w >> 16) & 0xFF),
+                tl.interleave((w4w >> 8) & 0xFF, (w4w >> 24) & 0xFF),
+            )
+        else:
+            offs_b4 = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+            b4 = tl.load(
+                w4_ptr + offs_m[:, None] * (K // 2) + offs_b4[None, :],
+                mask=m_mask[:, None] & (offs_b4[None, :] * 2 < k_end),
+                other=0,
+            ).to(tl.int32)
         low4 = tl.interleave((b4 >> 4) & 0xF, b4 & 0xF)
 
         code = (top2 << 4) | low4
@@ -368,18 +409,30 @@ _SPLIT_K_MAP = [
 
 
 def _pick_split_k(tokens, out_channels, in_channels):
-    """Choose split-K the way DeepSpeed does, falling back to 1.
+    """Choose split-K: DeepSpeed's profiled map first, powers of two as fallback.
 
     The profiled map is consulted for small token counts; a candidate whose
     slices are not 4-column aligned is rejected because the kernel unpacks
-    four codes per byte and each slice must start on a byte boundary.
+    four codes per byte and each slice must start on a byte boundary. The
+    map's odd factors (13, 18, ...) mostly fail that constraint, which used to
+    mean falling back to 1 and leaving a handful of CTAs to chew the whole
+    reduction; for the decode token range a power-of-two factor (chosen the
+    way the MetaX backend does, and measured faster on NVIDIA too) is tried
+    before giving up.
     """
     split_k = -1
     if tokens <= 768:
         split_k = _SPLIT_K_MAP[(tokens - 1) // 64].get(out_channels, -1)
-    if split_k <= 1 or in_channels % (split_k * 4) != 0:
-        return 1
-    return split_k
+    if split_k > 1 and in_channels % (split_k * 4) == 0:
+        return split_k
+    if tokens <= 64:
+        split_k = 8 if tokens <= 16 else 4
+        while split_k > 1 and (
+            in_channels % (split_k * 4) != 0 or in_channels // split_k < 64
+        ):
+            split_k //= 2
+        return split_k
+    return 1
 
 
 def wf6af16_linear(
@@ -446,6 +499,21 @@ def wf6af16_linear(
         )
         split_k = 1
 
+    # The word-wide weight loads need every row and every split-K slice to
+    # start on a 4-byte boundary of both packed slices: K % 16 == 0 keeps the
+    # rows aligned, and k_per_split % 16 == 0 keeps the slices aligned. They
+    # only pay on the decode path's narrow tiles; on the wide prefill tiles
+    # they measure neutral to clearly worse, so the gate also requires the
+    # decode token range.
+    k_per_split = in_channels // split_k
+    wide_load = (
+        tokens <= 64
+        and in_channels % 16 == 0
+        and k_per_split % 16 == 0
+        and weights_2bit.data_ptr() % 4 == 0
+        and weights_4bit.data_ptr() % 4 == 0
+    )
+
     def grid(meta):
         return (
             triton.cdiv(out_channels, meta["BLOCK_M"])
@@ -466,6 +534,7 @@ def wf6af16_linear(
                 in_channels,
                 split_k,
                 SPLIT_K_MODE=False,
+                WIDE_LOAD=wide_load,
             )
         else:
             workspace = torch.empty(
@@ -484,6 +553,7 @@ def wf6af16_linear(
                 in_channels,
                 split_k,
                 SPLIT_K_MODE=True,
+                WIDE_LOAD=wide_load,
             )
             total = tokens * out_channels
             wf6af16_split_k_reduce_kernel[(triton.cdiv(total, 1024),)](
