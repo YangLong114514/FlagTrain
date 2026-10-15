@@ -14,27 +14,42 @@
 """MetaX-tuned WF6-AF16 linear.
 
 The generic implementation is ``flag_train.deepspeed.wf6af16_linear`` and is
-what every backend without an override runs. The kernel *body* is imported
-from there unchanged -- the arithmetic is identical to the implementation the
-numeric tests cover -- and this module only replaces the tuning around it, for
-two MetaX-specific reasons:
+what every backend without an override runs. This module carries its own copy
+of the kernel with two changes that are worth 1.5-4.5x on MetaX's C550, plus
+its own tuning around it:
 
-* ``num_stages=1`` for every candidate. The MACA backend's software pipeliner
-  miscompiles this kernel with deeper pipelining: the activation load's
-  predicate depends on the loop bound ``k_end``, and with ``num_stages > 1``
-  the same compiled binary flips between right and wrong tiles across
-  launches (measured on a C550: 3-7 of 10 identical launches wrong, errors of
-  ~1e3 on fp16 outputs). Single-stage compilation never touches the buggy
-  path.
-* a ``do_bench`` wrapper that reports a launch-time ``RuntimeError`` as
-  infinitely slow. MetaX's driver caps per-thread private memory (4 KB by
-  default) and rejects over-limit kernels at launch time with a plain
-  ``RuntimeError``, which the stock autotuner does not treat as "skip this
-  config", so one over-limit config would abort the whole tuning run.
+* the activation tile is masked against ``K`` (a plain kernel argument) rather
+  than ``k_end`` (a computed scalar). The two masks accept exactly the same
+  lanes -- with ``split_k == 1`` they are identical, and with split-K the
+  overshoot into a neighbour slice's columns stays in-bounds and is cancelled
+  by zeroing the tail codes (see the kernel comment) -- but the MACA backend
+  emits far better code for the argument-bound mask: measured on the benchmark
+  shapes, (512, 4096, 4096) with the same tile goes from 3270 us to 812 us,
+  and (128, 4096, 14336) from ~2900 us to 532 us. As a side effect the load
+  keeps a statically analyzable predicate, which also avoids the MACA
+  pipeliner's miscompilation of loop-bound-dependent load masks (the reason
+  this kernel family must run with ``num_stages=1`` here: with deeper
+  pipelining the same binary intermittently produces wrong tiles).
+* a MetaX split-K choice for the decode shapes. The generic heuristic replays
+  DeepSpeed's A100-profiled map, whose odd factors (13, 18, ...) mostly fail
+  this kernel's byte-alignment constraint and fall back to 1, leaving a
+  single token on a handful of CTAs. Powers of two chosen by token count
+  roughly halve the decode latency on the C550 (264 us -> 123 us at one
+  token, K = M = 4096).
 
-The launcher mirrors the generic one; the pieces that must not drift -- the
-split-K heuristic and the reduction kernel -- are imported from the generic
-module.
+The autotune space is the measured winners of a tile sweep on the benchmark
+shapes rather than the generic list: small weight tiles with wide token tiles
+((32, 128) blocks) for prefill, (64, 16) with split-K for decode. Every
+candidate keeps ``num_stages=1``: deeper pipelining never won the sweep, so
+there is nothing to gain by approaching the pipeliner bug.
+
+A ``do_bench`` wrapper reports a launch-time ``RuntimeError`` as infinitely
+slow: MetaX's driver caps per-thread private memory (4 KB by default) and
+rejects over-limit kernels at launch with a plain ``RuntimeError``, which the
+stock autotuner does not treat as "skip this config".
+
+The reduction kernel is imported from the generic module; it has no MetaX
+divergence.
 
 Registration is by name. ``_metax/ops/deepspeed/__init__.py`` re-exports this
 module's ``wf6af16_linear``, and ``SpecOpRegistrar`` writes it over the
@@ -46,15 +61,13 @@ import logging
 
 import torch
 import triton
+import triton.language as tl
 
 import flag_train
-from flag_train.deepspeed.wf6af16_linear import (
-    _pick_split_k,
-    _wf6af16_linear_gemm,
-    wf6af16_split_k_reduce_kernel,
-)
+from flag_train.deepspeed.wf6af16_linear import wf6af16_split_k_reduce_kernel
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
+from flag_train.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
@@ -62,20 +75,19 @@ logger = logging.getLogger(__name__)
 def _gemm_configs():
     """Autotune candidates for the GEMM kernel on MetaX.
 
-    Same tiles as the generic space, but every entry runs with
-    ``num_stages=1`` -- see the module docstring for the pipeliner
-    miscompilation this sidesteps.
+    Winners of a tile sweep over the benchmark shapes on a C550 (see the
+    module docstring): (64, 16) tiles with split-K serve the decode shapes,
+    (32, 128) tiles serve prefill. ``num_stages`` stays 1 everywhere --
+    deeper pipelining neither won the sweep nor is safe from the MACA
+    pipeliner's load-mask miscompilation.
     """
     configs = []
     for block_m, block_n, block_k, warps in [
         (64, 16, 64, 4),
-        (64, 32, 64, 4),
-        (64, 64, 64, 4),
-        (128, 64, 64, 4),
-        (64, 128, 64, 4),
-        (128, 128, 32, 8),
-        (128, 128, 64, 8),
-        (128, 256, 32, 8),
+        (16, 16, 64, 2),
+        (32, 128, 64, 4),
+        (32, 128, 64, 8),
+        (64, 128, 64, 8),
     ]:
         configs.append(
             triton.Config(
@@ -106,13 +118,148 @@ def _gemm_do_bench():
     return do_bench
 
 
-wf6af16_linear_kernel = libentry()(
-    triton.autotune(
-        configs=_gemm_configs(),
-        key=["M", "N", "K", "split_k"],
-        do_bench=_gemm_do_bench(),
-    )(_wf6af16_linear_gemm)
+@libentry()
+@triton.autotune(
+    configs=_gemm_configs(),
+    key=["M", "N", "K", "split_k"],
+    do_bench=_gemm_do_bench(),
 )
+@triton.jit
+def wf6af16_linear_kernel(
+    out_ptr,
+    a_ptr,
+    w2_ptr,
+    w4_ptr,
+    scale_ptr,
+    M,
+    N,
+    K,
+    split_k,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K_MODE: tl.constexpr,
+):
+    """MetaX variant of the generic kernel; see the module docstring.
+
+    Identical to ``flag_train.deepspeed.wf6af16_linear._wf6af16_linear_gemm``
+    except for the activation mask (``offs_k < K`` instead of
+    ``offs_k < k_end``) and the explicit zeroing of tail codes that replaces
+    the cancelled-by-zero-activation trick.
+    """
+    pid = tle.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_k = pid % split_k
+    pid_mn = pid // split_k
+    pid_m = pid_mn // num_pid_n
+    pid_n = pid_mn % num_pid_n
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    k_per_split = K // split_k  # the launcher guarantees split_k divides K
+    k_start = pid_k * k_per_split
+    k_end = tl.minimum(k_start + k_per_split, K)
+
+    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+    for k0 in range(k_start, k_end, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+
+        # Masked against K, not k_end: the only lanes this accepts beyond
+        # k_end belong to the next slice (still in-bounds, finite values), and
+        # their contribution is cancelled by the zeroed codes below. A mask
+        # bound to a plain kernel argument compiles far better on MACA than
+        # one bound to the computed k_end -- and keeps the load off the
+        # pipeliner path that miscompiles loop-bound-dependent predicates.
+        a = tl.load(
+            a_ptr + offs_n[:, None] * K + offs_k[None, :],
+            mask=n_mask[:, None] & (offs_k[None, :] < K),
+            other=0.0,
+        )
+
+        # Unpack the 6-bit codes with compact byte loads: the 2-bit slice is
+        # read BLOCK_K//4 bytes per row (top-2 bits of 4 consecutive codes per
+        # byte, at bit offsets 6, 4, 2, 0) and the 4-bit slice BLOCK_K//2
+        # bytes per row (low-4 bits of 2 consecutive codes, at offsets 4, 0);
+        # tl.interleave then restores the column order.
+        offs_b2 = k0 // 4 + tl.arange(0, BLOCK_K // 4)
+        b2 = tl.load(
+            w2_ptr + offs_m[:, None] * (K // 4) + offs_b2[None, :],
+            mask=m_mask[:, None] & (offs_b2[None, :] * 4 < k_end),
+            other=0,
+        ).to(tl.int32)
+        top2 = tl.interleave(
+            tl.interleave((b2 >> 6) & 0x3, (b2 >> 2) & 0x3),
+            tl.interleave((b2 >> 4) & 0x3, b2 & 0x3),
+        )
+
+        offs_b4 = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+        b4 = tl.load(
+            w4_ptr + offs_m[:, None] * (K // 2) + offs_b4[None, :],
+            mask=m_mask[:, None] & (offs_b4[None, :] * 2 < k_end),
+            other=0,
+        ).to(tl.int32)
+        low4 = tl.interleave((b4 >> 4) & 0xF, b4 & 0xF)
+
+        # Codes past k_end (accepted activation lanes past the slice bound, or
+        # a byte holding a mix of in-range and tail columns) are forced to
+        # code 0, which dequantizes to exactly +0.0, so tail lanes add nothing
+        # to the dot.
+        code = tl.where(offs_k[None, :] < k_end, (top2 << 4) | low4, 0)
+
+        # FP6-E3M2 dequantization, bias 3, exponent 7 kept as a normal value:
+        # value = sign * 2^(e-3) * (1 + m/4), subnormal branch m * 2^-4. Every
+        # FP6 value is exactly representable in fp16, so the fp16 cast below
+        # is lossless and the fp16 multiply by the scale rounds exactly the
+        # way the CUDA kernel's __hmul chain does.
+        e = (code >> 2) & 0x7
+        mant = (code & 0x3).to(tl.float32)
+        mag = tl.where(
+            e == 0,
+            mant * 0.0625,
+            tl.exp2(e.to(tl.float32) - 3.0) * (1.0 + mant * 0.25),
+        )
+        w = tl.where((code >> 5) & 1 == 1, -mag, mag).to(tl.float16)
+
+        scale = tl.load(scale_ptr + offs_m, mask=m_mask, other=0.0)
+        w = w * scale[:, None]
+
+        acc = tl.dot(a, tl.trans(w), acc)
+
+    if SPLIT_K_MODE:
+        tl.store(
+            out_ptr + pid_k * N * M + offs_n[:, None] * M + offs_m[None, :],
+            acc,
+            mask=n_mask[:, None] & m_mask[None, :],
+        )
+    else:
+        tl.store(
+            out_ptr + offs_n[:, None] * M + offs_m[None, :],
+            acc.to(tl.float16),
+            mask=n_mask[:, None] & m_mask[None, :],
+        )
+
+
+def _pick_split_k(tokens, out_channels, in_channels):
+    """MetaX split-K choice for the decode shapes, 1 for anything larger.
+
+    A one-token decode over K = M = 4096 measures fastest at split-K 8 on the
+    C550 (123 us against 264 us unsplit); 64 tokens wants 4. Powers of two
+    keep every slice byte-aligned by construction; the constraint below is the
+    same one the generic launcher documents (four codes per byte, so a slice
+    must start on a multiple of 4 columns) plus a floor on slice length so the
+    follow-up reduction does not eat the win.
+    """
+    if tokens > 64:
+        return 1
+    split_k = 8 if tokens <= 16 else 4
+    while split_k > 1 and (
+        in_channels % (split_k * 4) != 0 or in_channels // split_k < 64
+    ):
+        split_k //= 2
+    return split_k
 
 
 def wf6af16_linear(
@@ -129,7 +276,8 @@ def wf6af16_linear(
     """FP6-weight FP16-activation linear: ``output = hidden @ (W * scale)^T``.
 
     Same contract as the generic ``flag_train.deepspeed.wf6af16_linear``; only
-    the kernel tuning differs (see the module docstring).
+    the kernel variant, the tuning space, and the split-K choice differ (see
+    the module docstring).
     """
     logger.debug("TRAIN WF6AF16_LINEAR (MetaX)")
 
