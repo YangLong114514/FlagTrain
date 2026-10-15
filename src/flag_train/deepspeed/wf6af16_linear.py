@@ -46,7 +46,6 @@ import triton
 import triton.language as tl
 
 import flag_train
-from flag_train import runtime
 from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
@@ -61,14 +60,10 @@ def _gemm_configs():
     kernel is bandwidth-bound on the packed weights); the large tiles with
     deeper pipelining serve the compute-bound prefill shapes.
 
-    On MetaX every candidate runs with ``num_stages=1``: the MACA backend's
-    software pipeliner intermittently produces wrong tiles for this kernel
-    when ``num_stages > 1`` (the activation load's predicate depends on the
-    loop bound ``k_end``, which the pipeliner mishandles), and the corruption
-    is silent -- the same compiled binary flips between right and wrong
-    results across launches. Single-stage compilation avoids the buggy path.
+    The bare kernel is also wrapped by vendor backends with their own tuning
+    (see e.g. ``runtime/backend/_metax/ops/deepspeed/wf6af16_linear.py``), so
+    this list carries only the generic choices.
     """
-    metax = runtime.device.vendor_name == "metax"
     configs = []
     for block_m, block_n, block_k, warps, stages in [
         (64, 16, 64, 4, 4),
@@ -84,43 +79,14 @@ def _gemm_configs():
             triton.Config(
                 {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k},
                 num_warps=warps,
-                num_stages=1 if metax else stages,
+                num_stages=stages,
             )
         )
     return configs
 
 
-def _gemm_do_bench():
-    """Autotune bench function that skips configs exceeding platform limits.
-
-    MetaX's driver limits per-thread private memory (4 KB by default) and
-    rejects over-limit kernels at launch time with a plain ``RuntimeError``,
-    which the stock autotuner does not treat as "skip this config", so one
-    over-limit config would abort the whole tuning run. Report such configs
-    as infinitely slow instead. Other vendors keep the default benchmarker.
-    """
-    if runtime.device.vendor_name != "metax":
-        return None
-    bench = triton.runtime.driver.active.get_benchmarker()
-
-    def do_bench(kernel_call, quantiles):
-        try:
-            return bench(kernel_call, quantiles=quantiles)
-        except RuntimeError as e:
-            logger.debug("wf6af16_linear autotune: skipping config: %s", e)
-            return [float("inf"), float("inf"), float("inf")]
-
-    return do_bench
-
-
-@libentry()
-@triton.autotune(
-    configs=_gemm_configs(),
-    key=["M", "N", "K", "split_k"],
-    do_bench=_gemm_do_bench(),
-)
 @triton.jit
-def wf6af16_linear_kernel(
+def _wf6af16_linear_gemm(
     out_ptr,
     a_ptr,
     w2_ptr,
@@ -229,6 +195,16 @@ def wf6af16_linear_kernel(
             acc.to(tl.float16),
             mask=n_mask[:, None] & m_mask[None, :],
         )
+
+
+# The bare JIT function above is what vendor backends wrap with their own
+# autotune space; the generic wrapper keeps the name the launcher calls.
+wf6af16_linear_kernel = libentry()(
+    triton.autotune(
+        configs=_gemm_configs(),
+        key=["M", "N", "K", "split_k"],
+    )(_wf6af16_linear_gemm)
+)
 
 
 @libentry()
