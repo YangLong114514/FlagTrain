@@ -15,8 +15,8 @@
 
 The generic implementation is ``flag_train.deepspeed.wf6af16_linear`` and is
 what every backend without an override runs. This module carries its own copy
-of the kernel with two changes that are worth 1.5-4.5x on MetaX's C550, plus
-its own tuning around it:
+of the kernel with three changes that are worth 1.5-4.5x on MetaX's C550,
+plus its own tuning around it:
 
 * the activation tile is masked against ``K`` (a plain kernel argument) rather
   than ``k_end`` (a computed scalar). The two masks accept exactly the same
@@ -36,6 +36,13 @@ its own tuning around it:
   single token on a handful of CTAs. Powers of two chosen by token count
   roughly halve the decode latency on the C550 (264 us -> 123 us at one
   token, K = M = 4096).
+* word-wide weight loads (``WIDE_LOAD``) on the decode path: the packed
+  slices are read as uint32 and the bytes extracted in registers, worth ~5%
+  on the decode shapes. It is engaged only on the decode token range (on the
+  wide prefill tiles it measures neutral to clearly worse) and only when
+  every row and every split-K slice starts on a 4-byte boundary of both
+  packed slices (K % 16 == 0 and the slice length a multiple of 16 columns);
+  the byte path is the fallback.
 
 The autotune space is the measured winners of a tile sweep on the benchmark
 shapes rather than the generic list: small weight tiles with wide token tiles
@@ -87,7 +94,6 @@ def _gemm_configs():
         (16, 16, 64, 2),
         (32, 128, 64, 4),
         (32, 128, 64, 8),
-        (64, 128, 64, 8),
     ]:
         configs.append(
             triton.Config(
@@ -139,6 +145,7 @@ def wf6af16_linear_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K_MODE: tl.constexpr,
+    WIDE_LOAD: tl.constexpr,
 ):
     """MetaX variant of the generic kernel; see the module docstring.
 
@@ -179,28 +186,59 @@ def wf6af16_linear_kernel(
             other=0.0,
         )
 
-        # Unpack the 6-bit codes with compact byte loads: the 2-bit slice is
-        # read BLOCK_K//4 bytes per row (top-2 bits of 4 consecutive codes per
-        # byte, at bit offsets 6, 4, 2, 0) and the 4-bit slice BLOCK_K//2
-        # bytes per row (low-4 bits of 2 consecutive codes, at offsets 4, 0);
-        # tl.interleave then restores the column order.
-        offs_b2 = k0 // 4 + tl.arange(0, BLOCK_K // 4)
-        b2 = tl.load(
-            w2_ptr + offs_m[:, None] * (K // 4) + offs_b2[None, :],
-            mask=m_mask[:, None] & (offs_b2[None, :] * 4 < k_end),
-            other=0,
-        ).to(tl.int32)
+        # Unpack the 6-bit codes. With WIDE_LOAD the packed slices are read as
+        # uint32 words (one word per 16 / 8 columns) and the bytes are
+        # extracted in registers -- fewer, wider load instructions, worth
+        # 5-7% on the decode shapes. The byte path below is the fallback for
+        # K % 16 != 0 or split-K slices whose start is not word-aligned: a
+        # word must never straddle two rows or two slices.
+        if WIDE_LOAD:
+            offs_w2 = k0 // 16 + tl.arange(0, BLOCK_K // 16)
+            w2w = tl.load(
+                tl.cast(w2_ptr, tl.pointer_type(tl.uint32))
+                + offs_m[:, None] * (K // 16)
+                + offs_w2[None, :],
+                mask=m_mask[:, None] & (offs_w2[None, :] * 16 < k_end),
+                other=0,
+            ).to(tl.int32, bitcast=True)
+            # byte b of word w covers columns 16w+4b .. 16w+4b+3; the nested
+            # interleave restores that column order.
+            b2 = tl.interleave(
+                tl.interleave(w2w & 0xFF, (w2w >> 16) & 0xFF),
+                tl.interleave((w2w >> 8) & 0xFF, (w2w >> 24) & 0xFF),
+            )
+        else:
+            offs_b2 = k0 // 4 + tl.arange(0, BLOCK_K // 4)
+            b2 = tl.load(
+                w2_ptr + offs_m[:, None] * (K // 4) + offs_b2[None, :],
+                mask=m_mask[:, None] & (offs_b2[None, :] * 4 < k_end),
+                other=0,
+            ).to(tl.int32)
         top2 = tl.interleave(
             tl.interleave((b2 >> 6) & 0x3, (b2 >> 2) & 0x3),
             tl.interleave((b2 >> 4) & 0x3, b2 & 0x3),
         )
 
-        offs_b4 = k0 // 2 + tl.arange(0, BLOCK_K // 2)
-        b4 = tl.load(
-            w4_ptr + offs_m[:, None] * (K // 2) + offs_b4[None, :],
-            mask=m_mask[:, None] & (offs_b4[None, :] * 2 < k_end),
-            other=0,
-        ).to(tl.int32)
+        if WIDE_LOAD:
+            offs_w4 = k0 // 8 + tl.arange(0, BLOCK_K // 8)
+            w4w = tl.load(
+                tl.cast(w4_ptr, tl.pointer_type(tl.uint32))
+                + offs_m[:, None] * (K // 8)
+                + offs_w4[None, :],
+                mask=m_mask[:, None] & (offs_w4[None, :] * 8 < k_end),
+                other=0,
+            ).to(tl.int32, bitcast=True)
+            b4 = tl.interleave(
+                tl.interleave(w4w & 0xFF, (w4w >> 16) & 0xFF),
+                tl.interleave((w4w >> 8) & 0xFF, (w4w >> 24) & 0xFF),
+            )
+        else:
+            offs_b4 = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+            b4 = tl.load(
+                w4_ptr + offs_m[:, None] * (K // 2) + offs_b4[None, :],
+                mask=m_mask[:, None] & (offs_b4[None, :] * 2 < k_end),
+                other=0,
+            ).to(tl.int32)
         low4 = tl.interleave((b4 >> 4) & 0xF, b4 & 0xF)
 
         # Codes past k_end (accepted activation lanes past the slice bound, or
@@ -310,6 +348,21 @@ def wf6af16_linear(
         )
         split_k = 1
 
+    # The word-wide weight loads need every row and every split-K slice to
+    # start on a 4-byte boundary of both packed slices: K % 16 == 0 keeps the
+    # rows aligned, and k_per_split % 16 == 0 keeps the slices aligned. They
+    # only pay on the decode path's narrow (64, 16) tiles; on the wide prefill
+    # tiles they measure neutral to clearly worse (e.g. 1024 -> 1211 us at
+    # (256, 8192, 8192)), so the gate also requires the decode token range.
+    k_per_split = in_channels // split_k
+    wide_load = (
+        tokens <= 64
+        and in_channels % 16 == 0
+        and k_per_split % 16 == 0
+        and weights_2bit.data_ptr() % 4 == 0
+        and weights_4bit.data_ptr() % 4 == 0
+    )
+
     def grid(meta):
         return (
             triton.cdiv(out_channels, meta["BLOCK_M"])
@@ -330,6 +383,7 @@ def wf6af16_linear(
                 in_channels,
                 split_k,
                 SPLIT_K_MODE=False,
+                WIDE_LOAD=wide_load,
             )
         else:
             workspace = torch.empty(
@@ -348,6 +402,7 @@ def wf6af16_linear(
                 in_channels,
                 split_k,
                 SPLIT_K_MODE=True,
+                WIDE_LOAD=wide_load,
             )
             total = tokens * out_channels
             wf6af16_split_k_reduce_kernel[(triton.cdiv(total, 1024),)](
