@@ -445,6 +445,7 @@ def wf6af16_linear(
     tokens=None,
     in_channels=None,
     split_k=None,
+    wide_load=None,
 ):
     """FP6-weight FP16-activation linear: ``output = hidden @ (W * scale)^T``.
 
@@ -464,6 +465,10 @@ def wf6af16_linear(
         in_channels (int, optional): inferred from ``hidden_states`` when omitted.
         split_k (int, optional): split-K factor; the profiled heuristic is
             used when omitted.
+        wide_load (bool, optional): force the word-wide packed-weight loads
+            on/off; the alignment-based heuristic is used when omitted.
+            Vendor backends whose Triton miscompiles the wide path pass
+            ``False`` here.
 
     Returns:
         Tensor: ``output``.
@@ -506,13 +511,14 @@ def wf6af16_linear(
     # they measure neutral to clearly worse, so the gate also requires the
     # decode token range.
     k_per_split = in_channels // split_k
-    wide_load = (
-        tokens <= 64
-        and in_channels % 16 == 0
-        and k_per_split % 16 == 0
-        and weights_2bit.data_ptr() % 4 == 0
-        and weights_4bit.data_ptr() % 4 == 0
-    )
+    if wide_load is None:
+        wide_load = (
+            tokens <= 64
+            and in_channels % 16 == 0
+            and k_per_split % 16 == 0
+            and weights_2bit.data_ptr() % 4 == 0
+            and weights_4bit.data_ptr() % 4 == 0
+        )
 
     def grid(meta):
         return (
