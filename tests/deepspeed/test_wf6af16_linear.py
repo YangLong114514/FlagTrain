@@ -160,14 +160,22 @@ _DEEPSPEED_AMPERE_ONLY_MSG = (
     "__CUDA_ARCH__ == 800); this device's compute capability is not sm_80, so "
     "the reference cannot execute here."
 )
+_DEEPSPEED_HYGON_MSG = (
+    "DeepSpeed's cuda_wf6af16_linear cannot run on Hygon: kernel_matmul.cuh "
+    "guards the kernel body with __CUDA_ARCH__ in [800, 900), which no HIP "
+    "build satisfies, so the DCU build compiles to a stub that returns "
+    "garbage or fails outright."
+)
 
 
 # Backends whose reference is DeepSpeed. cuda_wf6af16_linear ships in the
 # InferenceCore CUDA extension, so only a backend that can compile and execute
 # one can host it. On these the reference is not optional -- a missing one is
 # an environment fault, and skipping quietly would thin the suite without
-# saying so.
-_DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
+# saying so. Hygon is deliberately absent: the extension builds through HIP
+# there, but the kernel is Ampere-locked (see _DEEPSPEED_HYGON_MSG), so the
+# torch composition is the only reference a DCU can run.
+_DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
 
 def _load_deepspeed_wf6af16():
@@ -249,6 +257,8 @@ if (
     and torch.cuda.get_device_capability() != (8, 0)
 ):
     _ORACLE_SKIP_REASON = _DEEPSPEED_AMPERE_ONLY_MSG
+elif _deepspeed_wf6af16 is None and flag_train.vendor_name == "hygon":
+    _ORACLE_SKIP_REASON = _DEEPSPEED_HYGON_MSG
 else:
     _ORACLE_SKIP_REASON = _DEEPSPEED_UNAVAILABLE_MSG
 requires_deepspeed_reference = pytest.mark.skipif(
