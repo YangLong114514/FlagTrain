@@ -36,8 +36,11 @@ so the comparison feeds both sides the *same* FP6 codes, packed by each
 side's own packer.
 """
 
+import sys
+
 import pytest
 import torch
+import triton
 
 import flag_train
 
@@ -308,9 +311,12 @@ def _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=None):
 _SHAPES = [
     (1, 64, 64),
     (3, 128, 48),
+    (7, 260, 68),  # K % 16 != 0: byte-path fallback with a masked tail
     (16, 256, 256),
     (33, 512, 384),
     (100, 1024, 512),
+    (1, 4096, 512),  # split-K 8 with word-wide loads over 8 loop iterations
+    (800, 512, 256),  # beyond the split-K map's token range: single pass
 ]
 
 
@@ -351,6 +357,147 @@ def test_wf6af16_linear_split_k(split_k):
 
 
 @pytest.mark.wf6af16_linear
+def test_wf6af16_linear_split_k_misaligned_falls_back():
+    """An explicit split_k whose slices would start mid-byte falls back to 1."""
+    hidden, weights_2bit, weights_4bit, scales = _make_case(7, 512, 256)
+
+    train_out = _run_train(hidden, weights_2bit, weights_4bit, scales, split_k=3)
+    ref_out = wf6af16_ref(hidden, weights_2bit, weights_4bit, scales)
+
+    utils.train_assert_close(
+        utils.to_reference(train_out),
+        utils.to_reference(ref_out),
+        torch.float16,
+        reduce_dim=512,
+    )
+
+
+@pytest.mark.wf6af16_linear
+def test_wf6af16_linear_rejects_bad_inputs():
+    """Wrong dtypes and non-contiguous tensors are rejected, not miscomputed."""
+    hidden, weights_2bit, weights_4bit, scales = _make_case(7, 512, 256)
+    output = torch.empty((7, 256), dtype=torch.float16, device=hidden.device)
+
+    with pytest.raises(AssertionError):
+        flag_train.deepspeed.wf6af16_linear(
+            output, hidden.float(), weights_2bit, weights_4bit, scales, 256, 7, 512
+        )
+
+    noncontig = torch.randn(512, 7, dtype=torch.float16, device=hidden.device).t()
+    with pytest.raises(AssertionError):
+        flag_train.deepspeed.wf6af16_linear(
+            output, noncontig, weights_2bit, weights_4bit, scales, 256, 7, 512
+        )
+
+
+def _active_gemm():
+    """The bare GEMM kernel and the config list of the registered backend."""
+    module = sys.modules[flag_train.deepspeed.wf6af16_linear.__module__]
+    autotuner = module.wf6af16_linear_kernel.fn  # LibEntry -> Autotuner
+    return autotuner.fn, autotuner.configs
+
+
+def _run_config(bare, config, hidden, w2, w4, scales, split_k, wide_load):
+    """One launch of the bare GEMM kernel pinned to an explicit config."""
+    tokens, in_channels = hidden.shape
+    out_channels = scales.shape[0]
+    grid = (
+        triton.cdiv(out_channels, config.kwargs["BLOCK_M"])
+        * triton.cdiv(tokens, config.kwargs["BLOCK_N"])
+        * split_k,
+    )
+    meta = dict(config.kwargs)
+    meta.update(num_warps=config.num_warps, num_stages=config.num_stages)
+
+    output = torch.empty(
+        (tokens, out_channels), dtype=torch.float16, device=hidden.device
+    )
+    if split_k == 1:
+        bare[grid](
+            output,
+            hidden,
+            w2,
+            w4,
+            scales,
+            out_channels,
+            tokens,
+            in_channels,
+            split_k,
+            SPLIT_K_MODE=False,
+            WIDE_LOAD=wide_load,
+            **meta,
+        )
+        return output
+
+    workspace = torch.empty(
+        (split_k, tokens, out_channels), dtype=torch.float32, device=hidden.device
+    )
+    bare[grid](
+        workspace,
+        hidden,
+        w2,
+        w4,
+        scales,
+        out_channels,
+        tokens,
+        in_channels,
+        split_k,
+        SPLIT_K_MODE=True,
+        WIDE_LOAD=wide_load,
+        **meta,
+    )
+    reduce_kernel = sys.modules[
+        "flag_train.deepspeed.wf6af16_linear"
+    ].wf6af16_split_k_reduce_kernel
+    total = tokens * out_channels
+    reduce_kernel[(triton.cdiv(total, 1024),)](
+        workspace, output, total, split_k, BLOCK_SIZE=1024
+    )
+    return output
+
+
+@pytest.mark.wf6af16_linear
+def test_wf6af16_linear_all_configs():
+    """Every config in the active autotune space must compute correctly.
+
+    Autotune scores speed, not correctness: a config that miscompiles on a
+    platform can win tuning and only show up as wrong results. Sweep the
+    whole space explicitly -- on the byte path everywhere, plus the wide
+    path on the backends whose wrapper enables it -- so a bad entry fails
+    here instead of on whichever shape happens to select it.
+    """
+    bare, configs = _active_gemm()
+    wide_values = [False, True]
+    if flag_train.vendor_name == "iluvatar":
+        # The CoreX backend never enables WIDE_LOAD (it miscompiles there).
+        wide_values = [False]
+    for tokens, in_channels, out_channels, split_k in [
+        (1, 64, 64, 1),
+        (7, 512, 256, 4),
+    ]:
+        hidden, w2, w4, scales = _make_case(tokens, in_channels, out_channels)
+        ref_out = wf6af16_ref(hidden, w2, w4, scales)
+        for config in configs:
+            for wide_load in wide_values:
+                out = _run_config(
+                    bare, config, hidden, w2, w4, scales, split_k, wide_load
+                )
+                try:
+                    utils.train_assert_close(
+                        utils.to_reference(out),
+                        utils.to_reference(ref_out),
+                        torch.float16,
+                        reduce_dim=in_channels,
+                    )
+                except AssertionError as e:
+                    raise AssertionError(
+                        f"config {config}, WIDE_LOAD={wide_load}, shape "
+                        f"({tokens}, {in_channels}, {out_channels}), "
+                        f"split_k={split_k}:\n{e}"
+                    ) from e
+
+
+@pytest.mark.wf6af16_linear
 def test_pack_roundtrip():
     """Packing then unpacking must return the original codes."""
     codes = torch.randint(0, 64, (128, 512)).to(torch.uint8)
@@ -376,6 +523,20 @@ def test_quantize_weights_fp6():
     assert int(codes.max()) < 64
     assert scales.dtype == torch.float16
     assert (reconstructed - weight).abs().max() <= 2.0 * scales.max() + 1e-6
+
+
+@pytest.mark.wf6af16_linear
+def test_quantize_weights_fp6_zero_row():
+    """An all-zero row gets scale 1 and all-zero codes, reconstructed exactly."""
+    weight = torch.randn(4, 64, dtype=torch.float32)
+    weight[2] = 0.0
+    codes, scales = quantize_weights_fp6(weight)
+
+    assert scales[2] == 1.0
+    assert int(codes[2].max()) == 0
+    table = _fp6_e3m2_table()
+    reconstructed = table[codes.long()] * scales.to(torch.float32)[:, None]
+    assert torch.equal(reconstructed[2], weight[2])
 
 
 @pytest.mark.wf6af16_linear

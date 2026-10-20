@@ -37,16 +37,22 @@ import flag_train
 
 from .. import base
 
-# Inference-style shapes: (tokens, in_channels, out_channels). The token count
-# stays in the decode range the FP6 kernel targets; the channel pairs mirror
-# the sizes DeepSpeed's split-K map is profiled for.
+# Inference-style shapes: (tokens, in_channels, out_channels). The decode
+# ladder (1..64) is dense because the split-K heuristic switches there; the
+# prefill shapes reach past the map's 768-token ceiling. The channel pairs
+# mirror the sizes DeepSpeed's split-K map is profiled for.
 _WF6AF16_SHAPES = [
     (1, 4096, 4096),
+    (4, 4096, 4096),
+    (8, 4096, 4096),
     (16, 4096, 4096),
+    (16, 14336, 4096),
+    (32, 4096, 4096),
     (64, 4096, 4096),
     (128, 4096, 14336),
     (256, 8192, 8192),
     (512, 4096, 4096),
+    (1024, 4096, 4096),
 ]
 
 # ---------------------------------------------------------------------------

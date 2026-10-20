@@ -125,6 +125,9 @@ def wf6af16_linear(
     assert in_channels % 4 == 0, "in_channels must be a multiple of 4"
     assert weights_2bit.shape == (out_channels, in_channels // 4)
     assert weights_4bit.shape == (out_channels, in_channels // 2)
+    # The kernel indexes raw pointers with row-major strides.
+    for t in (output, hidden_states, weights_2bit, weights_4bit, scale):
+        assert t.is_contiguous(), "wf6af16_linear requires contiguous tensors"
 
     if split_k is None:
         split_k = _pick_split_k(tokens, out_channels, in_channels)
