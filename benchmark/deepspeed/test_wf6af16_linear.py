@@ -116,8 +116,12 @@ def wf6af16_ref(hidden_states, weights_2bit, weights_4bit, scales):
 
 # Backends whose baseline is DeepSpeed when the extension and GPU allow it.
 # cuda_wf6af16_linear ships in the InferenceCore CUDA extension, so only a
-# backend that can compile and execute one can host it.
-_DEEPSPEED_BASELINE_VENDORS = {"nvidia", "hygon"}
+# backend that can compile and execute one can host it. Hygon is deliberately
+# absent: the extension builds through HIP there, but the kernel body is
+# guarded by __CUDA_ARCH__ in [800, 900) (kernel_matmul.cuh), so the DCU build
+# compiles to a stub that returns garbage or fails the launch outright; the
+# torch reference is the only baseline a DCU can run.
+_DEEPSPEED_BASELINE_VENDORS = {"nvidia"}
 
 
 def _load_deepspeed_wf6af16():
