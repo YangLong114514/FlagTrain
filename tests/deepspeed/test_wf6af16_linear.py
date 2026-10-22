@@ -62,8 +62,12 @@ _FP6_ABS_MAX = 28.0
 
 
 def _fp6_e3m2_table(device=None):
-    """All 64 values representable in FP6-E3M2, indexed by the 6-bit code."""
-    codes = torch.arange(64, dtype=torch.int32, device=device)
+    """All 64 values representable in FP6-E3M2, indexed by the 6-bit code.
+
+    Built on the CPU: it is only 64 exact values, and some device stacks
+    (Iluvatar's ixrtc) fail to JIT-compile torch's fp32 ``exp2`` kernel.
+    """
+    codes = torch.arange(64, dtype=torch.int32)
     sign = torch.where((codes >> 5) & 1 == 1, -1.0, 1.0)
     e = ((codes >> 2) & 7).to(torch.float32)
     m = (codes & 3).to(torch.float32)
@@ -72,7 +76,7 @@ def _fp6_e3m2_table(device=None):
         m * 0.0625,
         torch.exp2(e - 3.0) * (1.0 + m * 0.25),
     )
-    return sign * mag
+    return (sign * mag).to(device)
 
 
 def quantize_weights_fp6(weight):
