@@ -22,4 +22,7 @@ which is what ``SpecOpRegistrar`` registers.
 from .blocked_flash import blocked_flash
 from .wf6af16_linear import wf6af16_linear
 
-__all__ = ["blocked_flash", "wf6af16_linear"]
+__all__ = [
+    "blocked_flash",
+    "wf6af16_linear",
+]

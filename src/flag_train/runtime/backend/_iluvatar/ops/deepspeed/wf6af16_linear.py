@@ -106,7 +106,7 @@ def wf6af16_linear(
     only the tuning space and the (forced-off) wide loads differ -- see the
     module docstring.
     """
-    logger.debug("TRAIN WF6AF16_LINEAR (Iluvatar)")
+    logger.debug("TRAIN_ILUVATAR WF6AF16_LINEAR")
 
     assert hidden_states.dtype == torch.float16, "activations must be fp16"
     assert output.dtype == torch.float16, "output must be fp16"

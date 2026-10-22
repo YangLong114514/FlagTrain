@@ -295,7 +295,7 @@ def wf6af16_linear(
     only the kernel variant, the tuning space, and the split-K choice differ
     (see the module docstring).
     """
-    logger.debug("TRAIN WF6AF16_LINEAR (Ascend)")
+    logger.debug("TRAIN_ASCEND WF6AF16_LINEAR")
 
     assert hidden_states.dtype == torch.float16, "activations must be fp16"
     assert output.dtype == torch.float16, "output must be fp16"

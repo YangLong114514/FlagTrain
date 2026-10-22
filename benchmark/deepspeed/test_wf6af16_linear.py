@@ -270,8 +270,6 @@ def train_op(hidden, weights_2bit, weights_4bit, scales, ds_w2, ds_w4):
 
 @pytest.mark.wf6af16_linear
 def test_wf6af16_linear_perf():
-    print(f"\nBaseline: {_BASELINE}")
-
     bench = Wf6Af16LinearBenchmark(
         input_fn=wf6af16_input_fn,
         op_name="wf6af16_linear",
