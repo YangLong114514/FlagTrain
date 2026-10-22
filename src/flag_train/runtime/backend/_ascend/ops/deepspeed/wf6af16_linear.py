@@ -56,6 +56,12 @@ Registration is by name. ``_ascend/ops/deepspeed/__init__.py`` re-exports this
 module's ``wf6af16_linear``, and ``SpecOpRegistrar`` writes it over the
 same-named generic function in ``flag_train.deepspeed`` when that package is
 imported -- the namespace the tests and the benchmark read the operator from.
+
+A ``do_bench`` wrapper reports a device-trapped config as infinitely slow:
+a binary that hangs the AI core fails the bench's synchronize with a plain
+``RuntimeError`` (error 507014; observed on CANN 9.1.1 for a config that is
+correct under 9.0.0), which the stock autotuner does not treat as "skip this
+config".
 """
 
 import logging
@@ -248,12 +254,35 @@ def _wf6af16_linear_gemm_ascend(
         )
 
 
+def _gemm_do_bench():
+    """Autotune bench function that skips configs the device rejects.
+
+    A config whose compiled binary traps or hangs on the AI core surfaces at
+    the bench's synchronize as a plain ``RuntimeError`` (error 507014,
+    "aicore execution times out") -- seen on CANN 9.1.1 with a config that is
+    correct under 9.0.0. The stock autotuner does not treat that as "skip
+    this config", so it is reported as infinitely slow and tuning continues
+    with the remaining candidates.
+    """
+    bench = triton.runtime.driver.active.get_benchmarker()
+
+    def do_bench(kernel_call, quantiles):
+        try:
+            return bench(kernel_call, quantiles=quantiles)
+        except RuntimeError as e:
+            logger.debug("wf6af16_linear autotune: skipping config: %s", e)
+            return [float("inf"), float("inf"), float("inf")]
+
+    return do_bench
+
+
 # The bare JIT function above is wrapped with the Ascend-verified autotune
 # space; the test suite reads the configs back off this object.
 wf6af16_linear_kernel = libentry()(
     triton.autotune(
         configs=_gemm_configs(),
         key=["M", "N", "K", "split_k"],
+        do_bench=_gemm_do_bench(),
     )(_wf6af16_linear_gemm_ascend)
 )
 
