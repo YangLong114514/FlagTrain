@@ -408,6 +408,10 @@ def _run_config(bare, config, hidden, w2, w4, scales, split_k, wide_load):
     )
     meta = dict(config.kwargs)
     meta.update(num_warps=config.num_warps, num_stages=config.num_stages)
+    # wide_load=None: the kernel has no WIDE_LOAD parameter (the Ascend
+    # variant drops the path entirely instead of just disabling it).
+    if wide_load is not None:
+        meta["WIDE_LOAD"] = wide_load
 
     output = torch.empty(
         (tokens, out_channels), dtype=torch.float16, device=hidden.device
@@ -424,7 +428,6 @@ def _run_config(bare, config, hidden, w2, w4, scales, split_k, wide_load):
             in_channels,
             split_k,
             SPLIT_K_MODE=False,
-            WIDE_LOAD=wide_load,
             **meta,
         )
         return output
@@ -443,7 +446,6 @@ def _run_config(bare, config, hidden, w2, w4, scales, split_k, wide_load):
         in_channels,
         split_k,
         SPLIT_K_MODE=True,
-        WIDE_LOAD=wide_load,
         **meta,
     )
     reduce_kernel = sys.modules[
@@ -471,6 +473,11 @@ def test_wf6af16_linear_all_configs():
     if flag_train.vendor_name == "iluvatar":
         # The CoreX backend never enables WIDE_LOAD (it miscompiles there).
         wide_values = [False]
+    elif flag_train.vendor_name == "ascend":
+        # WIDE_LOAD casts the packed weights to uint32 pointers, which
+        # BiShengHIR rejects at compile time (unmatched bitwidth); the Ascend
+        # kernel drops the path entirely, so there is nothing to pin here.
+        wide_values = [None]
     for tokens, in_channels, out_channels, split_k in [
         (1, 64, 64, 1),
         (7, 512, 256, 4),
