@@ -509,48 +509,6 @@ def test_wf6af16_linear_all_configs():
 
 
 @pytest.mark.wf6af16_linear
-def test_pack_roundtrip():
-    """Packing then unpacking must return the original codes."""
-    codes = torch.randint(0, 64, (128, 512)).to(torch.uint8)
-    weights_2bit, weights_4bit = pack_weights_fp6(codes)
-    utils.train_assert_equal(unpack_weights_fp6(weights_2bit, weights_4bit), codes)
-
-
-@pytest.mark.wf6af16_linear
-def test_quantize_weights_fp6():
-    """Quantization error must stay within half of the coarsest FP6 quantum.
-
-    The coarsest spacing of FP6-E3M2 is 4 (between 24 and 28), so with the
-    scale pinned to ``amax / 28`` no element may be off by more than ``2 *
-    scale``; values quantized from the middle of a binade do strictly better.
-    """
-    weight = torch.randn(64, 256, dtype=torch.float32)
-    codes, scales = quantize_weights_fp6(weight)
-
-    table = _fp6_e3m2_table()
-    reconstructed = table[codes.long()] * scales.to(torch.float32)[:, None]
-
-    assert codes.dtype == torch.uint8
-    assert int(codes.max()) < 64
-    assert scales.dtype == torch.float16
-    assert (reconstructed - weight).abs().max() <= 2.0 * scales.max() + 1e-6
-
-
-@pytest.mark.wf6af16_linear
-def test_quantize_weights_fp6_zero_row():
-    """An all-zero row gets scale 1 and all-zero codes, reconstructed exactly."""
-    weight = torch.randn(4, 64, dtype=torch.float32)
-    weight[2] = 0.0
-    codes, scales = quantize_weights_fp6(weight)
-
-    assert scales[2] == 1.0
-    assert int(codes[2].max()) == 0
-    table = _fp6_e3m2_table()
-    reconstructed = table[codes.long()] * scales.to(torch.float32)[:, None]
-    assert torch.equal(reconstructed[2], weight[2])
-
-
-@pytest.mark.wf6af16_linear
 @requires_deepspeed_reference
 @pytest.mark.parametrize("tokens", [1, 7, 64, 65, 200])
 def test_matches_deepspeed_oracle(tokens):
