@@ -1,11 +1,17 @@
 # Megatron 正确性测试
 
-本目录当前没有可执行测试。这里放置 `src/flag_train/megatron/` 后续实现对应的测试，
-不代表已验证 Megatron 的功能或兼容性。
+`test_fused_h_post_bda.py` 验证 mHC 的 `fused_h_post_bda_forward` 和
+`fused_h_post_bda_backward`。参考实现为独立的 PyTorch 组合前向和 PyTorch autograd
+反向，覆盖可选 bias、非连续输入、边界形状及全部输入梯度；`--ref cpu` 会在 CPU 上
+执行参考计算。
 
-贡献实现时，应同时提供参考实现及其版本，比较前向输出和输入、参数梯度，说明
-数据类型、误差容限及边界输入。涉及并行计算时，还需验证相应的进程数、张量划分、
-通信和随机种子条件，并记录实际硬件与执行结果。
+参考上游为 Megatron-LM 提交 `2052769557dcf7045c4091d1996f0bc59afeb80e` 的
+`megatron/core/fusions/fused_mhc_kernels.py`。运行：
 
-测试入口和运行命令随首个可执行测试一起补充；性能测量放在
-[`benchmark/megatron/`](../../benchmark/megatron/)。
+```bash
+pytest tests/megatron/test_fused_h_post_bda.py \
+  -m "fused_h_post_bda_forward or fused_h_post_bda_backward" --ref cpu -vs
+```
+
+性能测量见 [`benchmark/megatron/`](../../benchmark/megatron/)。实际验证环境及结果记录在
+[`docs/compatibility.md`](../../docs/compatibility.md)。
