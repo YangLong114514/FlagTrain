@@ -22,6 +22,7 @@ backward returns gradients in Megatron's order: ``h_res``, original residual,
 ``h_post``, ``x``, and optional bias.
 """
 
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -339,8 +340,29 @@ def fused_h_post_bda_forward(
         triton.cdiv(sb, meta["BLOCK_S"]),
         triton.cdiv(channels, meta["BLOCK_C"]),
     )
-    with torch_device_fn.device(h_res.device):
-        _triton_hpb_fwd_kernel[grid](
+    small_nvidia = (
+        runtime_device.vendor_name == "nvidia" and sb <= 8 and channels <= 1024
+    )
+    if small_nvidia:
+        fwd_kernel = _triton_hpb_fwd_kernel.fn.fn
+        fixed_config = {
+            "BLOCK_C": 64 if channels <= 256 else 128,
+            "BLOCK_S": 2 if n <= 2 else 1,
+            "num_warps": 4,
+        }
+    elif runtime_device.vendor_name == "nvidia":
+        fwd_kernel = _triton_hpb_fwd_kernel.fn
+        fixed_config = {}
+    else:
+        fwd_kernel = _triton_hpb_fwd_kernel
+        fixed_config = {}
+    device_context = (
+        nullcontext()
+        if runtime_device.vendor_name == "nvidia"
+        else torch_device_fn.device(h_res.device)
+    )
+    with device_context:
+        fwd_kernel[grid](
             hr_flat,
             orig_flat,
             hp_flat,
@@ -360,6 +382,7 @@ def fused_h_post_bda_forward(
             out.stride(1),
             out.stride(2),
             HAS_BIAS=(bias is not None),
+            **fixed_config,
         )
     return out.view(s, b, n, channels)
 
