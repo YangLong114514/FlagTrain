@@ -22,11 +22,18 @@ from flag_train.megatron import fused_h_post_bda_backward, fused_h_post_bda_forw
 from .. import accuracy_utils as utils
 
 _DTYPE_SHAPE_CASES = [
+    (torch.bfloat16, 1, 1, 1, 1),
     (torch.bfloat16, 1, 2, 2, 65),
     (torch.bfloat16, 2, 1, 4, 130),
+    (torch.bfloat16, 2, 3, 4, 130),
     (torch.bfloat16, 1, 1, 8, 257),
+    (torch.bfloat16, 64, 8, 4, 130),
+    (torch.float16, 1, 2, 2, 65),
     (torch.float16, 2, 1, 4, 130),
+    (torch.float16, 1, 1, 8, 257),
+    (torch.float32, 1, 2, 2, 65),
     (torch.float32, 2, 1, 4, 130),
+    (torch.float32, 1, 1, 8, 257),
 ]
 _GRADIENT_NAMES = ("h_res", "original_residual", "h_post", "x", "bias")
 

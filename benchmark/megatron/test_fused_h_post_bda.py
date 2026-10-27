@@ -30,8 +30,27 @@ from flag_train.megatron import fused_h_post_bda_forward as forward
 
 from .. import base
 
-_CORE_SHAPES = [(64, 8, 4, 4096)]
-_COMPREHENSIVE_SHAPES = [(8192, 4, 4, 7168)]
+_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+_CORE_SHAPES = [
+    (2, 4, 4, 1024, 0),
+    (2, 4, 4, 1024, 1),
+    (64, 8, 4, 4096, 0),
+    (64, 8, 4, 4096, 1),
+    (128, 1, 8, 7168, 0),
+    (128, 1, 8, 7168, 1),
+]
+_COMPREHENSIVE_SHAPES = [
+    (1, 1, 1, 1, 0),
+    (1, 1, 1, 1, 1),
+    (1, 2, 2, 65, 0),
+    (1, 2, 2, 65, 1),
+    (2, 3, 4, 130, 0),
+    (2, 3, 4, 130, 1),
+    (512, 4, 4, 4096, 0),
+    (512, 4, 4, 4096, 1),
+    (8192, 4, 4, 7168, 0),
+    (8192, 4, 4, 7168, 1),
+]
 
 
 def _torch_forward(h_res, original_residual, h_post, x, bias=None):
@@ -82,7 +101,7 @@ def _select_baseline():
         )
 
         hr, orig, hp, x, bias = next(
-            forward_input_fn((1, 1, 2, 8), torch.bfloat16, flag_train.device)
+            forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
         )
         with base.torch_device_fn.device(hr.device):
             output = _triton_h_post_bda_fwd(hr, orig, hp, x, bias)
@@ -104,12 +123,12 @@ def _select_baseline():
 
 
 def _make_inputs(shape, dtype, device):
-    s, b, n, channels = shape
+    s, b, n, channels, with_bias = shape
     h_res = torch.randn((s, b, n, n), dtype=dtype, device=device)
-    original_residual = torch.randn(shape, dtype=dtype, device=device)
+    original_residual = torch.randn((s, b, n, channels), dtype=dtype, device=device)
     h_post = torch.randn((s, b, n), dtype=dtype, device=device)
     x = torch.randn((s, b, channels), dtype=dtype, device=device)
-    bias = torch.randn((channels,), dtype=dtype, device=device)
+    bias = torch.randn((channels,), dtype=dtype, device=device) if with_bias else None
     return h_res, original_residual, h_post, x, bias
 
 
@@ -118,8 +137,9 @@ def forward_input_fn(shape, dtype, device):
 
 
 def backward_input_fn(shape, dtype, device):
+    s, b, n, channels, _ = shape
     h_res, original_residual, h_post, x, bias = _make_inputs(shape, dtype, device)
-    grad_output = torch.randn(shape, dtype=dtype, device=device)
+    grad_output = torch.randn((s, b, n, channels), dtype=dtype, device=device)
     yield grad_output, h_res, original_residual, h_post, x, bias
 
 
@@ -129,7 +149,7 @@ _baseline_forward, _baseline_backward, _BASELINE = _select_baseline()
 
 class FusedHPostBDABenchmark(base.GenericBenchmark):
     DEFAULT_SHAPES = _CORE_SHAPES
-    DEFAULT_SHAPE_DESC = "S, B, N, C"
+    DEFAULT_SHAPE_DESC = "S, B, N, C, WITH_BIAS"
 
     def set_shapes(self, shape_file=None):
         self.shapes = list(_CORE_SHAPES)
@@ -158,7 +178,7 @@ def test_fused_h_post_bda_forward_perf():
         input_fn=forward_input_fn,
         op_name="fused_h_post_bda_forward",
         torch_op=torch_forward,
-        dtypes=[torch.bfloat16],
+        dtypes=_DTYPES,
         is_backward=False,
     )
     bench.set_train(forward)
@@ -172,7 +192,7 @@ def test_fused_h_post_bda_backward_perf():
         input_fn=backward_input_fn,
         op_name="fused_h_post_bda_backward",
         torch_op=torch_backward,
-        dtypes=[torch.bfloat16],
+        dtypes=_DTYPES,
         # The public backward API is timed directly, not through autograd.
         is_backward=False,
     )
