@@ -426,8 +426,30 @@ def fused_h_post_bda_backward(
         triton.cdiv(channels, meta["BLOCK_C"]),
     )
     grid_b = lambda meta: (triton.cdiv(sb, meta["BLOCK_S"]),)
-    with torch_device_fn.device(h_res.device):
-        _triton_hpb_bwd_g_x_orig_kernel[grid_a](
+    small_nvidia = (
+        runtime_device.vendor_name == "nvidia" and sb <= 8 and channels <= 1024
+    )
+    if small_nvidia:
+        bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel.fn.fn
+        bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel.fn.fn
+        fixed_config = {
+            "BLOCK_C": 64 if channels <= 256 else 128,
+            "BLOCK_S": 2 if n <= 2 else 1,
+            "num_warps": 4,
+        }
+        device_context = nullcontext()
+    elif runtime_device.vendor_name == "nvidia":
+        bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel.fn
+        bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel.fn
+        fixed_config = {}
+        device_context = nullcontext()
+    else:
+        bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel
+        bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel
+        fixed_config = {}
+        device_context = torch_device_fn.device(h_res.device)
+    with device_context:
+        bwd_g_x_orig_kernel[grid_a](
             go_flat,
             hr_flat,
             hp_flat,
@@ -445,8 +467,9 @@ def fused_h_post_bda_backward(
             g_res.stride(0),
             g_res.stride(1),
             g_res.stride(2),
+            **fixed_config,
         )
-        _triton_hpb_bwd_g_hp_hr_kernel[grid_b](
+        bwd_g_hp_hr_kernel[grid_b](
             go_flat,
             orig_flat,
             x_flat,
@@ -466,6 +489,7 @@ def fused_h_post_bda_backward(
             g_hr.stride(1),
             g_hr.stride(2),
             HAS_BIAS=(bias is not None),
+            **fixed_config,
         )
 
     g_bias = g_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None
