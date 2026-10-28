@@ -1,8 +1,8 @@
 # wf6af16_linear 算子文档
 
 > FP6 权重 / FP16 激活线性层，移植自 DeepSpeed 的 `cuda_wf6af16_linear`（源自 FP6-LLM），
-> Triton 实现，支持多后端。本文档覆盖：功能、接口、NVIDIA 实现方案、实现历程、
-> 历史问题与解决方案、测试设计。
+> Triton 实现，支持多后端。本文档覆盖：功能、接口、NVIDIA 实现方案、国产平台后端实现方案、
+> 实现历程、历史问题与解决方案、测试设计。
 
 ---
 
@@ -30,7 +30,7 @@ decode 阶段（token 数少、带宽瓶颈在权重读取）收益最大。
 权重的**量化**（fp16 → FP6 code）和**打包**（code → 两个 uint8 切片）是模型加载时
 一次性完成的输入准备，不属于算子——这一点与 DeepSpeed 的分层完全一致
 （DeepSpeed 中是 module 层的 `fp_quantize` + `preprocess_weight`，kernel 不管；
-见第 4、5 节的讨论）。FlagTrain 测试目录里提供了这两个操作的 torch 参考实现，
+见第 5、6 节的讨论）。FlagTrain 测试目录里提供了这两个操作的 torch 参考实现，
 供调用方准备输入。
 
 ### 与 DeepSpeed 原版的关系
@@ -49,7 +49,7 @@ decode 阶段（token 数少、带宽瓶颈在权重读取）收益最大。
 
 ## 2. 接口介绍
 
-唯一公开接口（三个后端 override 注册在同一个命名空间下，调用方无感）：
+唯一公开接口（各后端 override 注册在同一个命名空间下，调用方无感）：
 
 ```python
 import flag_train
@@ -109,8 +109,8 @@ code -> sign * 2^(e-3) * (1 + m/4)        e != 0
 因此对调用方而言**接口永远只有一个**，后端差异透明。当前后端：
 
 - **通用后端**（`src/flag_train/deepspeed/wf6af16_linear.py`）：NVIDIA、海光及未覆盖平台；
-- **沐曦**（`_metax`）：自有 kernel 拷贝 + 自有调优空间；
-- **天数**（`_iluvatar`）：复用通用 kernel，裁剪过的配置空间 + 关闭宽读；
+- **沐曦**（`_metax`）：自有 kernel 拷贝 + 自有调优空间（见 4.1）；
+- **天数**（`_iluvatar`）：复用通用 kernel，裁剪过的配置空间 + 关闭宽读（见 4.2）；
 - **昇腾**（`_ascend`）：自有 kernel（流式拆解的 unpack 结构）。
 
 ---
@@ -146,7 +146,7 @@ key = `[M, N, K, split_k]`：
 - 小 `BLOCK_N`（16/32）服务 decode（带宽瓶颈在打包权重）；
 - 大 tile + 深流水（stages 3-4）服务 prefill（计算瓶颈）；
 - 其中 `(16,16,64)`、`(64,16,64)` 浅流水、`(32,128,64)` 四组来自沐曦 C550 扫参的
-  优胜配置，在 H20 上实测同样更快，反哺进了通用空间（见 5.6）。
+  优胜配置，在 H20 上实测同样更快，反哺进了通用空间（见 4.1）。
 
 ### 3.3 split-K 策略（`_pick_split_k`）
 
@@ -197,7 +197,70 @@ H20 上 tokens=1 约 22% 收益。该路径在通用 kernel 内以 `WIDE_LOAD` c
 
 ---
 
-## 4. 实现历程
+## 4. 国产平台后端实现方案
+
+各后端与通用后端的关系：kernel 要么复用通用的裸 JIT（`_wf6af16_linear_gemm`）
+自行包装调优空间，要么整体自带 kernel 拷贝；split-K 归约 kernel 一律复用通用实现；
+注册机制见 2.5。
+
+### 4.1 沐曦（MetaX C550）
+
+**自有 kernel 拷贝 + 自有调优空间**，是改动最深的一个后端，也是反哺通用后端
+优化的来源。与通用 kernel 的差异：
+
+1. **激活 mask 绑定 kernel 参数 K，而非循环内计算的 `k_end`**。两者接受的 lane
+   完全一致（split_k=1 时 `k_end == K`；split-K 时越界进入相邻切片的列仍在界内，
+   其贡献由显式置 0 的尾部 code 抵消——沐曦版用
+   `code = tl.where(offs_k < k_end, code, 0)` 替代通用版的"零激活抵消"）。
+   MACA 编译器给参数边界的 mask 生成的代码远好于循环计算值边界的 mask：
+   同一 tile 下 (512,4096,4096) 从 3270us → 812us，(128,4096,14336) 从 ~2900us
+   → 532us。同时参数边界 mask 可静态分析，**规避了 MACA pipeliner 对
+   "循环边界相关 load mask"的误编译**。
+2. **全配置 `num_stages=1`**：上述 pipeliner bug 下深流水间歇性算错 tile，
+   且扫参显示深流水在 C550 上从未获胜。
+3. **专属 tile 空间（4 组）**：decode 用 `(64,16,64)` / `(16,16,64)` 小 tile，
+   prefill 用 `(32,128,64)`（4/8 warps 两档）——C550 上全量扫参的优胜者。
+4. **decode 的 split-K 用 2 的幂**（tokens≤16 取 8，≤64 取 4，带对齐与最小切片
+   长度守卫）：2 的幂天然满足字节对齐，而 DeepSpeed 表的奇数因子大多对齐失败
+   退化为 1。1 token、K=M=4096 实测 264us → 123us。
+5. **WIDE_LOAD 的首发地**：uint32 宽读 + 寄存器拆字节，decode 收益 5-7%，
+   门控条件（对齐 + 仅 decode）后被通用后端原样吸收。
+6. **自定义 `do_bench`**：沐曦驱动默认每线程私有内存上限 4KB，超限 config
+   启动时报普通 `RuntimeError`（stock autotuner 不容错），记为无穷慢跳过。
+
+整体收益：相对初版通用实现 1.5-4.5x。
+
+### 4.2 天数（Iluvatar CoreX）
+
+**复用通用裸 kernel，自有 launcher + 裁剪过的配置空间**。kernel 逻辑与通用版
+完全一致（字节路径在天数上是正确的），差异只在两件事：
+
+1. **强制 `WIDE_LOAD=False`**：CoreX 后端误编译宽读路径的循环内地址计算
+   （`tl.cast(ptr, pointer_type(uint32)) + k0//16`），单迭代形状正常、
+   多次迭代约 37% 元素算错（详见 6.5）。
+2. **配置空间裁剪为 9 个**：经逐 config 诊断（绕过 autotune 逐一定参对拍），
+   `(16,16,64,2w)`、`(128,128,32)`、`(128,256,32)` 三个 config 在天数上
+   误编译（约 100% 全错），从空间中剔除（详见 6.6）。
+
+split-K 启发式、tile 的其余 9 组、归约 kernel 均与通用后端一致。
+
+### 4.3 海光（Hygon DCU）
+
+**无独立后端，直接走通用后端**（含宽读、pow2 split-K 等全部优化），
+11 个功能测试全部通过，未做平台专属调优。注意 DeepSpeed 原版 kernel 在海光
+HIP 编译下是空桩（见 6.8），因此海光的正确性参照物和性能基线都是
+torch 组合实现。
+
+### 4.4 平头哥 PPU（T-Head，待接入）
+
+**暂未跑通**：FlagTree PPU 后端与机器上 PPU_SDK 的 `ppu-llc` 版本不匹配，
+kernel 在编译期失败（汇编器无法解析 formatter 生成的文件头，见 6.10），
+属环境问题。待 SDK 版本对齐后按通用后端验证数值；若出现类似天数的误编译，
+按同样模式加后端覆盖即可。
+
+---
+
+## 5. 实现历程
 
 | 时间 | 提交 | 内容 |
 |---|---|---|
@@ -219,9 +282,9 @@ H20 上 tokens=1 约 22% 收益。该路径在通用 kernel 内以 `WIDE_LOAD` c
 
 ---
 
-## 5. 历史问题与解决方案
+## 6. 历史问题与解决方案
 
-### 5.1 DeepSpeed 原版 kernel 锁死 sm_80
+### 6.1 DeepSpeed 原版 kernel 锁死 sm_80
 
 **现象**：本机 H20（sm_90）跑 DeepSpeed 原版算子无法执行；而 DeepSpeed 自己的
 单测在本机显示 pass——实为测试内 `major != 8` 时 early-return 空跑，pass 是假象。
@@ -234,13 +297,13 @@ H20 上 tokens=1 约 22% 收益。该路径在通用 kernel 内以 `WIDE_LOAD` c
 → capability == (8,0) → InferenceCore 可构建，否则用 torch 组合参考实现，
 并在 skip 原因里写明。
 
-### 5.2 权重打包布局与 DeepSpeed 不兼容
+### 6.2 权重打包布局与 DeepSpeed 不兼容
 
 DeepSpeed 为喂 MMA fragment 把比特按 32 线程交织；Triton kernel 用不上这种布局。
 FlagTrain 自定义密集行主序布局（第 2 节），并在模块 docstring 中明确声明
 "不得直接喂 DeepSpeed `preprocess_weight` 的输出"。
 
-### 5.3 沐曦：私有内存 4KB 限制导致 autotune 崩溃
+### 6.3 沐曦：私有内存 4KB 限制导致 autotune 崩溃
 
 **现象**：沐曦 C550 上 benchmark 直接失败：
 `private memory size required ... system: 4 KB/Thread, kernel request: 5 KB/thread`，
@@ -252,7 +315,7 @@ MACA 后端报的是普通 `RuntimeError`，一个超限 config 就让整个调�
 
 **方案**：autotune 传自定义 `do_bench`，把启动失败的 config 记为无穷大耗时自动跳过。
 
-### 5.4 沐曦：pipeliner 误编译
+### 6.4 沐曦：pipeliner 误编译
 
 **现象**：深流水（num_stages ≥ 2）下间歇性算错 tile。
 
@@ -264,7 +327,7 @@ MACA 后端报的是普通 `RuntimeError`，一个超限 config 就让整个调�
 置 0 抵消），全配置 `num_stages=1`。该改动在 NVIDIA 上实测无收益，**不回迁**
 通用后端。
 
-### 5.5 天数：WIDE_LOAD 多次迭代误编译
+### 6.5 天数：WIDE_LOAD 多次迭代误编译
 
 **现象**：天数 CoreX 上约 37% 元素大面积算错，且不同 split_k 下错误值相同。
 
@@ -274,7 +337,7 @@ CoreX Triton 后端对 `tl.cast(ptr, pointer_type(uint32)) + k0//16` 的循环�
 
 **方案**：天数建独立后端，强制 `WIDE_LOAD=False`（字节路径本身是对的）。
 
-### 5.6 天数：3 个 tile config 误编译
+### 6.6 天数：3 个 tile config 误编译
 
 **现象**：宽读修复后仍有两个用例约 100% 全错，且失败集合随代码改动漂移。
 
@@ -286,7 +349,7 @@ CoreX Triton 后端对 `tl.cast(ptr, pointer_type(uint32)) + k0//16` 的循环�
 同时把"逐 config 正确性扫描"固化成正式测试（`test_wf6af16_linear_all_configs`），
 防止下一个平台踩同样的坑。
 
-### 5.7 天数 CI：torch.exp2 的 ixrtc JIT 失败
+### 6.7 天数 CI：torch.exp2 的 ixrtc JIT 失败
 
 **现象**：天数 CI 上第一个测试就挂，报错在 torch 参考实现的
 `torch.exp2(e - 3.0)`：`ixrtcCompileProgram failed`——CI 容器的 PyTorch 栈
@@ -294,18 +357,18 @@ CoreX Triton 后端对 `tl.cast(ptr, pointer_type(uint32)) + k0//16` 的循环�
 
 **方案**：FP6 值表（仅 64 个精确值）改在 CPU 上构建再搬到 device，CPU 不走 ixrtc JIT。
 
-### 5.8 海光：DeepSpeed oracle 是空桩
+### 6.8 海光：DeepSpeed oracle 是空桩
 
 **现象**：海光 DCU 上我们的算子 11 个功能测试全过，但 oracle 对照测试输出
 全是脏数据或报 `out of memory`。
 
-**原因**：5.1 的 `__CUDA_ARCH__` 守卫在 HIP 编译下不成立，kernel 编译成空桩——
+**原因**：6.1 的 `__CUDA_ARCH__` 守卫在 HIP 编译下不成立，kernel 编译成空桩——
 小 shape 读到未初始化内存，大 shape 直接报错。
 
 **方案**：把 hygon 从 `_DEEPSPEED_BASELINE_VENDORS` 移除（单测和 benchmark 两处），
 海光的参照物固定为 torch 组合实现，并加专门的 skip 说明。
 
-### 5.9 昇腾：BiShengHIR 编译器限制
+### 6.9 昇腾：BiShengHIR 编译器限制
 
 **现象**：指针位宽扩展 cast 直接被拒（`Casting pointers with unmatched bitwidth!`，
 uint32 在 A2/A3 上不是硬件 dtype）；字节路径仅在 BLOCK_K=32 能编译
@@ -316,7 +379,7 @@ BiShengHIR 插入的布局转换打乱数值。
 端到端处理，4-bit 片用偶/奇两路 stride-2 字节读，激活 tile 按 stride-4 读 4 流，
 最终 tile 的 dot 为 4 个分流的 dot 之和，全程无 `tl.interleave`。
 
-### 5.10 平头哥 PPU：工具链版本不匹配（未解决）
+### 6.10 平头哥 PPU：工具链版本不匹配（未解决）
 
 **现象**：PPU 上编译期报错，`ppu-llc` 无法解析 `irformatter` 生成的汇编文件头
 （`line 1:0 mismatched input 'ppu'`）。
@@ -327,9 +390,9 @@ BiShengHIR 插入的布局转换打乱数值。
 
 ---
 
-## 6. 测试设计
+## 7. 测试设计
 
-### 6.1 精度测试（`tests/deepspeed/test_wf6af16_linear.py`，20 用例）
+### 7.1 精度测试（`tests/deepspeed/test_wf6af16_linear.py`，20 用例）
 
 双层 oracle 设计：
 
@@ -351,7 +414,7 @@ BiShengHIR 插入的布局转换打乱数值。
 输入准备 helper（`quantize_weights_fp6` / `pack_weights_fp6` / `unpack_weights_fp6`）
 是 torch 参考实现，留在测试文件中供调用方参考，不作为被测对象。
 
-### 6.2 性能测试（`benchmark/deepspeed/test_wf6af16_linear.py`，11 个 shape）
+### 7.2 性能测试（`benchmark/deepspeed/test_wf6af16_linear.py`，11 个 shape）
 
 - decode 梯度 1/4/8/16/32/64（卡住 split-K 启发式的分档边界），
   prefill 128/256/512/1024（越过 split-K 表 768 行上限），
@@ -359,7 +422,7 @@ BiShengHIR 插入的布局转换打乱数值。
 - 基线按平台降级：sm_80 白名单 → DeepSpeed 原版 kernel，否则 torch 组合实现；
 - 计时只含 kernel 调用，打包/量化在 input 准备阶段完成（与真实推理一致）。
 
-### 6.3 运行方式
+### 7.3 运行方式
 
 ```bash
 # 精度（两个目录的 conftest 都注册 --override，不能放一条命令里跑）
