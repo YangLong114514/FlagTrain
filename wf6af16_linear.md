@@ -111,7 +111,7 @@ code -> sign * 2^(e-3) * (1 + m/4)        e != 0
 - **通用后端**（`src/flag_train/deepspeed/wf6af16_linear.py`）：NVIDIA、海光及未覆盖平台；
 - **沐曦**（`_metax`）：自有 kernel 拷贝 + 自有调优空间（见 4.1）；
 - **天数**（`_iluvatar`）：复用通用 kernel，裁剪过的配置空间 + 关闭宽读（见 4.2）；
-- **昇腾**（`_ascend`）：自有 kernel（流式拆解的 unpack 结构）。
+- **昇腾**（`_ascend`）：自有 kernel（四路 K 流拆解的 unpack 结构）+ 自有调优空间（见 4.3）。
 
 ---
 
@@ -244,17 +244,47 @@ H20 上 tokens=1 约 22% 收益。该路径在通用 kernel 内以 `WIDE_LOAD` c
 
 split-K 启发式、tile 的其余 9 组、归约 kernel 均与通用后端一致。
 
-### 4.3 海光（Hygon DCU）
+### 4.3 昇腾（Ascend 910B）
+
+**自有 kernel + 自有调优空间**，改动幅度与沐曦并列最大：通用 kernel 的两条
+代码路径在 BiShengHIR 下一条编译期被拒、一条能编译但算错（见 6.9），unpack
+结构整体重写。split-K 归约 kernel 复用通用实现。与通用 kernel 的差异：
+
+1. **四路 K 流拆解，全程无 `tl.interleave`**。把 2-bit 切片每个字节装的 4 列
+   当作 4 条独立 K 流端到端处理：2-bit 片一次加载（每字节天然含 4 流各 2 位），
+   4-bit 片按偶/奇字节两次 stride-2 加载（偶字节是流 0/1 的低 4 位、奇字节是
+   流 2/3 的）；每流在流内合成 6-bit code、`_dequant_fp6` 解量化、乘行 scale；
+   激活 tile 按 stride-4 拆 4 流匹配；tile 的 dot 为 4 个分流 dot 累加之和。
+   所有张量都源自同模式 strided load，编译器永远不需要在 interleave 布局间
+   做转换（它一转就错，且转换会实体化 kernel 内最宽的中间量）。
+2. **BLOCK_K 固定 64**：分流后每个 dot 的归约维是 `BLOCK_K/4`，须达到 cube
+   单元最小归约维 16，即 `BLOCK_K >= 64`；扫参显示更大的 BLOCK_K 只涨 UB
+   占用、不赢任何形状。
+3. **无 WIDE_LOAD**：uint32 指针位宽 cast 被 BiShengHIR 编译期拒绝（见 6.9a），
+   整条路径删除，wrapper 也不接受 `wide_load` 参数。
+4. **专属 tile 空间（6 组，全 BLOCK_K=64、4 warps）**：
+   `(128, 16/32/64/128, stages=1)` + `(64, 64, stages=2)` + `(16, 16)`。
+   来自 910B4 上绕过 autotune 的 128 组逐 config 扫参（108 组结果正确），
+   保留各形状优胜且正确的配置——与天数同理，autotune 只比速度不比正确性，
+   误编译配置必须在进空间前就剔掉。
+5. **split-K 取 2 的幂**（tokens≤16 取 16，≤64 取 8，更大取 1；带
+   `K % (split_k*4) == 0` 与切片长度 ≥64 守卫，不满足则减半）。2 的幂天然
+   满足字节对齐；1 token、K=M=4096 实测 split-16 约 2.2us vs 不切约 35us。
+
+性能（910B4，CANN 9.0，基线为 torch 组合实现）：decode `(1, 4096, 4096)`
+约 2.2us（约 125x），prefill `(1024, 4096, 4096)` 约 61us（约 5x）。
+
+### 4.4 海光（Hygon DCU）
 
 **无独立后端，直接走通用后端**（含宽读、pow2 split-K 等全部优化），
 11 个功能测试全部通过，未做平台专属调优。注意 DeepSpeed 原版 kernel 在海光
 HIP 编译下是空桩（见 6.8），因此海光的正确性参照物和性能基线都是
 torch 组合实现。
 
-### 4.4 平头哥 PPU（T-Head，待接入）
+### 4.5 平头哥 PPU（T-Head，待接入）
 
 **暂未跑通**：FlagTree PPU 后端与机器上 PPU_SDK 的 `ppu-llc` 版本不匹配，
-kernel 在编译期失败（汇编器无法解析 formatter 生成的文件头，见 6.10），
+kernel 在编译期失败（汇编器无法解析 formatter 生成的文件头，见 6.12），
 属环境问题。待 SDK 版本对齐后按通用后端验证数值；若出现类似天数的误编译，
 按同样模式加后端覆盖即可。
 
@@ -279,6 +309,8 @@ kernel 在编译期失败（汇编器无法解析 formatter 生成的文件头�
 | 10-22 | `6accb10` | **天数 CI 修复**：FP6 值表改在 CPU 构建，绕开 ixrtc 的 exp2 JIT 失败 |
 | 10-22 | `52a83da` | 删除非公开接口（量化/打包 helper）的测试 |
 | 10-22 | `2fad49f` | PR review 意见处理（日志前缀、`__all__` 格式等） |
+| 10-22 | `1420af3` | 昇腾 autotune 容错尝试：自定义 `do_bench` 跳过设备 trap 的配置 |
+| 10-22 | `27d3293` | 回退 `1420af3`：CANN 9.1.1 CI 挂死原因待定位，恢复失败可见（见 6.10） |
 
 ---
 
@@ -368,18 +400,63 @@ CoreX Triton 后端对 `tl.cast(ptr, pointer_type(uint32)) + k0//16` 的循环�
 **方案**：把 hygon 从 `_DEEPSPEED_BASELINE_VENDORS` 移除（单测和 benchmark 两处），
 海光的参照物固定为 torch 组合实现，并加专门的 skip 说明。
 
-### 6.9 昇腾：BiShengHIR 编译器限制
+### 6.9 昇腾：通用 kernel 在 BiShengHIR 下三条路全断
 
-**现象**：指针位宽扩展 cast 直接被拒（`Casting pointers with unmatched bitwidth!`，
-uint32 在 A2/A3 上不是硬件 dtype）；字节路径仅在 BLOCK_K=32 能编译
-（192KB 统一缓冲区限制），且 `tl.interleave` 两种布局的 `|` 组合会被
-BiShengHIR 插入的布局转换打乱数值。
+通用 kernel 在昇腾上不可用不是单一 bug，而是三层叠加（910B4 + CANN 9.0 实测）：
 
-**方案**：昇腾后端重写 kernel 的 unpack 结构——把每字节 4 列当作 4 条独立 K 流
-端到端处理，4-bit 片用偶/奇两路 stride-2 字节读，激活 tile 按 stride-4 读 4 流，
-最终 tile 的 dot 为 4 个分流的 dot 之和，全程无 `tl.interleave`。
+**a) WIDE_LOAD 编译期被拒**。宽读路径把 uint8 打包权重指针 cast 为
+`tl.pointer_type(tl.uint32)`，BiShengHIR 直接报
+`Casting pointers with unmatched bitwidth!`（uint32 在 A2/A3 上根本不是硬件
+dtype）。更糟的是通用 wrapper 的启发式恰好在 decode token 范围（≤64）自动
+开启宽读——通用路径会在它本来要加速的 shape 上编译期崩溃。
 
-### 6.10 平头哥 PPU：工具链版本不匹配（未解决）
+**b) 字节路径爆统一缓冲区（UB）**。关掉宽读后字节路径仅在 BLOCK_K=32 能编译；
+更大 BLOCK_K 时解包链的众多 `(BLOCK_M, BLOCK_K)` 中间量各自实体化，多 buffer
+再翻倍，超出 192KB UB 上限，编译失败。
+
+**c) interleave 布局转换打错数值**。BLOCK_K=32 虽能编译但结果全错。写逐层
+探针 kernel 定位：`code = (top2 << 4) | low4` 合并的两个张量携带不同的
+`tl.interleave` 布局，BiShengHIR 为 `|`（或 `+`）插入的布局转换会把数值
+打乱——每个操作数单独写回都正确，合并即乱；各基础原语（strided load、位运算、
+`tl.dot`）单独验证也都正确，错误只出现在布局转换点。interleave 产物直接进
+`tl.dot` 同样被转换打乱。
+
+**方案**：放弃在通用 kernel 上修补，昇腾后端整体重写 unpack 为四路 K 流结构
+（见 4.3），全程无 `tl.interleave`，编译器没有任何布局转换可做；WIDE_LOAD
+路径整条删除。教训与天数 6.5/6.6 相同但更深：天数是"部分 config 误编译"，
+昇腾是"kernel 的核心解包惯用法不被编译器支持"，只能换算法结构而不是换参数。
+
+### 6.10 昇腾 CI：CANN 9.1.1 上 autotune 期间设备 trap（处理中）
+
+**现象**：CI runner（CANN 9.1.1）跑 `test_wf6af16_linear` 的 shape
+`(800, 512, 256)` 时，autotune 正在 bench 某配置，设备报
+`507014 aicore execution times out`（fftsplus trap），在
+`do_bench → synchronize` 抛 RuntimeError；前 7 个 shape 全过，本机
+CANN 9.0.0 上同套件全绿。
+
+**分析**：9.0 全绿 + 9.1.1 挂死，指向版本相关的编译器产物 trap——某配置在
+9.1.1 下的编译结果在设备上跑飞。trap 发生后设备上下文可能已中毒，之后的
+同步调用会连续报错，单配置容错未必救得回整个进程。
+
+**处置**：先按沐曦 6.3 的同款模式给 autotune 挂容错 `do_bench`（trap 配置
+记为无穷慢跳过，`1420af3`），本地回归全绿后推送；随后为排除 CI 环境本身的
+嫌疑将其回退（`27d3293`），恢复"失败可见"。根治路线沿用天数 6.6 的模式：
+在 CANN 9.1.1 环境上跑 `test_wf6af16_linear_all_configs` 逐 config 定位肇事
+配置，从 `_gemm_configs()` 剔除（昇腾空间仅 6 组候选，见 4.3）。
+
+### 6.11 昇腾 benchmark：CANN profiler 偶发采不到数据
+
+**现象**：benchmark 的 kernel 计时模式走
+`triton.backends.ascend.testing.do_bench_npu`（底层是 CANN profiler），偶发
+`Failed to get acl to npu flow events` / `SQLite Error: no such table: TASK` /
+`No profiling data found`，对应形状的算子延迟被记为 `inf`，或 torch 基线出现
+异常大的离群值（同套件内相邻 shape 差 40 倍）。
+
+**结论**：profiler 设施抖动，非算子问题——算子正确性由精度测试保证，且
+operator 模式（墙钟）下数值稳定。规避：清 `/root/.triton/profile_results/*`
+后重跑，或 `pytest ... --mode operator` 改走墙钟计时。
+
+### 6.12 平头哥 PPU：工具链版本不匹配（未解决）
 
 **现象**：PPU 上编译期报错，`ppu-llc` 无法解析 `irformatter` 生成的汇编文件头
 （`line 1:0 mismatched input 'ppu'`）。
@@ -408,7 +485,7 @@ BiShengHIR 插入的布局转换打乱数值。
 | `test_wf6af16_linear_split_k` | split_k ∈ {1,2,4,8} 的部分和 + 归约路径 |
 | `test_wf6af16_linear_split_k_misaligned_falls_back` | 显式传 split_k=3（切片不对齐）验证回退 |
 | `test_wf6af16_linear_rejects_bad_inputs` | dtype 错误、非连续输入必须抛 AssertionError |
-| `test_wf6af16_linear_all_configs` | **逐 config 扫描**：解开当前后端 autotuner，每个 config 在字节路径（及宽读平台的宽读路径）单独对拍——防误编译 config 被 autotune 选中（天数事故的固化防线） |
+| `test_wf6af16_linear_all_configs` | **逐 config 扫描**：解开当前后端 autotuner，每个 config 在字节路径（及宽读平台的宽读路径）单独对拍——防误编译 config 被 autotune 选中（天数事故的固化防线）。昇腾扫自有的 6 组配置、无宽读维度（kernel 没有 WIDE_LOAD 参数，测试侧传 `None` 跳过），也是 6.10 的肇事 config 定位工具 |
 | `test_matches_deepspeed_oracle` | 5 个 token 数对拍 DeepSpeed 原版（仅 Ampere 白名单平台） |
 
 输入准备 helper（`quantize_weights_fp6` / `pack_weights_fp6` / `unpack_weights_fp6`）
@@ -419,8 +496,11 @@ BiShengHIR 插入的布局转换打乱数值。
 - decode 梯度 1/4/8/16/32/64（卡住 split-K 启发式的分档边界），
   prefill 128/256/512/1024（越过 split-K 表 768 行上限），
   另加 `(16, 14336, 4096)` 大 K decode；
-- 基线按平台降级：sm_80 白名单 → DeepSpeed 原版 kernel，否则 torch 组合实现；
-- 计时只含 kernel 调用，打包/量化在 input 准备阶段完成（与真实推理一致）。
+- 基线按平台降级：sm_80 白名单 → DeepSpeed 原版 kernel，否则 torch 组合实现
+  （昇腾无 DeepSpeed 移植，固定为 torch 组合实现）；
+- 计时只含 kernel 调用，打包/量化在 input 准备阶段完成（与真实推理一致）；
+- 昇腾的 kernel 计时模式走 CANN profiler（`do_bench_npu`），偶发采不到数据，
+  现象与规避见 6.11；`--mode operator` 的墙钟模式不受影响。
 
 ### 7.3 运行方式
 
@@ -432,3 +512,5 @@ python -m pytest benchmark/deepspeed/test_wf6af16_linear.py -q -s
 ```
 
 当前 H20 状态：15 passed / 5 skipped（oracle skip 符合预期），benchmark 全 SUCCESS。
+昇腾 910B4（CANN 9.0）状态：18 passed / 5 skipped（同样 5 项 oracle skip），
+benchmark 全 SUCCESS（kernel 计时模式的 profiler 抖动见 6.11）。
