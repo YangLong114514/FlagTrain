@@ -45,6 +45,19 @@ def _hpb_configs():
     ]
 
 
+def _prune_hpb_configs(configs, nargs, **kwargs):
+    if not kwargs["REUSE_INPUT"]:
+        return configs
+    block_channels = (256, 512) if nargs["hr_ptr"].dtype == torch.float32 else (512,)
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_C"] in block_channels
+        and config.kwargs["BLOCK_S"] in (1, 2)
+        and config.num_warps == 2
+    ]
+
+
 def _validate_inputs(h_res, original_residual, h_post, x, bias):
     if original_residual.dim() != 4:
         raise ValueError("original_residual must have shape [s, b, n, C]")
@@ -81,7 +94,11 @@ def _validate_inputs(h_res, original_residual, h_post, x, bias):
 
 
 @libentry()
-@triton.autotune(configs=_hpb_configs(), key=["C", "N"])
+@triton.autotune(
+    configs=_hpb_configs(),
+    key=["C", "N", "REUSE_INPUT"],
+    prune_configs_by={"early_config_prune": _prune_hpb_configs},
+)
 @triton.jit
 def _triton_hpb_fwd_kernel(
     hr_ptr,
@@ -103,6 +120,7 @@ def _triton_hpb_fwd_kernel(
     stride_out_n,
     stride_out_c,
     HAS_BIAS: tl.constexpr,
+    REUSE_INPUT: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
@@ -121,15 +139,15 @@ def _triton_hpb_fwd_kernel(
         bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
         x_tile += bias_tile[None, :]
 
-    for i in tl.static_range(N):
-        hp_i = tl.load(hp_ptr + offs_s * N + i, mask=mask_s, other=0.0).to(tl.float32)
-        out_i = hp_i[:, None] * x_tile
+    if REUSE_INPUT:
+        offs_n = tl.arange(0, N)
+        hp = tl.load(
+            hp_ptr + offs_s[None, :] * N + offs_n[:, None],
+            mask=mask_s[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        outputs = hp[:, :, None] * x_tile[None, :, :]
         for j in tl.static_range(N):
-            hr_ji = tl.load(
-                hr_ptr + offs_s * stride_hr_s + j * stride_hr_i + i * stride_hr_j,
-                mask=mask_s,
-                other=0.0,
-            ).to(tl.float32)
             orig_j = tl.load(
                 orig_ptr
                 + offs_s[:, None] * stride_orig_s
@@ -138,20 +156,61 @@ def _triton_hpb_fwd_kernel(
                 mask=mask_2d,
                 other=0.0,
             ).to(tl.float32)
-            out_i += hr_ji[:, None] * orig_j
-
+            hr = tl.load(
+                hr_ptr
+                + offs_s[None, :] * stride_hr_s
+                + j * stride_hr_i
+                + offs_n[:, None] * stride_hr_j,
+                mask=mask_s[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            outputs += hr[:, :, None] * orig_j[None, :, :]
         tl.store(
             out_ptr
-            + offs_s[:, None] * stride_out_s
-            + i * stride_out_n
-            + offs_c[None, :],
-            out_i.to(out_ptr.dtype.element_ty),
-            mask=mask_2d,
+            + offs_s[None, :, None] * stride_out_s
+            + offs_n[:, None, None] * stride_out_n
+            + offs_c[None, None, :],
+            outputs.to(out_ptr.dtype.element_ty),
+            mask=mask_2d[None, :, :],
         )
+    else:
+        for i in tl.static_range(N):
+            hp_i = tl.load(hp_ptr + offs_s * N + i, mask=mask_s, other=0.0).to(
+                tl.float32
+            )
+            out_i = hp_i[:, None] * x_tile
+            for j in tl.static_range(N):
+                hr_ji = tl.load(
+                    hr_ptr + offs_s * stride_hr_s + j * stride_hr_i + i * stride_hr_j,
+                    mask=mask_s,
+                    other=0.0,
+                ).to(tl.float32)
+                orig_j = tl.load(
+                    orig_ptr
+                    + offs_s[:, None] * stride_orig_s
+                    + j * stride_orig_n
+                    + offs_c[None, :],
+                    mask=mask_2d,
+                    other=0.0,
+                ).to(tl.float32)
+                out_i += hr_ji[:, None] * orig_j
+
+            tl.store(
+                out_ptr
+                + offs_s[:, None] * stride_out_s
+                + i * stride_out_n
+                + offs_c[None, :],
+                out_i.to(out_ptr.dtype.element_ty),
+                mask=mask_2d,
+            )
 
 
 @libentry()
-@triton.autotune(configs=_hpb_configs(), key=["C", "N"])
+@triton.autotune(
+    configs=_hpb_configs(),
+    key=["C", "N", "REUSE_INPUT"],
+    prune_configs_by={"early_config_prune": _prune_hpb_configs},
+)
 @triton.jit
 def _triton_hpb_bwd_g_x_orig_kernel(
     go_ptr,
@@ -171,6 +230,7 @@ def _triton_hpb_bwd_g_x_orig_kernel(
     stride_orig_s,
     stride_orig_n,
     stride_orig_c,
+    REUSE_INPUT: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
@@ -183,22 +243,9 @@ def _triton_hpb_bwd_g_x_orig_kernel(
     mask_2d = mask_s[:, None] & mask_c[None, :]
 
     g_x_acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
-    for j in tl.static_range(N):
-        go_j = tl.load(
-            go_ptr + offs_s[:, None] * stride_go_s + j * stride_go_n + offs_c[None, :],
-            mask=mask_2d,
-            other=0.0,
-        ).to(tl.float32)
-        hp_j = tl.load(hp_ptr + offs_s * N + j, mask=mask_s, other=0.0).to(tl.float32)
-        g_x_acc += hp_j[:, None] * go_j
-    tl.store(
-        g_x_ptr + offs_s[:, None] * C + offs_c[None, :],
-        g_x_acc.to(g_x_ptr.dtype.element_ty),
-        mask=mask_2d,
-    )
-
-    for i in tl.static_range(N):
-        g_orig_i = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+    if REUSE_INPUT:
+        offs_n = tl.arange(0, N)
+        g_orig = tl.zeros((N, BLOCK_S, BLOCK_C), dtype=tl.float32)
         for j in tl.static_range(N):
             go_j = tl.load(
                 go_ptr
@@ -208,20 +255,72 @@ def _triton_hpb_bwd_g_x_orig_kernel(
                 mask=mask_2d,
                 other=0.0,
             ).to(tl.float32)
-            hr_ij = tl.load(
-                hr_ptr + offs_s * stride_hr_s + i * stride_hr_i + j * stride_hr_j,
-                mask=mask_s,
+            hp_j = tl.load(hp_ptr + offs_s * N + j, mask=mask_s, other=0.0).to(
+                tl.float32
+            )
+            hr = tl.load(
+                hr_ptr
+                + offs_s[None, :] * stride_hr_s
+                + offs_n[:, None] * stride_hr_i
+                + j * stride_hr_j,
+                mask=mask_s[None, :],
                 other=0.0,
             ).to(tl.float32)
-            g_orig_i += hr_ij[:, None] * go_j
+            g_x_acc += hp_j[:, None] * go_j
+            g_orig += hr[:, :, None] * go_j[None, :, :]
         tl.store(
             g_orig_ptr
-            + offs_s[:, None] * stride_orig_s
-            + i * stride_orig_n
-            + offs_c[None, :],
-            g_orig_i.to(g_orig_ptr.dtype.element_ty),
-            mask=mask_2d,
+            + offs_s[None, :, None] * stride_orig_s
+            + offs_n[:, None, None] * stride_orig_n
+            + offs_c[None, None, :],
+            g_orig.to(g_orig_ptr.dtype.element_ty),
+            mask=mask_2d[None, :, :],
         )
+    else:
+        for j in tl.static_range(N):
+            go_j = tl.load(
+                go_ptr
+                + offs_s[:, None] * stride_go_s
+                + j * stride_go_n
+                + offs_c[None, :],
+                mask=mask_2d,
+                other=0.0,
+            ).to(tl.float32)
+            hp_j = tl.load(hp_ptr + offs_s * N + j, mask=mask_s, other=0.0).to(
+                tl.float32
+            )
+            g_x_acc += hp_j[:, None] * go_j
+
+        for i in tl.static_range(N):
+            g_orig_i = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+            for j in tl.static_range(N):
+                go_j = tl.load(
+                    go_ptr
+                    + offs_s[:, None] * stride_go_s
+                    + j * stride_go_n
+                    + offs_c[None, :],
+                    mask=mask_2d,
+                    other=0.0,
+                ).to(tl.float32)
+                hr_ij = tl.load(
+                    hr_ptr + offs_s * stride_hr_s + i * stride_hr_i + j * stride_hr_j,
+                    mask=mask_s,
+                    other=0.0,
+                ).to(tl.float32)
+                g_orig_i += hr_ij[:, None] * go_j
+            tl.store(
+                g_orig_ptr
+                + offs_s[:, None] * stride_orig_s
+                + i * stride_orig_n
+                + offs_c[None, :],
+                g_orig_i.to(g_orig_ptr.dtype.element_ty),
+                mask=mask_2d,
+            )
+    tl.store(
+        g_x_ptr + offs_s[:, None] * C + offs_c[None, :],
+        g_x_acc.to(g_x_ptr.dtype.element_ty),
+        mask=mask_2d,
+    )
 
 
 @libentry()
@@ -343,6 +442,11 @@ def fused_h_post_bda_forward(
     small_nvidia = (
         runtime_device.vendor_name == "nvidia" and sb <= 8 and channels <= 1024
     )
+    reuse_input = (
+        runtime_device.vendor_name == "nvidia"
+        and not small_nvidia
+        and (n >= 8 or sb > 512 or h_res.dtype == torch.float32)
+    )
     if small_nvidia:
         fwd_kernel = _triton_hpb_fwd_kernel.fn.fn
         fixed_config = {
@@ -382,6 +486,7 @@ def fused_h_post_bda_forward(
             out.stride(1),
             out.stride(2),
             HAS_BIAS=(bias is not None),
+            REUSE_INPUT=reuse_input,
             **fixed_config,
         )
     return out.view(s, b, n, channels)
@@ -429,6 +534,11 @@ def fused_h_post_bda_backward(
     small_nvidia = (
         runtime_device.vendor_name == "nvidia" and sb <= 8 and channels <= 1024
     )
+    reuse_input = (
+        runtime_device.vendor_name == "nvidia"
+        and not small_nvidia
+        and (n >= 8 or sb > 512 or h_res.dtype == torch.float32)
+    )
     if small_nvidia:
         bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel.fn.fn
         bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel.fn.fn
@@ -467,6 +577,7 @@ def fused_h_post_bda_backward(
             g_res.stride(0),
             g_res.stride(1),
             g_res.stride(2),
+            REUSE_INPUT=reuse_input,
             **fixed_config,
         )
         bwd_g_hp_hr_kernel[grid_b](
