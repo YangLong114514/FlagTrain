@@ -139,7 +139,7 @@ def _triton_hpb_fwd_kernel(
         bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
         x_tile += bias_tile[None, :]
 
-    if REUSE_INPUT:
+    if REUSE_INPUT == 1:
         offs_n = tl.arange(0, N)
         hp = tl.load(
             hp_ptr + offs_s[None, :] * N + offs_n[:, None],
@@ -719,6 +719,19 @@ def fused_h_post_bda_forward(
             "BLOCK_C": 64 if channels <= 256 else 128,
             "BLOCK_S": 2 if n <= 2 else 1,
             "num_warps": 4,
+        }
+    elif (
+        runtime_device.vendor_name == "nvidia"
+        and n == 4
+        and sb == 512
+        and channels == 4096
+        and h_res.dtype in (torch.bfloat16, torch.float16)
+    ):
+        fwd_kernel = _triton_hpb_fwd_kernel.fn.fn
+        fixed_config = {
+            "BLOCK_C": 256 if h_res.dtype == torch.bfloat16 else 512,
+            "BLOCK_S": 2,
+            "num_warps": 2 if h_res.dtype == torch.bfloat16 else 4,
         }
     elif runtime_device.vendor_name == "nvidia":
         fwd_kernel = _triton_hpb_fwd_kernel.fn

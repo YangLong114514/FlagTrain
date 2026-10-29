@@ -143,6 +143,17 @@ def test_forward_matches_torch_reference(dtype, s, b, n, channels, with_bias):
     _assert_close(actual, expected, dtype, "output")
 
 
+@pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_forward_medium_shapes_match_torch_reference(dtype, with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(64, 8, 4, 4099, dtype, with_bias)
+    actual = fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(_ref_h_post_bda(*inputs))
+    _assert_close(actual, expected, dtype, "medium-shape output")
+
+
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype,s,b,n,channels", _DTYPE_SHAPE_CASES)
@@ -211,6 +222,18 @@ def test_forward_accepts_non_contiguous_inputs():
     actual = fused_h_post_bda_forward(*inputs)
     expected = _ref_h_post_bda(*(_reference_copy(tensor) for tensor in inputs))
     _assert_close(actual, expected, torch.bfloat16, "non-contiguous output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+def test_forward_medium_shape_accepts_non_contiguous_inputs():
+    torch.manual_seed(2026)
+    inputs = tuple(
+        _non_contiguous(tensor)
+        for tensor in _make_inputs(64, 8, 4, 4096, torch.bfloat16, with_bias=True)
+    )
+    actual = fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(_ref_h_post_bda(*inputs))
+    _assert_close(actual, expected, torch.bfloat16, "medium non-contiguous output")
 
 
 @pytest.mark.fused_h_post_bda_backward
