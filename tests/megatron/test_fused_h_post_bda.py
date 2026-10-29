@@ -164,6 +164,23 @@ def test_backward_matches_torch_autograd(dtype, s, b, n, channels, with_bias):
             _assert_close(actual_grad, expected_grad, dtype, name, backward=True)
 
 
+@pytest.mark.fused_h_post_bda_backward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_backward_split_c_matches_torch_autograd(dtype, with_bias):
+    torch.manual_seed(2026)
+    s, b, n, channels = 128, 1, 8, 4096
+    inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
+    grad_output = _rand((s, b, n, channels), dtype)
+    actual = fused_h_post_bda_backward(grad_output, *inputs)
+    expected = _ref_h_post_bda_backward(
+        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    )
+
+    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
+        _assert_close(actual_grad, expected_grad, dtype, name, backward=True)
+
+
 @pytest.mark.fused_h_post_bda_forward
 def test_forward_uses_h_res_transpose():
     h_res = torch.tensor(

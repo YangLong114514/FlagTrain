@@ -419,6 +419,272 @@ def _triton_hpb_bwd_g_hp_hr_kernel(
             )
 
 
+@triton.jit
+def _triton_hpb_bwd_g_hp_hr_split_c_kernel(
+    go_ptr,
+    orig_ptr,
+    x_ptr,
+    bias_ptr,
+    g_hr_ptr,
+    g_hp_ptr,
+    sb,
+    C: tl.constexpr,
+    N: tl.constexpr,
+    stride_go_s,
+    stride_go_n,
+    stride_go_c,
+    stride_orig_s,
+    stride_orig_n,
+    stride_orig_c,
+    HAS_BIAS: tl.constexpr,
+    SPLIT_C: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    pid_s = tle.program_id(0)
+    pid_c = tle.program_id(1)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_n = tl.arange(0, N)
+    mask_s = offs_s < sb
+
+    g_hp_acc = tl.zeros((BLOCK_S, N), dtype=tl.float32)
+    g_hr_acc = tl.zeros((BLOCK_S, N * N), dtype=tl.float32)
+    c_split = tl.cdiv(C, SPLIT_C * BLOCK_C) * BLOCK_C
+    c_begin = pid_c * c_split
+
+    for c_offset in range(0, c_split, BLOCK_C):
+        offs_c = c_begin + c_offset + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+        mask_2d = mask_s[:, None] & mask_c[None, :]
+        x_tile = tl.load(
+            x_ptr + offs_s[:, None] * C + offs_c[None, :], mask=mask_2d, other=0.0
+        ).to(tl.float32)
+        if HAS_BIAS:
+            bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(
+                tl.float32
+            )
+            x_tile += bias_tile[None, :]
+
+        for i in tl.static_range(N):
+            go_i = tl.load(
+                go_ptr
+                + offs_s[:, None] * stride_go_s
+                + i * stride_go_n
+                + offs_c[None, :],
+                mask=mask_2d,
+                other=0.0,
+            ).to(tl.float32)
+            dot_hp = tl.sum(go_i * x_tile, axis=1)
+            g_hp_acc += tl.where(
+                offs_n[None, :] == i,
+                dot_hp[:, None],
+                tl.zeros((BLOCK_S, N), dtype=tl.float32),
+            )
+            for j in tl.static_range(N):
+                orig_j = tl.load(
+                    orig_ptr
+                    + offs_s[:, None] * stride_orig_s
+                    + j * stride_orig_n
+                    + offs_c[None, :],
+                    mask=mask_2d,
+                    other=0.0,
+                ).to(tl.float32)
+                dot_hr = tl.sum(go_i * orig_j, axis=1)
+                g_hr_acc += tl.where(
+                    tl.arange(0, N * N)[None, :] == j * N + i,
+                    dot_hr[:, None],
+                    tl.zeros((BLOCK_S, N * N), dtype=tl.float32),
+                )
+
+    tl.store(
+        g_hp_ptr + pid_c * sb * N + offs_s[:, None] * N + offs_n[None, :],
+        g_hp_acc,
+        mask=mask_s[:, None],
+    )
+    nn_offs = tl.arange(0, N * N)
+    tl.store(
+        g_hr_ptr + pid_c * sb * N * N + offs_s[:, None] * N * N + nn_offs[None, :],
+        g_hr_acc,
+        mask=mask_s[:, None],
+    )
+
+
+@triton.jit
+def _triton_hpb_bwd_g_hp_hr_merge_kernel(
+    g_hr_partial_ptr,
+    g_hp_partial_ptr,
+    g_hr_ptr,
+    g_hp_ptr,
+    sb,
+    N: tl.constexpr,
+    stride_hr_s,
+    stride_hr_i,
+    stride_hr_j,
+    SPLIT_C: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    pid_s = tle.program_id(0)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_n = tl.arange(0, N)
+    mask_s = offs_s < sb
+
+    g_hp_acc = tl.zeros((BLOCK_S, N), dtype=tl.float32)
+    for split in tl.static_range(SPLIT_C):
+        g_hp_acc += tl.load(
+            g_hp_partial_ptr + split * sb * N + offs_s[:, None] * N + offs_n[None, :],
+            mask=mask_s[:, None],
+            other=0.0,
+        )
+    tl.store(
+        g_hp_ptr + offs_s[:, None] * N + offs_n[None, :],
+        g_hp_acc.to(g_hp_ptr.dtype.element_ty),
+        mask=mask_s[:, None],
+    )
+
+    for i in tl.static_range(N):
+        for j in tl.static_range(N):
+            g_hr_acc = tl.zeros((BLOCK_S,), dtype=tl.float32)
+            for split in tl.static_range(SPLIT_C):
+                g_hr_acc += tl.load(
+                    g_hr_partial_ptr + split * sb * N * N + offs_s * N * N + i * N + j,
+                    mask=mask_s,
+                    other=0.0,
+                )
+            tl.store(
+                g_hr_ptr + offs_s * stride_hr_s + i * stride_hr_i + j * stride_hr_j,
+                g_hr_acc.to(g_hr_ptr.dtype.element_ty),
+                mask=mask_s,
+            )
+
+
+@triton.jit
+def _triton_hpb_bwd_small_kernel(
+    go_ptr,
+    hr_ptr,
+    orig_ptr,
+    hp_ptr,
+    x_ptr,
+    bias_ptr,
+    g_hr_ptr,
+    g_res_ptr,
+    g_hp_ptr,
+    g_x_ptr,
+    sb,
+    C: tl.constexpr,
+    N: tl.constexpr,
+    stride_go_s,
+    stride_go_n,
+    stride_go_c,
+    stride_hr_s,
+    stride_hr_i,
+    stride_hr_j,
+    stride_orig_s,
+    stride_orig_n,
+    stride_orig_c,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    pid_s = tle.program_id(0)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_n = tl.arange(0, N)
+    mask_s = offs_s < sb
+
+    g_hp_acc = tl.zeros((BLOCK_S, N), dtype=tl.float32)
+    g_hr_acc = tl.zeros((BLOCK_S, N * N), dtype=tl.float32)
+
+    for c_start in range(0, C, BLOCK_C):
+        offs_c = c_start + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+        mask_2d = mask_s[:, None] & mask_c[None, :]
+        x_tile = tl.load(
+            x_ptr + offs_s[:, None] * C + offs_c[None, :], mask=mask_2d, other=0.0
+        ).to(tl.float32)
+        if HAS_BIAS:
+            bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(
+                tl.float32
+            )
+            x_tile += bias_tile[None, :]
+
+        g_x_acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+        g_res_acc = tl.zeros((N, BLOCK_S, BLOCK_C), dtype=tl.float32)
+        for i in tl.static_range(N):
+            go_i = tl.load(
+                go_ptr
+                + offs_s[:, None] * stride_go_s
+                + i * stride_go_n
+                + offs_c[None, :],
+                mask=mask_2d,
+                other=0.0,
+            ).to(tl.float32)
+            hp_i = tl.load(hp_ptr + offs_s * N + i, mask=mask_s, other=0.0).to(
+                tl.float32
+            )
+            hr_i = tl.load(
+                hr_ptr
+                + offs_s[None, :] * stride_hr_s
+                + offs_n[:, None] * stride_hr_i
+                + i * stride_hr_j,
+                mask=mask_s[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            g_x_acc += hp_i[:, None] * go_i
+            g_res_acc += hr_i[:, :, None] * go_i[None, :, :]
+
+            dot_hp = tl.sum(go_i * x_tile, axis=1)
+            g_hp_acc += tl.where(
+                offs_n[None, :] == i,
+                dot_hp[:, None],
+                tl.zeros((BLOCK_S, N), dtype=tl.float32),
+            )
+            for j in tl.static_range(N):
+                orig_j = tl.load(
+                    orig_ptr
+                    + offs_s[:, None] * stride_orig_s
+                    + j * stride_orig_n
+                    + offs_c[None, :],
+                    mask=mask_2d,
+                    other=0.0,
+                ).to(tl.float32)
+                dot_hr = tl.sum(go_i * orig_j, axis=1)
+                g_hr_acc += tl.where(
+                    tl.arange(0, N * N)[None, :] == j * N + i,
+                    dot_hr[:, None],
+                    tl.zeros((BLOCK_S, N * N), dtype=tl.float32),
+                )
+
+        tl.store(
+            g_res_ptr
+            + offs_s[None, :, None] * stride_orig_s
+            + offs_n[:, None, None] * stride_orig_n
+            + offs_c[None, None, :],
+            g_res_acc.to(g_res_ptr.dtype.element_ty),
+            mask=mask_2d[None, :, :],
+        )
+        tl.store(
+            g_x_ptr + offs_s[:, None] * C + offs_c[None, :],
+            g_x_acc.to(g_x_ptr.dtype.element_ty),
+            mask=mask_2d,
+        )
+
+    tl.store(
+        g_hp_ptr + offs_s[:, None] * N + offs_n[None, :],
+        g_hp_acc.to(g_hp_ptr.dtype.element_ty),
+        mask=mask_s[:, None],
+    )
+
+    nn_offs = tl.arange(0, N * N)
+    for i in tl.static_range(N):
+        for j in tl.static_range(N):
+            col_mask = (nn_offs == (i * N + j)).to(tl.float32)
+            val = tl.sum(g_hr_acc * col_mask[None, :], axis=1)
+            tl.store(
+                g_hr_ptr + offs_s * stride_hr_s + i * stride_hr_i + j * stride_hr_j,
+                val.to(g_hr_ptr.dtype.element_ty),
+                mask=mask_s,
+            )
+
+
 def fused_h_post_bda_forward(
     h_res: Tensor,
     original_residual: Tensor,
@@ -539,31 +805,22 @@ def fused_h_post_bda_backward(
         and not small_nvidia
         and (n >= 8 or sb > 512 or h_res.dtype == torch.float32)
     )
-    if small_nvidia:
-        bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel.fn.fn
-        bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel.fn.fn
+    if small_nvidia and n <= 4:
         fixed_config = {
             "BLOCK_C": 64 if channels <= 256 else 128,
             "BLOCK_S": 2 if n <= 2 else 1,
             "num_warps": 4,
         }
-        device_context = nullcontext()
-    elif runtime_device.vendor_name == "nvidia":
-        bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel.fn
-        bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel.fn
-        fixed_config = {}
-        device_context = nullcontext()
-    else:
-        bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel
-        bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel
-        fixed_config = {}
-        device_context = torch_device_fn.device(h_res.device)
-    with device_context:
-        bwd_g_x_orig_kernel[grid_a](
+        _triton_hpb_bwd_small_kernel[grid_b](
             go_flat,
             hr_flat,
+            orig_flat,
             hp_flat,
+            x_flat,
+            bias.contiguous() if bias is not None else x_flat,
+            g_hr,
             g_res,
+            g_hp,
             g_x,
             sb,
             channels,
@@ -574,34 +831,133 @@ def fused_h_post_bda_backward(
             hr_flat.stride(0),
             hr_flat.stride(1),
             hr_flat.stride(2),
-            g_res.stride(0),
-            g_res.stride(1),
-            g_res.stride(2),
-            REUSE_INPUT=reuse_input,
-            **fixed_config,
-        )
-        bwd_g_hp_hr_kernel[grid_b](
-            go_flat,
-            orig_flat,
-            x_flat,
-            bias.contiguous() if bias is not None else x_flat,
-            g_hr,
-            g_hp,
-            sb,
-            channels,
-            n,
-            go_flat.stride(0),
-            go_flat.stride(1),
-            go_flat.stride(2),
             orig_flat.stride(0),
             orig_flat.stride(1),
             orig_flat.stride(2),
-            g_hr.stride(0),
-            g_hr.stride(1),
-            g_hr.stride(2),
             HAS_BIAS=(bias is not None),
             **fixed_config,
         )
+    else:
+        if small_nvidia:
+            bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel.fn.fn
+            bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel.fn.fn
+            fixed_config = {
+                "BLOCK_C": 64 if channels <= 256 else 128,
+                "BLOCK_S": 2 if n <= 2 else 1,
+                "num_warps": 4,
+            }
+            device_context = nullcontext()
+        elif runtime_device.vendor_name == "nvidia":
+            bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel.fn
+            bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel.fn
+            fixed_config = {}
+            device_context = nullcontext()
+        else:
+            bwd_g_x_orig_kernel = _triton_hpb_bwd_g_x_orig_kernel
+            bwd_g_hp_hr_kernel = _triton_hpb_bwd_g_hp_hr_kernel
+            fixed_config = {}
+            device_context = torch_device_fn.device(h_res.device)
+        split_c = 0
+        if (
+            runtime_device.vendor_name == "nvidia"
+            and not small_nvidia
+            and n == 8
+            and sb <= 128
+            and channels >= 4096
+        ):
+            split_c = 4
+        if split_c:
+            split_config = {"BLOCK_C": 256, "BLOCK_S": 2, "num_warps": 2}
+            g_hr_partial = torch.empty(
+                split_c, sb, n, n, dtype=torch.float32, device=h_res.device
+            )
+            g_hp_partial = torch.empty(
+                split_c, sb, n, dtype=torch.float32, device=h_res.device
+            )
+            grid_split = lambda meta: (
+                triton.cdiv(sb, meta["BLOCK_S"]),
+                split_c,
+            )
+        with device_context:
+            bwd_g_x_orig_kernel[grid_a](
+                go_flat,
+                hr_flat,
+                hp_flat,
+                g_res,
+                g_x,
+                sb,
+                channels,
+                n,
+                go_flat.stride(0),
+                go_flat.stride(1),
+                go_flat.stride(2),
+                hr_flat.stride(0),
+                hr_flat.stride(1),
+                hr_flat.stride(2),
+                g_res.stride(0),
+                g_res.stride(1),
+                g_res.stride(2),
+                REUSE_INPUT=reuse_input,
+                **fixed_config,
+            )
+            if split_c:
+                _triton_hpb_bwd_g_hp_hr_split_c_kernel[grid_split](
+                    go_flat,
+                    orig_flat,
+                    x_flat,
+                    bias.contiguous() if bias is not None else x_flat,
+                    g_hr_partial,
+                    g_hp_partial,
+                    sb,
+                    channels,
+                    n,
+                    go_flat.stride(0),
+                    go_flat.stride(1),
+                    go_flat.stride(2),
+                    orig_flat.stride(0),
+                    orig_flat.stride(1),
+                    orig_flat.stride(2),
+                    HAS_BIAS=(bias is not None),
+                    SPLIT_C=split_c,
+                    **split_config,
+                )
+                _triton_hpb_bwd_g_hp_hr_merge_kernel[grid_b](
+                    g_hr_partial,
+                    g_hp_partial,
+                    g_hr,
+                    g_hp,
+                    sb,
+                    n,
+                    g_hr.stride(0),
+                    g_hr.stride(1),
+                    g_hr.stride(2),
+                    SPLIT_C=split_c,
+                    BLOCK_S=split_config["BLOCK_S"],
+                    num_warps=split_config["num_warps"],
+                )
+            else:
+                bwd_g_hp_hr_kernel[grid_b](
+                    go_flat,
+                    orig_flat,
+                    x_flat,
+                    bias.contiguous() if bias is not None else x_flat,
+                    g_hr,
+                    g_hp,
+                    sb,
+                    channels,
+                    n,
+                    go_flat.stride(0),
+                    go_flat.stride(1),
+                    go_flat.stride(2),
+                    orig_flat.stride(0),
+                    orig_flat.stride(1),
+                    orig_flat.stride(2),
+                    g_hr.stride(0),
+                    g_hr.stride(1),
+                    g_hr.stride(2),
+                    HAS_BIAS=(bias is not None),
+                    **fixed_config,
+                )
 
     g_bias = g_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None
     return (

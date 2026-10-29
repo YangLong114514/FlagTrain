@@ -211,26 +211,33 @@ assert grads[-1] is None
 
 ### 4.1 Kernel 划分
 
-当前实现包含三个主要 Triton Kernel，以及一个 Torch bias 归约。
+当前实现按形状选择不同的 Kernel 组合：
 
 | 部分 | 实现 | 主要工作 |
 | --- | --- | --- |
 | Forward | `_triton_hpb_fwd_kernel` | 计算 `H_res.T @ R + H_post * (x + bias)` |
-| Backward A | `_triton_hpb_bwd_g_x_orig_kernel` | 计算 `grad_x` 和 `grad_original_residual` |
-| Backward B | `_triton_hpb_bwd_g_hp_hr_kernel` | 计算 `grad_h_post` 和 `grad_h_res` |
+| Backward A | `_triton_hpb_bwd_g_x_orig_kernel` | 通用路径计算 `grad_x` 和 `grad_original_residual` |
+| Backward B | `_triton_hpb_bwd_g_hp_hr_kernel` | 单阶段计算 `grad_h_post` 和 `grad_h_res` |
+| 小形状 backward | `_triton_hpb_bwd_small_kernel` | 单 Kernel 计算除 bias 外的四类梯度 |
+| Split-C backward B | `_triton_hpb_bwd_g_hp_hr_split_c_kernel` | 沿 C 分片生成 FP32 partial 梯度 |
+| Split-C merge | `_triton_hpb_bwd_g_hp_hr_merge_kernel` | 合并 partial 并写出 `grad_h_post`、`grad_h_res` |
 | Bias 归约 | `g_x.sum(dim=0).to(bias.dtype)` | 跨全部 `sb` 计算 `grad_bias` |
 
 Grid 组织方式：
 
 - Forward：二维 grid，分别覆盖 `sb` 和 `C`。
 - Backward A：二维 grid，覆盖 `sb` 和 `C`。
-- Backward B：一维 grid，覆盖 `sb`，在 Kernel 内沿 `C` 分块归约。
+- 单阶段 Backward B：一维 grid，覆盖 `sb`，在 Kernel 内沿 `C` 分块归约。
+- 小形状 backward：一维 grid 覆盖 `sb`，在一个 Kernel 中遍历 C tile 并完成四类梯度。
+- Split-C backward B：二维 grid 覆盖 `sb` 和 4 个 C 分片；merge 再沿 `sb` 合并。
 
-累加使用 FP32，最终写回各输出对应的输入 dtype。
+普通 backward 使用 A、B 两个 Kernel；小形状融合路径只使用一个计算 Kernel；N=8
+split-C 路径使用 A、split-C、merge 三个计算 Kernel。有 bias 时，各路径都额外执行
+Torch reduction。计算累加和 split-C partial 都使用 FP32，最终写回各输出对应的输入 dtype。
 
 ### 4.2 通用 autotune 配置
 
-主要 Kernel 的通用搜索空间为：
+主要通用 Kernel 的搜索空间为：
 
 - `BLOCK_C ∈ {64,128,256,512}`
 - `BLOCK_S ∈ {1,2,4,8}`
@@ -238,10 +245,11 @@ Grid 组织方式：
 
 合计 48 组配置。未启用输入复用时仍使用完整搜索空间。Forward 和 backward A 的
 autotune key 为 `C`、`N` 和 `REUSE_INPUT`，Triton 还会把输入 dtype 纳入缓存键；
-backward B 的 key 仍为 `C` 和 `N`。`REUSE_INPUT` 可以隔离两种计算结构的调优结果，
-避免原分支的 block 配置被复用分支错误继承。
+单阶段 backward B 的 key 仍为 `C` 和 `N`。`REUSE_INPUT` 可以隔离两种计算结构的调优
+结果，避免原分支的 block 配置被复用分支错误继承。
 
-首次编译和调优发生在正式性能测量之前。
+小形状融合 Kernel 和 split-C/merge Kernel 使用固定配置，不进入 Autotuner。首次编译和
+调优发生在正式性能测量之前。
 
 ### 4.3 NVIDIA 输入复用路径
 
@@ -259,8 +267,8 @@ Forward 将循环顺序调整为以输入流 `j` 为外层，每个 `original_re
 `N` 个输出流之间重复读取残差，复用分支将这部分读取次数从 `N²` 降为 `N`。
 
 Backward A 使用同样的三维累加方式，在同一轮 `j` 循环中计算 `grad_x` 和全部
-`grad_original_residual`，使每个 `grad_output[j]` 只读取一次。Backward B 和 bias
-归约保持原实现。
+`grad_original_residual`，使每个 `grad_output[j]` 只读取一次。未启用小形状融合或
+split-C 时，Backward B 和 bias 归约保持原实现。
 
 三维 accumulator 会增加寄存器压力，因此 BF16/FP16 的 `sb=512、N=4` 等收益不稳定
 的中等形状仍走原分支。复用分支还将 autotune 配置裁剪为：
@@ -272,30 +280,60 @@ Backward A 使用同样的三维累加方式，在同一轮 `j` 循环中计算 
 
 ### 4.4 NVIDIA 小形状专用路径
 
-小形状对 Python dispatch、Autotuner 和设备上下文非常敏感。当前对满足以下条件的
+小形状对 Python dispatch、Autotuner 和设备上下文非常敏感。Forward 对满足以下条件的
 输入使用专用路径：
 
 ```text
 vendor == "nvidia" 且 sb <= 8 且 C <= 1024
 ```
 
-Forward 和 backward 都直接调用原始 `JITFunction`，完全绕过 `LibEntry` 和
-Autotuner，并显式传入固定配置：
+Backward 在相同范围内进一步限制 `n <= 4`，启用单 Kernel 融合；此范围内的 `n=8`
+仍使用原来的 A、B 两个 Kernel。专用路径直接调用原始 `JITFunction`，完全绕过
+`LibEntry` 和 Autotuner，并显式传入固定配置：
 
 | 条件 | `BLOCK_C` | `BLOCK_S` | `num_warps` |
 | --- | ---: | ---: | ---: |
 | `C <= 256` | 64 | `n <= 2` 时为 2，否则为 1 | 4 |
 | `256 < C <= 1024` | 128 | `n <= 2` 时为 2，否则为 1 | 4 |
 
-NVIDIA 下不再进入 `torch_device_fn.device()` 上下文，避免小形状上的额外固定开销。
-小形状始终设置 `REUSE_INPUT=False`，保持原有计算结构。
+小形状 backward 融合以 B 的 C 循环为主线，每轮共享 `grad_output` tile，同时计算
+`grad_x`、全部 `grad_original_residual`、`grad_h_post` 和 `grad_h_res`。它既减少一次
+launch，也避免 A、B 重复读取上游梯度。Bias 梯度仍从已写回输入 dtype 的 `grad_x`
+归约，保持原有舍入路径。
 
-### 4.5 分发路径和其他 vendor
+NVIDIA 下不进入 `torch_device_fn.device()` 上下文，避免额外固定开销。小形状 forward
+和未融合的 backward 仍设置 `REUSE_INPUT=False`。
+
+### 4.5 N=8 的 Backward B split-C 路径
+
+满足以下受限条件时，Backward B 使用 split-C=4：
+
+```text
+vendor == "nvidia"
+且不属于小形状
+且 n == 8
+且 sb <= 128
+且 C >= 4096
+```
+
+固定配置为 `BLOCK_C=256`、`BLOCK_S=2`、`num_warps=2`。以 `(128,1,8,7168)` 为例，
+单阶段 B 只有 64 个 sb CTA；split-C 第一阶段变为 `64 × 4 = 256` 个 CTA，增加通道方向
+并行度。第一阶段写出 `[4,sb,n,n]` 和 `[4,sb,n]` 的 FP32 partial，第二阶段用一个小
+Kernel 合并，不使用 atomic，也不改变 bias 的归约来源。
+
+split-C 会改变 FP32 的累加分组，并增加 partial 读写和一次 merge launch，因此没有推广
+到其他 N 或大 sb。N=4 的实验虽然降低了 Graph 时间，但完整 API 明显退化，最终仍保留
+单阶段 B。
+
+### 4.6 分发路径和其他 vendor
 
 | 输入情况 | Kernel 调用方式 | 计算结构 | 设备上下文 |
 | --- | --- | --- | --- |
-| NVIDIA 小形状 | 原始 JITFunction + 固定配置 | 原实现 | `nullcontext()` |
-| NVIDIA 非小形状且满足复用条件 | 直接调用 Autotuner + 裁剪配置 | 输入复用 | `nullcontext()` |
+| NVIDIA 小形状 forward | 原始 JITFunction + 固定配置 | 原 forward | `nullcontext()` |
+| NVIDIA 小形状 backward，`n<=4` | 原始 JITFunction + 固定配置 | 单 Kernel 融合 | `nullcontext()` |
+| NVIDIA 小形状 backward，`n>4` | 原始 JITFunction + 固定配置 | 原 A、B | `nullcontext()` |
+| NVIDIA N=8 split-C | A 直接调用 Autotuner；B 固定配置 | A 输入复用 + split-C/merge | `nullcontext()` |
+| NVIDIA 其他满足复用条件的形状 | 直接调用 Autotuner + 裁剪配置 | 输入复用 | `nullcontext()` |
 | NVIDIA 其他形状 | 直接调用 Autotuner + 完整配置 | 原实现 | `nullcontext()` |
 | 其他 vendor | `LibEntry` + 通用 autotune | 原实现 | `torch_device_fn.device()` |
 
@@ -356,6 +394,22 @@ NVIDIA 下不再进入 `torch_device_fn.device()` 上下文，避免小形状上
 
 最终 48 个 forward 数据点的算术平均加速比由 1.167x 提升到 1.240x，48 个
 backward 数据点由 1.161x 提升到 1.171x，两个方向均没有低于 0.8x 的数据点。
+
+### 5.6 小形状融合与 N=8 split-C 优化
+
+本轮先用完整 API、CUDA Graph replay 和分段 GPU 计时区分提交开销与 Kernel 瓶颈，再实施
+两项受限优化：
+
+1. `sb<=8、C<=1024、n<=4` 的 backward 改为单 Kernel，减少 launch 并共享
+   `grad_output` tile。
+2. `N==8、sb<=128、C>=4096` 的 Backward B 改为 split-C=4，以 FP32 partial 增加 C
+   方向并行，再由 merge Kernel 合并。
+3. N=4 split-C 的完整 API 性能退化，因此撤回，不在最终路径中启用。
+4. 新增 BF16/FP32 的 `(128,1,8,4096)` split-C 精度测试，正确性测试由 71 项扩充到
+   75 项。
+
+最终 48 个 backward 数据点的算术平均加速比由 1.171x 提升到 1.770x，最低加速比为
+0.833x，仍没有低于 0.8x 的数据点。Forward 代码和性能口径本轮未改动。
 
 ## 6. 历史问题及解决方式
 
@@ -450,6 +504,31 @@ block 和 warp 数更敏感，因此继承原分支的高寄存器压力配置�
 3. 连续执行 `(64,8,4,4096)`、`(512,4,4,4096)` 和 `(128,1,8,7168)`，确认缓存中
    原分支与复用分支的配置相互独立，再运行完整 96 点性能回归。
 
+### 6.9 Graph 时间下降但完整 API 退化
+
+本轮先对 BF16 做分段测量。小形状 `(2,4,4,1024)` 无 bias 时，完整 API 约 47.8 μs，
+Graph replay 约 32.5 μs，其中 A、B 的 GPU 时间分别约 1.2 μs 和 31.0 μs。这说明
+提交和 launch 间隔不可忽略，但 B 本身的 C 循环同样是主要瓶颈。
+
+N=4 的 `(64,8,4,4096)` 使用 split-C=2 后，Graph replay 从约 38.8 μs 降到 31.9 μs，
+但完整 48 点 benchmark 中 BF16 无 bias/有 bias 加速比降至 0.744x/0.754x，FP32 更降至
+0.603x/0.655x。额外的 partial 分配、merge launch 和提交开销抵消了纯 GPU 收益，因此最终
+撤回 N=4 split-C。
+
+N=8 使用 split-C=4 后，`(128,1,8,7168)` 无 bias 的 Graph replay 从约 89.1 μs 降到
+45.1 μs，完整 API 也有稳定收益，所以只保留受限的 N=8 路径。这个结果表明 Graph 适合
+辅助定位 Kernel 瓶颈，但最终是否保留优化仍必须以完整 API 回归为准。普通 `do_bench`
+会清理 L2，而 `do_bench_cudagraph` 不清理 L2，两者差值也不能全部解释为 CPU 开销。
+
+### 6.10 新增融合和 merge 中的索引映射错误
+
+小形状融合初次实现把 `grad_original_residual[j]` 错写为使用 `H_res[i,j]`，导致结果
+相当于矩阵方向转置；修正为 `H_res[j,i]` 后通过全部 backward 测试。
+
+Split-C merge 初次实现直接按 accumulator 的 `(i,j)` 直觉提取 partial，造成 `grad_h_res`
+转置。当前与原 B 保持一致：累加列使用 `j*N+i`，最终输出 `(i,j)` 时提取 `i*N+j`。
+新增的 split-C CPU autograd 回归用例覆盖了该映射。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
@@ -480,7 +559,9 @@ block 和 warp 数更敏感，因此继承原分支的高寄存器压力配置�
 - 三种 dtype 下的 `n=2/4/8`。
 - 三种 dtype 的输入复用路径，以及 BF16/FP16 的中等形状原路径。
 
-每组形状分别测试 `bias=None` 和有 bias，forward 和 backward 分开执行。
+每组形状分别测试 `bias=None` 和有 bias，forward 和 backward 分开执行。本轮还增加了
+backward 专用的 split-C 用例：BF16 和 FP32 分别覆盖 `(128,1,8,4096)`，每种 dtype
+都测试有无 bias，直接验证四路 C 分片、FP32 partial 和 merge 的数值结果。
 
 ### 7.3 特殊测试
 
@@ -490,6 +571,7 @@ block 和 warp 数更敏感，因此继承原分支的高寄存器压力配置�
 2. **非连续 forward 输入**：检查输出与 CPU reference 一致。
 3. **非连续 backward 输入**：包含非连续 bias 和 `grad_output`，逐项检查五个梯度。
 4. **无 bias 返回约定**：验证 `grad_bias is None`。
+5. **Split-C backward**：覆盖 BF16/FP32、有无 bias，检查五个梯度及 partial 合并映射。
 
 ### 7.4 容差
 
@@ -501,12 +583,13 @@ block 和 warp 数更敏感，因此继承原分支的高寄存器压力配置�
 
 ### 7.5 用例数量
 
-- 17 组 dtype/shape 组合 × 2 种 bias 设置 × 2 个方向 = 68 项。
+- 17 组通用 dtype/shape 组合 × 2 种 bias 设置 × 2 个方向 = 68 项。
+- 2 种 split-C dtype × 2 种 bias 设置 = 4 项。
 - 固定 transpose 案例 = 1 项。
 - 非连续 forward = 1 项。
 - 非连续 backward = 1 项。
 
-**合计 71 项正确性测试，当前全部通过。**
+**合计 75 项正确性测试，当前全部通过。**
 
 运行命令：
 
@@ -536,10 +619,15 @@ benchmark 在运行时实际探测 Megatron：
 - 预热 25 ms，正式测量 100 ms，取中位数。
 - 输入随机生成在计时区域之外。
 - 首次编译和 autotune 不属于正式测量。
-- 输出分配、`.contiguous()` 和 bias 梯度求和包含在被测 API 内。
+- 输出分配、`.contiguous()`、split-C partial 分配和 bias 梯度求和都包含在被测 API 内。
 - Backward 直接传入 `grad_output` 调用 backward，**不经过 autograd，也不包含 forward
   耗时**。
 - Speedup 定义为 `Megatron latency / FlagTrain latency`，大于 1 表示 FlagTrain 更快。
+
+本轮优化还使用 CUDA Graph replay 和 Profiler 分段计时辅助定位 A、B、bias reduction 的
+GPU 时间。Graph 数据只用于分析，不替代上述完整 API 的 48 点性能结果；普通 `do_bench`
+和 Graph 的 L2 清理口径不同，Graph 还会展开多轮调用及输出分配，不适合不加限制地用于
+大形状综合集。
 
 ### 8.3 核心形状
 
@@ -607,23 +695,25 @@ CUDA_VISIBLE_DEVICES=3 pytest -s -v benchmark/megatron/test_fused_h_post_bda.py 
 
 ## 9. 当前性能结果
 
-以下结果来自 NVIDIA H20-3e、BF16/FP16/FP32 全精度综合集。时间单位为 ms，对应
-`eeabbc4` 的最终缓存隔离版本。
+以下结果来自 NVIDIA H20-3e、BF16/FP16/FP32 全精度综合集，时间单位为 ms。Forward
+仍对应 `eeabbc4` 的最终缓存隔离版本；backward 对应本轮小形状融合和 N=8 split-C
+最终实现。
 
 ### 9.1 整体统计
 
 | 算子 | 数据点数 | 最低 Speedup | 算术平均 Speedup | 低于 0.8x 的数量 |
 | --- | ---: | ---: | ---: | ---: |
 | Forward | 48 | 0.830x | 1.240x | 0 |
-| Backward | 48 | 0.819x | 1.171x | 0 |
+| Backward | 48 | 0.833x | 1.770x | 0 |
 
 这里的平均值是各数据点 Speedup 的**算术平均**，不是按耗时加权，也不代表端到端训练加速比。
-输入复用优化前，forward/backward 的算术平均加速比分别为 1.167x 和 1.161x。
+本轮 backward 优化前的平均值为 1.171x、最低值为 0.819x；当前最低点是 FP16
+`(64,8,4,4096)` 无 bias 的 0.833x，该形状继续使用单阶段 B。
 
 最终 JSON 记录为：
 
 - `/workspace/benchmark_fused_h_post_bda_forward_gpu3_reuse_cachefix.json`
-- `/workspace/benchmark_fused_h_post_bda_backward_gpu3_reuse_cachefix.json`
+- `/workspace/benchmark_fused_h_post_bda_backward_gpu3_fused_splitc_final.json`
 
 ### 9.2 Forward 代表性数据（BF16）
 
@@ -648,20 +738,23 @@ CUDA_VISIBLE_DEVICES=3 pytest -s -v benchmark/megatron/test_fused_h_post_bda.py 
 
 | Shape | Bias | Megatron (ms) | FlagTrain (ms) | Speedup |
 | --- | --- | ---: | ---: | ---: |
-| `(1,2,2,65)` | 无 | 0.054144 | 0.036352 | 1.489x |
-| `(1,2,2,65)` | 有 | 0.063872 | 0.047840 | 1.335x |
-| `(2,4,4,1024)` | 无 | 0.055104 | 0.048512 | 1.136x |
-| `(2,4,4,1024)` | 有 | 0.065056 | 0.052512 | 1.239x |
-| `(64,8,4,4096)` | 无 | 0.059840 | 0.073024 | 0.819x |
-| `(64,8,4,4096)` | 有 | 0.072480 | 0.083584 | 0.867x |
-| `(128,1,8,7168)` | 无 | 0.102944 | 0.098240 | 1.048x |
-| `(128,1,8,7168)` | 有 | 0.130336 | 0.125696 | 1.037x |
-| `(512,4,4,4096)` | 无 | 0.120592 | 0.114976 | 1.049x |
-| `(8192,4,4,7168)` | 无 | 2.892032 | 2.696640 | 1.072x |
-| `(8192,4,4,7168)` | 有 | 3.110096 | 2.848096 | 1.092x |
+| `(1,2,2,65)` | 无 | 0.056720 | 0.017472 | 3.246x |
+| `(1,2,2,65)` | 有 | 0.066624 | 0.028000 | 2.379x |
+| `(2,4,4,1024)` | 无 | 0.056704 | 0.049056 | 1.156x |
+| `(2,4,4,1024)` | 有 | 0.067808 | 0.050848 | 1.334x |
+| `(64,8,4,4096)` | 无 | 0.062624 | 0.074560 | 0.840x |
+| `(64,8,4,4096)` | 有 | 0.072416 | 0.085120 | 0.851x |
+| `(128,1,8,7168)` | 无 | 0.101312 | 0.083424 | 1.214x |
+| `(128,1,8,7168)` | 有 | 0.126976 | 0.093792 | 1.354x |
+| `(512,4,4,4096)` | 无 | 0.121280 | 0.115296 | 1.052x |
+| `(512,4,4,4096)` | 有 | 0.143488 | 0.133216 | 1.077x |
+| `(8192,4,4,7168)` | 无 | 2.930272 | 2.687840 | 1.090x |
+| `(8192,4,4,7168)` | 有 | 3.486624 | 2.947968 | 1.183x |
 
-Backward 的整体收益小于 forward，因为 backward B 和 bias reduction 没有改动；
-输入复用主要改善 backward A，对 `N=8` 和大 `sb` 的端到端反向 API 仍有可见收益。
+本轮小形状融合显著降低了极小形状的完整 API 时间；N=8 split-C 将 `(128,1,8,7168)`
+无 bias/有 bias 的 FlagTrain 时间从原来的 0.098240/0.125696 ms 降至
+0.083424/0.093792 ms。N=4 中等形状保持单阶段 B，大 sb 路径仍主要受益于 backward A
+输入复用。Bias reduction 没有改动。
 
 ## 10. 当前限制与后续方向
 
@@ -677,6 +770,8 @@ Backward 的整体收益小于 forward，因为 backward B 和 bias reduction �
    开销抵消了理论收益。
 8. **输入复用具有适用范围**：三维 accumulator 会增加寄存器压力，不能对所有形状默认
    启用；新增平台或重要形状后，应重新验证复用条件和配置裁剪规则。
+9. **Split-C 不能只看 Graph 收益**：partial 分配和 merge launch 会影响完整 API；当前仅
+   保留实测有效的 N=8 受限路径，其他 N 或更大的 sb 需要重新测量，不能直接推广。
 
 ## 11. 相关文件
 
@@ -684,6 +779,6 @@ Backward 的整体收益小于 forward，因为 backward B 和 bias reduction �
 | --- | --- |
 | `src/flag_train/megatron/fused_h_post_bda.py` | Triton Kernel、输入校验和 forward/backward 包装 |
 | `src/flag_train/megatron/__init__.py` | 算子导出和 `SpecOpRegistrar` 注册 |
-| `tests/megatron/test_fused_h_post_bda.py` | 71 项正确性测试 |
+| `tests/megatron/test_fused_h_post_bda.py` | 75 项正确性测试 |
 | `benchmark/megatron/test_fused_h_post_bda.py` | Baseline 选择、输入生成和性能测试 |
 | `fused_h_post_bda.md` | 本文档 |
