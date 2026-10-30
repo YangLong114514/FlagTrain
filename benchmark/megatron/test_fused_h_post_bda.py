@@ -14,9 +14,10 @@
 """Benchmark fused_h_post_bda against Megatron's Triton kernels when usable.
 
 Megatron is optional: a small real forward/backward probe selects its kernels,
-otherwise both benchmarks warn and use the explicit torch baselines. Backward
-receives grad_output and the original inputs directly, so is_backward stays
-False; enabling it would make GenericBenchmark run an extra autograd forward.
+otherwise both benchmarks warn and use torch.compile baselines that mirror
+Megatron's native implementation. Backward receives grad_output and the original
+inputs directly, so is_backward stays False; enabling it would make
+GenericBenchmark run an extra autograd forward.
 """
 
 import warnings
@@ -53,43 +54,47 @@ _COMPREHENSIVE_SHAPES = [
 ]
 
 
+@torch.compile
 def _torch_forward(h_res, original_residual, h_post, x, bias=None):
     s, b, n, channels = original_residual.shape
-    sb = s * b
-    hr = h_res.contiguous().view(sb, n, n)
-    orig = original_residual.contiguous().view(sb, n, channels)
-    hp = h_post.contiguous().view(sb, n)
-    x_flat = x.contiguous().view(sb, channels)
-
-    out = torch.bmm(hr.transpose(1, 2), orig) + hp.unsqueeze(-1) * x_flat.unsqueeze(1)
+    h_res_batched = h_res.view(s * b, n, n)
+    residual_batched = original_residual.view(s * b, n, channels)
+    mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(
+        s, b, n, channels
+    )
+    x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
-        out = out + hp.unsqueeze(-1) * bias.view(1, 1, channels)
-    return out.view(s, b, n, channels)
+        bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, channels)
+        return x_expanded + bias_expanded + mixed
+    return x_expanded + mixed
 
 
+@torch.compile
 def _torch_backward(grad_output, h_res, original_residual, h_post, x, bias=None):
     s, b, n, channels = original_residual.shape
     sb = s * b
-    go = grad_output.contiguous().view(sb, n, channels)
-    hr = h_res.contiguous().view(sb, n, n)
-    orig = original_residual.contiguous().view(sb, n, channels)
-    hp = h_post.contiguous().view(sb, n)
-    x_flat = x.contiguous().view(sb, channels)
+    go = grad_output.reshape(sb, n, channels)
+    hr = h_res.reshape(sb, n, n)
+    orig = original_residual.reshape(sb, n, channels)
+    hp = h_post.reshape(sb, n)
+    x_flat = x.reshape(sb, channels)
 
-    grad_h_res = torch.bmm(orig, go.transpose(1, 2))
-    grad_res = torch.bmm(hr, go)
-    grad_x = (go * hp.unsqueeze(-1)).sum(dim=1)
-    x_expanded = x_flat.unsqueeze(1)
-    if bias is not None:
-        x_expanded = x_expanded + bias.view(1, 1, channels)
-    grad_h_post = (go * x_expanded).sum(dim=2)
-    grad_bias = grad_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None
+    g_hr = torch.bmm(orig, go.transpose(1, 2)).view(s, b, n, n)
+    g_res = torch.bmm(hr, go).view(s, b, n, channels)
+    g_x = torch.sum(go * hp.unsqueeze(-1), dim=1).view(s, b, channels)
+    xb = x_flat if bias is None else x_flat + bias.view(1, channels)
+    g_hp = torch.sum(go * xb.unsqueeze(1), dim=2).view(s, b, n)
+    g_bias = (
+        g_x.reshape(sb, channels).sum(dim=0).to(dtype=bias.dtype)
+        if bias is not None
+        else None
+    )
     return (
-        grad_h_res.view(s, b, n, n),
-        grad_res.view(s, b, n, channels),
-        grad_h_post.view(s, b, n),
-        grad_x.view(s, b, channels),
-        grad_bias,
+        g_hr.to(dtype=h_res.dtype),
+        g_res.to(dtype=original_residual.dtype),
+        g_hp.to(dtype=h_post.dtype),
+        g_x.to(dtype=x.dtype),
+        g_bias,
     )
 
 
@@ -111,10 +116,14 @@ def _select_baseline():
     except Exception as exc:
         warnings.warn(
             "Megatron Triton fused_h_post_bda baseline is unavailable "
-            f"({exc!r}); falling back to the explicit torch baseline.",
+            f"({exc!r}); falling back to the Megatron-native torch.compile baseline.",
             stacklevel=2,
         )
-        return _torch_forward, _torch_backward, "torch bmm (fallback)"
+        return (
+            _torch_forward,
+            _torch_backward,
+            "Megatron-native torch.compile (fallback)",
+        )
     return (
         _triton_h_post_bda_fwd,
         _triton_h_post_bda_bwd,

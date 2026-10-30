@@ -645,17 +645,21 @@ benchmark 在运行时实际探测 Megatron：
 
 1. 优先使用 Megatron `_triton_h_post_bda_fwd/_bwd`。
 2. 用小张量实际执行 forward、backward 并同步设备。
-3. 如果导入或执行失败，则警告并回退到显式 PyTorch `bmm/sum` baseline。
-4. 打印实际选择的 baseline，避免把 PyTorch fallback 误报成 Megatron。
+3. 如果导入或执行失败，则警告并回退到与 Megatron native 对齐的 `torch.compile` baseline。
+4. 打印实际选择的 baseline，避免把 PyTorch fallback 误报成 Megatron Triton。
 
-当前 NVIDIA 环境选择 Megatron Triton baseline。
+当前 NVIDIA 环境选择 Megatron Triton baseline。Fallback 逐行对齐 Megatron
+`native_h_post_bda` 和 `_torch_h_post_bda_bwd`，包括矩阵乘方向、view/reshape、bias 展开、
+加法顺序和梯度 dtype 转换，并保留 `@torch.compile` 以接近未使用融合 Kernel 时的真实
+Megatron 执行方式。它显示为 `Megatron-native torch.compile (fallback)`，不是普通 eager
+Torch 组合实现。
 
 ### 8.2 计时口径
 
 - 使用 GenericBenchmark 的 kernel 模式和 CUDA Event。
 - 预热 25 ms，正式测量 100 ms，取中位数。
 - 输入随机生成在计时区域之外。
-- 首次编译和 autotune 不属于正式测量。
+- 首次 Triton 编译、autotune 和 fallback 的 `torch.compile` 编译不属于正式测量。
 - 输出分配、`.contiguous()`、split-C partial 分配和 bias 梯度求和都包含在被测 API 内。
 - Backward 直接传入 `grad_output` 调用 backward，**不经过 autograd，也不包含 forward
   耗时**。
