@@ -562,6 +562,39 @@ Split-C merge 初次实现直接按 accumulator 的 `(i,j)` 直觉提取 partial
 转置。当前与原 B 保持一致：累加列使用 `j*N+i`，最终输出 `(i,j)` 时提取 `i*N+j`。
 新增的 split-C CPU autograd 回归用例覆盖了该映射。
 
+### 6.11 flagtree AABS 原地污染 autotune 配置导致性能测量失真
+
+**现象**：MetaX 环境 benchmark 中，排在 `(1,1,1,1)` 之后的 case 的 train latency 被放大
+100~1000 倍（如 backward `(8192,4,4,7168)` 测出 3378 ms，真实值约 6.5 ms），且同一
+shape 的 forward/backward 数字几乎相同。
+
+**原因**：flagtree Triton fork 的 AABS（`FLAGTREE_AABS`，默认开启）在 autotune 时按
+"block size > 张量维度则缩小" 的规则调整配置，但 `update_bs` 会**原地修改 autotuner
+共享的 config 对象**。遇到 `C=1` 的迷你形状后，全部候选配置的 `BLOCK_C` 被永久缩成 1，
+后续所有 key（包括之前已缓存的最优配置，因为缓存持有同一批对象）都退化到
+`BLOCK_C=1`，kernel 退化为每个 program 处理 1 个 channel。
+
+**解决**：算子的 kernel 启动点外套 `_disable_aabs()`，调用期间临时关闭
+`triton.knobs.autotuning.adjust_block_size`，退出恢复；对无此 knob 的原版 Triton 自动
+跳过。根治需要 flagtree 上游修复 `update_bs` 的原地修改问题。
+
+### 6.12 MACA 每线程私有内存上限导致个别配置启动失败
+
+**现象**：MetaX 环境 fp32 backward 测试报 `Triton Error [MACA]: memory size or pointer
+value too large to fit in 32 bit`，崩溃点在 autotune 测速
+`_triton_hpb_bwd_g_hp_hr_kernel` 的 `BLOCK_C=128/256, BLOCK_S=8` 配置。
+
+**原因**：该 kernel 持有 `(BLOCK_S, N²)` 的累加器，`BLOCK_S=8, N=8` 时编译器产生的
+每线程私有内存需求（实测 5~7 KB/thread）超过 MACA 驱动默认上限（4 KB/thread），
+`mcModuleLaunchKernel` 直接拒绝启动。stock `triton.autotune` 只捕获
+`OutOfResources` 等三类异常，普通 `RuntimeError` 会中断整个调优。
+
+**解决**：本文件的三个 autotuned kernel 改用本地 `_hpb_autotune` 装饰器——在
+`triton.autotune` 之外给 `_bench` 包一层 `RuntimeError` 捕获，启动失败的配置按
+无穷慢处理并跳过（与 `libentry.LibTuner` 的容错策略一致）。此前全量测试未暴露是因为
+dtype14 先在 `sb=1` 下为同一 key 完成了调优，dtype16 直接命中缓存，从未在大 grid 下
+启动过该配置。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
@@ -570,6 +603,9 @@ Split-C merge 初次实现直接按 accumulator 的 `(i,j)` 直觉提取 partial
 
 - Forward：独立的 PyTorch `bmm + 逐元素运算` reference。
 - Backward：对 PyTorch reference 前向执行 `torch.autograd.grad`。
+- 参考计算中的 `bmm`（含 autograd 反传）在 `_strict_fp32_matmul()` 下执行，临时关闭
+  TF32：部分后端（如 MetaX）默认 fp32 matmul 走 TF32，参考值自身误差会超过 fp32 用例
+  的 1e-5 容差，造成假失败。
 - 使用 `--ref cpu` 时，通用 reference 输入会被独立复制到 CPU，确保参考计算真正在 CPU
   上执行，而不是只把结果移动到 CPU。
 - 大形状 forward 专项使用独立 GPU PyTorch reference 后再复制预期结果，避免非连续大
@@ -646,13 +682,16 @@ benchmark 在运行时实际探测 Megatron：
 1. 优先使用 Megatron `_triton_h_post_bda_fwd/_bwd`。
 2. 用小张量实际执行 forward、backward 并同步设备。
 3. 如果导入或执行失败，则警告并回退到与 Megatron native 对齐的 `torch.compile` baseline。
-4. 打印实际选择的 baseline，避免把 PyTorch fallback 误报成 Megatron Triton。
+4. 如果 `torch.compile` 探测同样失败（例如环境的 torch 与 Triton 版本不匹配导致
+   inductor 不可用），再次警告并回退到同一实现的 eager 版本。
+5. 打印实际选择的 baseline，避免把 PyTorch fallback 误报成 Megatron Triton。
 
 当前 NVIDIA 环境选择 Megatron Triton baseline。Fallback 逐行对齐 Megatron
 `native_h_post_bda` 和 `_torch_h_post_bda_bwd`，包括矩阵乘方向、view/reshape、bias 展开、
-加法顺序和梯度 dtype 转换，并保留 `@torch.compile` 以接近未使用融合 Kernel 时的真实
+加法顺序和梯度 dtype 转换，并保留 `torch.compile` 以接近未使用融合 Kernel 时的真实
 Megatron 执行方式。它显示为 `Megatron-native torch.compile (fallback)`，不是普通 eager
-Torch 组合实现。
+Torch 组合实现；当 `torch.compile` 不可用时显示为 `Megatron-native torch eager
+(fallback)`，二者共享同一份实现代码。
 
 ### 8.2 计时口径
 

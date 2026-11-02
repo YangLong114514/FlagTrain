@@ -15,7 +15,8 @@
 
 Megatron is optional: a small real forward/backward probe selects its kernels,
 otherwise both benchmarks warn and use torch.compile baselines that mirror
-Megatron's native implementation. Backward receives grad_output and the original
+Megatron's native implementation (eager equivalents when torch.compile is
+broken in the environment). Backward receives grad_output and the original
 inputs directly, so is_backward stays False; enabling it would make
 GenericBenchmark run an extra autograd forward.
 """
@@ -54,8 +55,7 @@ _COMPREHENSIVE_SHAPES = [
 ]
 
 
-@torch.compile
-def _torch_forward(h_res, original_residual, h_post, x, bias=None):
+def _eager_forward(h_res, original_residual, h_post, x, bias=None):
     s, b, n, channels = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, channels)
@@ -69,8 +69,7 @@ def _torch_forward(h_res, original_residual, h_post, x, bias=None):
     return x_expanded + mixed
 
 
-@torch.compile
-def _torch_backward(grad_output, h_res, original_residual, h_post, x, bias=None):
+def _eager_backward(grad_output, h_res, original_residual, h_post, x, bias=None):
     s, b, n, channels = original_residual.shape
     sb = s * b
     go = grad_output.reshape(sb, n, channels)
@@ -98,6 +97,10 @@ def _torch_backward(grad_output, h_res, original_residual, h_post, x, bias=None)
     )
 
 
+_torch_forward = torch.compile(_eager_forward)
+_torch_backward = torch.compile(_eager_backward)
+
+
 def _select_baseline():
     try:
         from megatron.core.fusions.fused_mhc_kernels import (
@@ -119,6 +122,26 @@ def _select_baseline():
             f"({exc!r}); falling back to the Megatron-native torch.compile baseline.",
             stacklevel=2,
         )
+        try:
+            hr, orig, hp, x, bias = next(
+                forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
+            )
+            with base.torch_device_fn.device(hr.device):
+                output = _torch_forward(hr, orig, hp, x, bias)
+                grad_output = torch.randn_like(output)
+                _torch_backward(grad_output, hr, orig, hp, x, bias)
+                base.torch_device_fn.synchronize()
+        except Exception as compile_exc:
+            warnings.warn(
+                "torch.compile baseline is unavailable "
+                f"({compile_exc!r}); falling back to eager execution.",
+                stacklevel=2,
+            )
+            return (
+                _eager_forward,
+                _eager_backward,
+                "Megatron-native torch eager (fallback)",
+            )
         return (
             _torch_forward,
             _torch_backward,

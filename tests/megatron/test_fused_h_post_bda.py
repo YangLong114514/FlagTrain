@@ -13,6 +13,8 @@
 # limitations under the License.
 """Correctness tests for fused mHC H_post BDA forward and backward."""
 
+import contextlib
+
 import pytest
 import torch
 
@@ -41,6 +43,18 @@ _DTYPE_SHAPE_CASES = [
     (torch.float32, 2, 5, 8, 257),
 ]
 _GRADIENT_NAMES = ("h_res", "original_residual", "h_post", "x", "bias")
+
+
+@contextlib.contextmanager
+def _strict_fp32_matmul():
+    # Some backends default fp32 matmul to TF32, which would make the bmm-based
+    # reference less accurate than the fp32 kernel it is checking against.
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
 
 
 def _tolerances(dtype, backward=False):
@@ -73,10 +87,11 @@ def _reference_copy(tensor):
 
 def _ref_h_post_bda(h_res, original_residual, h_post, x, bias=None):
     s, b, n, channels = original_residual.shape
-    mixed = torch.bmm(
-        h_res.reshape(s * b, n, n).transpose(1, 2),
-        original_residual.reshape(s * b, n, channels),
-    ).reshape(s, b, n, channels)
+    with _strict_fp32_matmul():
+        mixed = torch.bmm(
+            h_res.reshape(s * b, n, n).transpose(1, 2),
+            original_residual.reshape(s * b, n, channels),
+        ).reshape(s, b, n, channels)
     output = h_post.unsqueeze(-1) * x.unsqueeze(2) + mixed
     if bias is not None:
         output = output + h_post.unsqueeze(-1) * bias.reshape(1, 1, 1, channels)
@@ -103,7 +118,8 @@ def _ref_h_post_bda_backward(
             bias,
         )
     )
-    gradients = torch.autograd.grad(output, inputs, grad_output)
+    with _strict_fp32_matmul():
+        gradients = torch.autograd.grad(output, inputs, grad_output)
     return gradients if bias is not None else (*gradients, None)
 
 

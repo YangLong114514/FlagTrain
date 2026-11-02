@@ -22,7 +22,7 @@ backward returns gradients in Megatron's order: ``h_res``, original residual,
 ``h_post``, ``x``, and optional bias.
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -36,6 +36,23 @@ from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
 
+@contextmanager
+def _disable_aabs():
+    # The flagtree Triton fork's AABS adjusts autotune configs in place, so one
+    # tiny-C autotune run (e.g. C=1) permanently cripples BLOCK_C for every
+    # later shape in the process. Disable it while launching these kernels.
+    autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
+    if autotuning is None or not hasattr(autotuning, "adjust_block_size"):
+        yield
+        return
+    prev = autotuning.adjust_block_size
+    autotuning.adjust_block_size = False
+    try:
+        yield
+    finally:
+        autotuning.adjust_block_size = prev
+
+
 def _hpb_configs():
     return [
         triton.Config({"BLOCK_C": block_c, "BLOCK_S": block_s}, num_warps=num_warps)
@@ -43,6 +60,31 @@ def _hpb_configs():
         for block_s in (1, 2, 4, 8)
         for num_warps in (2, 4, 8)
     ]
+
+
+def _hpb_autotune(**autotune_kwargs):
+    """triton.autotune that tolerates configs the backend driver cannot launch.
+
+    The MACA driver rejects kernels whose per-thread private memory exceeds its
+    limit with a plain RuntimeError ("memory size or pointer value too large to
+    fit in 32 bit"), which stock autotune does not catch — one bad config would
+    abort the whole tuning run. Treat such configs as infinitely slow instead.
+    """
+
+    def decorator(fn):
+        tuner = triton.autotune(**autotune_kwargs)(fn)
+        bench = tuner._bench
+
+        def _safe_bench(*args, **kwargs):
+            try:
+                return bench(*args, **kwargs)
+            except RuntimeError:
+                return [float("inf")] * 3
+
+        tuner._bench = _safe_bench
+        return tuner
+
+    return decorator
 
 
 def _prune_hpb_configs(configs, nargs, **kwargs):
@@ -94,7 +136,7 @@ def _validate_inputs(h_res, original_residual, h_post, x, bias):
 
 
 @libentry()
-@triton.autotune(
+@_hpb_autotune(
     configs=_hpb_configs(),
     key=["C", "N", "REUSE_INPUT"],
     prune_configs_by={"early_config_prune": _prune_hpb_configs},
@@ -206,7 +248,7 @@ def _triton_hpb_fwd_kernel(
 
 
 @libentry()
-@triton.autotune(
+@_hpb_autotune(
     configs=_hpb_configs(),
     key=["C", "N", "REUSE_INPUT"],
     prune_configs_by={"early_config_prune": _prune_hpb_configs},
@@ -324,7 +366,7 @@ def _triton_hpb_bwd_g_x_orig_kernel(
 
 
 @libentry()
-@triton.autotune(configs=_hpb_configs(), key=["C", "N"])
+@_hpb_autotune(configs=_hpb_configs(), key=["C", "N"])
 @triton.jit
 def _triton_hpb_bwd_g_hp_hr_kernel(
     go_ptr,
@@ -744,7 +786,7 @@ def fused_h_post_bda_forward(
         if runtime_device.vendor_name == "nvidia"
         else torch_device_fn.device(h_res.device)
     )
-    with device_context:
+    with _disable_aabs(), device_context:
         fwd_kernel[grid](
             hr_flat,
             orig_flat,
@@ -891,7 +933,7 @@ def fused_h_post_bda_backward(
                 triton.cdiv(sb, meta["BLOCK_S"]),
                 split_c,
             )
-        with device_context:
+        with _disable_aabs(), device_context:
             bwd_g_x_orig_kernel[grid_a](
                 go_flat,
                 hr_flat,
