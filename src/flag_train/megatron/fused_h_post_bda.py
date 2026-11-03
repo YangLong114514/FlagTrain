@@ -961,7 +961,14 @@ def fused_h_post_bda_backward(
                 **fixed_config,
             )
             if native_fp32_reduction:
-                g_hr = torch.bmm(orig_flat, go_flat.transpose(1, 2))
+                # Some backends default fp32 matmul to TF32, which would silently
+                # degrade this path's fp32 accuracy.
+                prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+                torch.backends.cuda.matmul.allow_tf32 = False
+                try:
+                    g_hr = torch.bmm(orig_flat, go_flat.transpose(1, 2))
+                finally:
+                    torch.backends.cuda.matmul.allow_tf32 = prev_tf32
                 x_bias = x_flat.unsqueeze(1)
                 if bias is not None:
                     x_bias = x_bias + bias.contiguous().view(1, 1, channels)
