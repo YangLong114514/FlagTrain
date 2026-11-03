@@ -846,6 +846,7 @@ def fused_h_post_bda_backward(
     orig_flat = original_residual.contiguous().view(sb, n, channels)
     hp_flat = h_post.contiguous().view(sb, n)
     x_flat = x.contiguous().view(sb, channels)
+    native_fp32_reduction = h_res.dtype == torch.float32 and channels >= 4096
 
     grid_a = lambda meta: (
         triton.cdiv(sb, meta["BLOCK_S"]),
@@ -914,7 +915,8 @@ def fused_h_post_bda_backward(
             device_context = torch_device_fn.device(h_res.device)
         split_c = 0
         if (
-            runtime_device.vendor_name == "nvidia"
+            not native_fp32_reduction
+            and runtime_device.vendor_name == "nvidia"
             and not small_nvidia
             and n == 8
             and sb <= 128
@@ -955,7 +957,13 @@ def fused_h_post_bda_backward(
                 REUSE_INPUT=reuse_input,
                 **fixed_config,
             )
-            if split_c:
+            if native_fp32_reduction:
+                g_hr = torch.bmm(orig_flat, go_flat.transpose(1, 2))
+                x_bias = x_flat.unsqueeze(1)
+                if bias is not None:
+                    x_bias = x_bias + bias.contiguous().view(1, 1, channels)
+                g_hp = (go_flat * x_bias).sum(dim=-1)
+            elif split_c:
                 _triton_hpb_bwd_g_hp_hr_split_c_kernel[grid_split](
                     go_flat,
                     orig_flat,
@@ -1013,9 +1021,6 @@ def fused_h_post_bda_backward(
                     HAS_BIAS=(bias is not None),
                     **fixed_config,
                 )
-
-    if runtime_device.vendor_name == "thead" and h_res.dtype == torch.float32:
-        g_hr = torch.bmm(orig_flat, go_flat.transpose(1, 2))
 
     g_bias = g_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None
     return (
