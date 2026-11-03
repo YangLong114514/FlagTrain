@@ -14,7 +14,7 @@
 - `src/flag_train/megatron/fused_h_post_bda.py`
 - `src/flag_train/megatron/__init__.py`
 
-当前分支为 `fused_h_post_bda`。本文描述截至代码提交 `eeabbc4` 的实现和验证结果。
+当前分支为 `fused_h_post_bda`。本文描述截至代码提交 `807a1ae` 的实现和验证结果。
 
 ## 2. 数学功能
 
@@ -348,9 +348,29 @@ BF16/FP16 的 `(64,8,4,4096)` 保留逐输出流原计算结构，但直接调�
 
 split-C 会改变 FP32 的累加分组，并增加 partial 读写和一次 merge launch，因此没有推广
 到其他 N 或大 sb。N=4 的实验虽然降低了 Graph 时间，但完整 API 明显退化，最终仍保留
-单阶段 B。
+单阶段 B。FP32 长通道输入使用下一节的原生归约路径，不再进入 split-C。
 
-### 4.7 分发路径和其他 vendor
+### 4.7 FP32 长通道原生归约路径
+
+所有平台在 `dtype == FP32` 且 `C >= 4096` 时使用统一的原生 Backward B，不再按 vendor
+选择不同数值路径。Backward A 仍由 Triton 计算 `grad_x` 和 `grad_original_residual`，随后用
+PyTorch 计算：
+
+```python
+g_hr = torch.bmm(orig_flat, go_flat.transpose(1, 2))
+x_bias = x_flat.unsqueeze(1)
+if bias is not None:
+    x_bias = x_bias + bias.contiguous().view(1, 1, C)
+g_hp = (go_flat * x_bias).sum(dim=-1)
+```
+
+执行 `bmm` 前会临时设置 `torch.backends.cuda.matmul.allow_tf32=False`，并在结束后恢复原值，
+避免后端默认 TF32 降低 FP32 精度。这条路径完全不启动 Triton Backward B，也不分配 split-C
+partial，避免先由 Triton 计算后再用原生实现覆盖的重复开销。`grad_bias` 仍从已写回输入 dtype
+的 `grad_x` 归约。该实现依赖平台的 PyTorch 矩阵乘和归约能力；Hygon 上观察到的 hipBLAS
+初始化问题见第 6.14 节。
+
+### 4.8 分发路径和其他 vendor
 
 | 输入情况 | Kernel 调用方式 | 计算结构 | 设备上下文 |
 | --- | --- | --- | --- |
@@ -358,11 +378,12 @@ split-C 会改变 FP32 的累加分组，并增加 partial 读写和一次 merge
 | NVIDIA `(64,8,4,4096)` forward，BF16/FP16 | 原始 JITFunction + dtype 固定配置 | 原 forward | `nullcontext()` |
 | NVIDIA 小形状 backward，`n<=4` | 原始 JITFunction + 固定配置 | 单 Kernel 融合 | `nullcontext()` |
 | NVIDIA 小形状 backward，`n>4` | 原始 JITFunction + 固定配置 | 原 A、B | `nullcontext()` |
-| NVIDIA N=8 split-C | A 直接调用 Autotuner；B 固定配置 | A 输入复用 + split-C/merge | `nullcontext()` |
+| NVIDIA N=8 split-C，BF16/FP16 | A 直接调用 Autotuner；B 固定配置 | A 输入复用 + split-C/merge | `nullcontext()` |
+| 任意 vendor，FP32 且 `C>=4096` | A 沿用平台路径；B 使用 PyTorch | 原生 `bmm` 和通道归约 | 沿用当前平台 |
 | NVIDIA 其他满足复用条件的形状 | 直接调用 Autotuner + 裁剪配置 | 输入复用 | `nullcontext()` |
 | NVIDIA 其他形状 | 直接调用 Autotuner + 完整配置 | 原实现 | `nullcontext()` |
 | 其他 vendor N=8 split-C（非 FP32） | `LibEntry` + 通用 autotune；B 固定配置 | split-C=16/merge | `torch_device_fn.device()` |
-| 其他 vendor | `LibEntry` + 通用 autotune | 原实现 | `torch_device_fn.device()` |
+| 其他 vendor 的其余形状 | `LibEntry` + 通用 autotune | 原实现 | `torch_device_fn.device()` |
 
 其他 vendor 的通用路径被保留，但目前没有完成与 NVIDIA 相同范围的正确性和性能验证。
 
@@ -453,6 +474,17 @@ backward 数据点由 1.161x 提升到 1.171x，两个方向均没有低于 0.8x
 `(BLOCK_C,BLOCK_S,num_warps)` 固定配置并绕过 Autotuner。新增 7 项 forward 测试后共
 82 项，覆盖三种 dtype、有无 bias、非整块 C=4099 和大形状非连续输入。最终 forward
 平均加速比为 1.253x，最低为 0.980x。
+
+### 5.8 FP32 长通道归约的跨平台修正
+
+PPU 的 `(128,1,8,4096)` FP32 backward 首先在 `grad_h_res` 上暴露归约误差。初版修复只针对
+`thead` 调用原生 `bmm`，随后为避免平台特判，改为所有平台在 FP32 且 `C>=4096` 时统一使用
+原生 Backward B。最终版本同时计算 `grad_h_res` 和 `grad_h_post`，完全跳过 Triton B 及
+split-C partial 分配，而不是在 Triton 计算后覆盖结果。
+
+本机受影响的 4 项 split-C/长归约测试和模拟 PPU 通用路径的有无 bias 用例均通过。最新通用版本
+尚未完成完整 82 项回归，也没有重新测量 FP32 长形状性能，因此第 9 节保留的是修改前的历史
+性能结果。
 
 ## 6. 历史问题及解决方式
 
@@ -605,6 +637,35 @@ value too large to fit in 32 bit`，崩溃点在 autotune 测速
 dtype14 先在 `sb=1` 下为同一 key 完成了调优，dtype16 直接命中缓存，从未在大 grid 下
 启动过该配置。
 
+### 6.13 PPU FP32 `grad_h_res` 长归约误差
+
+**现象**：PPU 上 `(128,1,8,4096)` 的 FP32 backward 在有/无 bias 时均只有 `grad_h_res`
+超过 `atol=rtol=1e-5`，其余 80 项通过。实际值与参考值非常接近，不是索引或转置错误。
+
+**原因**：PPU 不进入 NVIDIA split-C 分支，通用 Triton Backward B 对 4096 个通道的 FP32
+归约顺序与 Torch reference 不同，累积舍入误差超过当前容差。
+
+**处理**：先验证原生 `torch.bmm(orig, grad_output.T)` 与 Autograd 参考结果一致，再将其推广为
+所有平台的 FP32 长通道原生归约路径。为避免重复计算，最终跳过整个 Triton Backward B，
+`grad_h_post` 也由原生乘法和归约产生。没有放宽测试容差。本机专项测试和模拟 PPU 路径通过，
+PPU 实机仍需复测。
+
+### 6.14 Hygon 测试参考实现触发 hipBLAS 分配失败
+
+**现象**：Hygon 上多个 forward 用例报 `HIPBLAS_STATUS_ALLOC_FAILED when calling
+hipblasCreate(handle)`。堆栈显示被测 Triton forward 已完成，失败发生在随后计算参考值的
+`torch.bmm`，不是输出数值比对失败。日志中的 TF32 不支持警告和手动中断产生的 Triton
+`KeyboardInterrupt` 都不是该错误的根因。
+
+**当前判断**：应优先在 Hygon 新进程和空闲显卡上单独运行最小 `torch.bmm`，结合 `hy-smi`、
+内存占用及 HIP/hipBLAS 版本检查运行环境。`HIPBLASLT_ALLOW_TF32=1` 只控制 TF32，不能解决
+句柄分配失败。
+
+**对当前实现的影响**：FP32 长通道 backward 也使用原生 `bmm`，如果 Hygon 的最小 `bmm`
+同样失败，后续 backward 也会受影响。曾评估把参考矩阵乘改成逐元素乘法求和，但本地 BF16
+用例因舍入路径变化超出现有容差，因此没有将该实验作为修复提交。目前此问题仍需 Hygon 实机
+最小复现结果，尚未修改测试或算子来绕过 hipBLAS。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
@@ -641,9 +702,9 @@ dtype14 先在 `sb=1` 下为同一 key 完成了调优，dtype16 直接命中缓
 - 三种 dtype 的输入复用路径，以及 BF16/FP16 的中等形状原路径。
 
 每组通用形状分别测试 `bias=None` 和有 bias，forward 和 backward 分开执行。Backward
-专用 split-C 用例由 BF16 和 FP32 覆盖 `(128,1,8,4096)`，每种 dtype 都测试有无 bias，
-直接验证四路 C 分片、FP32 partial 和 merge。Forward 专项由三种 dtype 覆盖
-`(64,8,4,4099)` 及有无 bias，验证中等形状分发和非整块 C。
+长通道专项由 BF16 和 FP32 覆盖 `(128,1,8,4096)`，每种 dtype 都测试有无 bias。BF16
+验证四路 C 分片、FP32 partial 和 merge；FP32 验证当前原生 `bmm` 与通道归约路径。Forward
+专项由三种 dtype 覆盖 `(64,8,4,4099)` 及有无 bias，验证中等形状分发和非整块 C。
 
 ### 7.3 特殊测试
 
@@ -653,7 +714,8 @@ dtype14 先在 `sb=1` 下为同一 key 完成了调优，dtype16 直接命中缓
 2. **非连续 forward 输入**：分别覆盖小形状和 `(64,8,4,4096)` 中等形状固定配置路径。
 3. **非连续 backward 输入**：包含非连续 bias 和 `grad_output`，逐项检查五个梯度。
 4. **无 bias 返回约定**：验证 `grad_bias is None`。
-5. **Split-C backward**：覆盖 BF16/FP32、有无 bias，检查五个梯度及 partial 合并映射。
+5. **长通道 backward**：覆盖 BF16/FP32、有无 bias，检查五个梯度；分别对应 split-C/merge
+   和 FP32 原生归约路径。
 
 ### 7.4 容差
 
@@ -666,13 +728,15 @@ dtype14 先在 `sb=1` 下为同一 key 完成了调优，dtype16 直接命中缓
 ### 7.5 用例数量
 
 - 17 组通用 dtype/shape 组合 × 2 种 bias 设置 × 2 个方向 = 68 项。
-- 2 种 split-C dtype × 2 种 bias 设置 = 4 项。
+- 2 种长通道 backward dtype × 2 种 bias 设置 = 4 项。
 - 3 种 forward dtype × 2 种 bias 设置 = 6 项。
 - 固定 transpose 案例 = 1 项。
 - 非连续 forward = 2 项。
 - 非连续 backward = 1 项。
 
-**合计 82 项正确性测试，当前全部通过。**
+**合计 82 项正确性测试。** FP32 通用归约修改前的完整套件为 82 passed；最新修改后，本机
+4 项长通道专项和模拟 PPU 的 2 种 bias 情况均通过。完整套件两次在后续编译/执行阶段长时间
+停滞后中止，因此最新提交暂不标记为全量通过。
 
 运行命令：
 
@@ -786,21 +850,23 @@ CUDA_VISIBLE_DEVICES=3 pytest -s -v benchmark/megatron/test_fused_h_post_bda.py 
 ## 9. 当前性能结果
 
 以下结果来自 NVIDIA H20-3e、BF16/FP16/FP32 全精度综合集，时间单位为 ms。Forward
-对应当前中等形状固定配置版本；backward 对应小形状融合和 N=8 split-C 最终实现。
+对应当前中等形状固定配置版本；backward 数据对应 FP32 通用原生归约修改前的小形状融合和
+N=8 split-C 版本。`1c32531` 之后 FP32 且 `C>=4096` 的 backward 尚未重新测量，下列
+backward 统计和代表数据应视为历史结果，不能直接当作当前 FP32 长形状性能。
 
 ### 9.1 整体统计
 
 | 算子 | 数据点数 | 最低 Speedup | 算术平均 Speedup | 低于 0.8x 的数量 |
 | --- | ---: | ---: | ---: | ---: |
 | Forward | 48 | 0.980x | 1.253x | 0 |
-| Backward | 48 | 0.833x | 1.770x | 0 |
+| Backward（历史） | 48 | 0.833x | 1.770x | 0 |
 
 这里的平均值是各数据点 Speedup 的**算术平均**，不是按耗时加权，也不代表端到端训练加速比。
 Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward 优化前分别为
-1.171x 和 0.819x。当前 backward 最低点是 FP16 `(64,8,4,4096)` 无 bias 的 0.833x，
+1.171x 和 0.819x。历史 backward 最低点是 FP16 `(64,8,4,4096)` 无 bias 的 0.833x，
 该形状继续使用单阶段 B。
 
-最终 JSON 记录为：
+历史 JSON 记录为：
 
 - `/workspace/benchmark_fused_h_post_bda_forward_gpu3_medium_fixed_final.json`
 - `/workspace/benchmark_fused_h_post_bda_backward_gpu3_fused_splitc_final.json`
@@ -861,10 +927,13 @@ Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward �
    开销抵消了理论收益。
 8. **输入复用具有适用范围**：三维 accumulator 会增加寄存器压力，不能对所有形状默认
    启用；新增平台或重要形状后，应重新验证复用条件和配置裁剪规则。
-9. **Split-C 不能只看 Graph 收益**：partial 分配和 merge launch 会影响完整 API；当前仅
-   保留实测有效的 N=8 受限路径，其他 N 或更大的 sb 需要重新测量，不能直接推广。
+9. **Split-C 不能只看 Graph 收益**：partial 分配和 merge launch 会影响完整 API；当前仅在
+   非原生 FP32 的 N=8 受限形状启用，NVIDIA 使用 split-C=4，其他后端使用 16；其他 N 或更大的
+   sb 需要重新测量。
 10. **中等形状 forward 配置是受限特调**：固定配置只用于 BF16/FP16 的
     `(64,8,4,4096)`；全流和双流复用曾出现完整 API 回退，不能推广到其他形状或 dtype。
+11. **FP32 长归约依赖原生 PyTorch 算子**：该路径优先保证跨平台数值一致性，但会增加对平台
+    BLAS/归约实现的依赖；Hygon hipBLAS 问题尚待实机最小复现，且需要补测修改后的性能。
 
 ## 11. 相关文件
 
