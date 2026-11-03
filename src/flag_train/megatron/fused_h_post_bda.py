@@ -1014,6 +1014,9 @@ def fused_h_post_bda_backward(
                     **fixed_config,
                 )
 
+    if runtime_device.vendor_name == "thead" and h_res.dtype == torch.float32:
+        g_hr = torch.bmm(orig_flat, go_flat.transpose(1, 2))
+
     g_bias = g_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None
     return (
         g_hr.view(s, b, n, n),
