@@ -322,20 +322,27 @@ BF16/FP16 的 `(64,8,4,4096)` 保留逐输出流原计算结构，但直接调�
 
 ### 4.6 N=8 的 Backward B split-C 路径
 
-满足以下受限条件时，Backward B 使用 split-C=4：
+满足以下受限条件时，Backward B 使用 split-C：
 
 ```text
-vendor == "nvidia"
-且不属于小形状
-且 n == 8
+n == 8
 且 sb <= 128
 且 C >= 4096
+且（vendor == "nvidia" 且不属于小形状 → split-C=4；
+    其他 vendor → split-C=16）
 ```
 
 固定配置为 `BLOCK_C=256`、`BLOCK_S=2`、`num_warps=2`。以 `(128,1,8,7168)` 为例，
-单阶段 B 只有 64 个 sb CTA；split-C 第一阶段变为 `64 × 4 = 256` 个 CTA，增加通道方向
-并行度。第一阶段写出 `[4,sb,n,n]` 和 `[4,sb,n]` 的 FP32 partial，第二阶段用一个小
-Kernel 合并，不使用 atomic，也不改变 bias 的归约来源。
+单阶段 B 只有 64 个 sb CTA；NVIDIA 的 split-C=4 第一阶段变为 `64 × 4 = 256` 个 CTA，
+增加通道方向并行度。第一阶段写出 `[split,sb,n,n]` 和 `[split,sb,n]` 的 FP32 partial，
+第二阶段用一个小 Kernel 合并，不使用 atomic，也不改变 bias 的归约来源。
+
+通用后端（如沐曦）同样需要这条路径：该后端 Backward B 的 grid 只沿 sb 展开，
+`(128,1,8,7168)` 时每个 CTA 要串行扫完整个 C=7168，g_hp_hr Kernel 占反向总耗时约
+82%（371/451 us）。split-C=16 后该 Kernel 降到约 150 us，完整反向从约 450 us 降到
+约 220 us（FP32 约 280 us），该 case 对 eager 基线的 speedup 从 0.65-0.70x 提升到
+1.3-1.9x。沐曦上用更大的 split-C 是因为其单 CTA 沿 C 的串行扫描更长，需要更多并行
+度填满设备。
 
 split-C 会改变 FP32 的累加分组，并增加 partial 读写和一次 merge launch，因此没有推广
 到其他 N 或大 sb。N=4 的实验虽然降低了 Graph 时间，但完整 API 明显退化，最终仍保留
@@ -352,6 +359,7 @@ split-C 会改变 FP32 的累加分组，并增加 partial 读写和一次 merge
 | NVIDIA N=8 split-C | A 直接调用 Autotuner；B 固定配置 | A 输入复用 + split-C/merge | `nullcontext()` |
 | NVIDIA 其他满足复用条件的形状 | 直接调用 Autotuner + 裁剪配置 | 输入复用 | `nullcontext()` |
 | NVIDIA 其他形状 | 直接调用 Autotuner + 完整配置 | 原实现 | `nullcontext()` |
+| 其他 vendor N=8 split-C | `LibEntry` + 通用 autotune；B 固定配置 | split-C=16/merge | `torch_device_fn.device()` |
 | 其他 vendor | `LibEntry` + 通用 autotune | 原实现 | `torch_device_fn.device()` |
 
 其他 vendor 的通用路径被保留，但目前没有完成与 NVIDIA 相同范围的正确性和性能验证。

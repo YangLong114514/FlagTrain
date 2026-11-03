@@ -916,13 +916,16 @@ def fused_h_post_bda_backward(
         split_c = 0
         if (
             not native_fp32_reduction
-            and runtime_device.vendor_name == "nvidia"
-            and not small_nvidia
             and n == 8
             and sb <= 128
             and channels >= 4096
         ):
-            split_c = 4
+            if runtime_device.vendor_name == "nvidia" and not small_nvidia:
+                split_c = 4
+            elif runtime_device.vendor_name != "nvidia":
+                # Generic backends: the g_hp_hr reduction parallelizes only over
+                # sb, which starves the device for tall-C shapes; split C wider.
+                split_c = 16
         if split_c:
             split_config = {"BLOCK_C": 256, "BLOCK_S": 2, "num_warps": 2}
             g_hr_partial = torch.empty(
