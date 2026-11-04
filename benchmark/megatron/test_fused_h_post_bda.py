@@ -27,8 +27,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import fused_h_post_bda_backward as backward
-from flag_train.megatron import fused_h_post_bda_forward as forward
 
 from .. import base
 
@@ -213,7 +211,7 @@ def test_fused_h_post_bda_forward_perf():
         dtypes=_DTYPES,
         is_backward=False,
     )
-    bench.set_train(forward)
+    bench.set_train(flag_train.megatron.fused_h_post_bda_forward)
     bench.run()
 
 
@@ -228,5 +226,5 @@ def test_fused_h_post_bda_backward_perf():
         # The public backward API is timed directly, not through autograd.
         is_backward=False,
     )
-    bench.set_train(backward)
+    bench.set_train(flag_train.megatron.fused_h_post_bda_backward)
     bench.run()

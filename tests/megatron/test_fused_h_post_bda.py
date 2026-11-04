@@ -19,7 +19,6 @@ import pytest
 import torch
 
 import flag_train
-from flag_train.megatron import fused_h_post_bda_backward, fused_h_post_bda_forward
 
 from .. import accuracy_utils as utils
 
@@ -154,7 +153,7 @@ def _non_contiguous(tensor):
 def test_forward_matches_torch_reference(dtype, s, b, n, channels, with_bias):
     torch.manual_seed(2026)
     inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
-    actual = fused_h_post_bda_forward(*inputs)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _ref_h_post_bda(*(_reference_copy(tensor) for tensor in inputs))
     _assert_close(actual, expected, dtype, "output")
 
@@ -165,7 +164,7 @@ def test_forward_matches_torch_reference(dtype, s, b, n, channels, with_bias):
 def test_forward_medium_shapes_match_torch_reference(dtype, with_bias):
     torch.manual_seed(2026)
     inputs = _make_inputs(64, 8, 4, 4099, dtype, with_bias)
-    actual = fused_h_post_bda_forward(*inputs)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _reference_copy(_ref_h_post_bda(*inputs))
     _assert_close(actual, expected, dtype, "medium-shape output")
 
@@ -177,7 +176,7 @@ def test_backward_matches_torch_autograd(dtype, s, b, n, channels, with_bias):
     torch.manual_seed(2026)
     inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
     grad_output = _rand((s, b, n, channels), dtype)
-    actual = fused_h_post_bda_backward(grad_output, *inputs)
+    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
     expected = _ref_h_post_bda_backward(
         _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
     )
@@ -199,7 +198,7 @@ def test_backward_split_c_matches_torch_autograd(dtype, with_bias):
     s, b, n, channels = 128, 1, 8, 4096
     inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
     grad_output = _rand((s, b, n, channels), dtype)
-    actual = fused_h_post_bda_backward(grad_output, *inputs)
+    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
     expected = _ref_h_post_bda_backward(
         _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
     )
@@ -224,7 +223,9 @@ def test_forward_uses_h_res_transpose():
         device=flag_train.device,
     )
 
-    actual = fused_h_post_bda_forward(h_res, original_residual, h_post, x)
+    actual = flag_train.megatron.fused_h_post_bda_forward(
+        h_res, original_residual, h_post, x
+    )
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 
 
@@ -235,7 +236,7 @@ def test_forward_accepts_non_contiguous_inputs():
         _non_contiguous(tensor)
         for tensor in _make_inputs(2, 1, 4, 130, torch.bfloat16, with_bias=True)
     )
-    actual = fused_h_post_bda_forward(*inputs)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _ref_h_post_bda(*(_reference_copy(tensor) for tensor in inputs))
     _assert_close(actual, expected, torch.bfloat16, "non-contiguous output")
 
@@ -247,7 +248,7 @@ def test_forward_medium_shape_accepts_non_contiguous_inputs():
         _non_contiguous(tensor)
         for tensor in _make_inputs(64, 8, 4, 4096, torch.bfloat16, with_bias=True)
     )
-    actual = fused_h_post_bda_forward(*inputs)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _reference_copy(_ref_h_post_bda(*inputs))
     _assert_close(actual, expected, torch.bfloat16, "medium non-contiguous output")
 
@@ -260,7 +261,7 @@ def test_backward_accepts_non_contiguous_inputs():
         for tensor in _make_inputs(2, 1, 4, 130, torch.bfloat16, with_bias=True)
     )
     grad_output = _non_contiguous(_rand((2, 1, 4, 130), torch.bfloat16))
-    actual = fused_h_post_bda_backward(grad_output, *inputs)
+    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
     expected = _ref_h_post_bda_backward(
         _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
     )
