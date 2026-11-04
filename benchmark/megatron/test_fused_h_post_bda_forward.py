@@ -66,7 +66,9 @@ def _select_baseline():
     try:
         from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_fwd
 
-        inputs = next(forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device))
+        inputs = next(
+            forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
+        )
         with base.torch_device_fn.device(inputs[0].device):
             _triton_h_post_bda_fwd(*inputs)
             base.torch_device_fn.synchronize()
