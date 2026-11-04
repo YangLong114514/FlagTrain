@@ -12,16 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused mHC H_post BDA forward and backward operators.
+"""Fused mHC H_post BDA backward operator.
 
-Ported from Megatron-LM's ``fused_mhc_kernels.py`` at:
-https://github.com/NVIDIA/Megatron-LM/blob/2052769557dcf7045c4091d1996f0bc59afeb80e/megatron/core/fusions/fused_mhc_kernels.py
-
-The forward computes ``H_res.T @ residual + H_post * (x + bias)``. The
-backward returns gradients in Megatron's order: ``h_res``, original residual,
-``h_post``, ``x``, and optional bias.
+Ported from Megatron-LM's ``fused_mhc_kernels.py``. The backward returns
+gradients in Megatron's order: ``h_res``, original residual, ``h_post``, ``x``,
+and optional bias.
 """
 
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import Optional, Tuple
 
@@ -35,12 +33,13 @@ from flag_train.runtime import torch_device_fn
 from flag_train.utils import libentry
 from flag_train.utils import triton_lang_extension as tle
 
+logger = logging.getLogger(__name__)
+
 
 @contextmanager
 def _disable_aabs():
     # The flagtree Triton fork's AABS adjusts autotune configs in place, so one
-    # tiny-C autotune run (e.g. C=1) permanently cripples BLOCK_C for every
-    # later shape in the process. Disable it while launching these kernels.
+    # tiny-C autotune run permanently cripples BLOCK_C for every later shape.
     autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
     if autotuning is None or not hasattr(autotuning, "adjust_block_size"):
         yield
@@ -63,13 +62,7 @@ def _hpb_configs():
 
 
 def _hpb_autotune(**autotune_kwargs):
-    """triton.autotune that tolerates configs the backend driver cannot launch.
-
-    The MACA driver rejects kernels whose per-thread private memory exceeds its
-    limit with a plain RuntimeError ("memory size or pointer value too large to
-    fit in 32 bit"), which stock autotune does not catch — one bad config would
-    abort the whole tuning run. Treat such configs as infinitely slow instead.
-    """
+    """Autotune while treating configs rejected by the driver as infinitely slow."""
 
     def decorator(fn):
         tuner = triton.autotune(**autotune_kwargs)(fn)
@@ -133,118 +126,6 @@ def _validate_inputs(h_res, original_residual, h_post, x, bias):
     if n == 0 or n != triton.next_power_of_2(n):
         raise ValueError("n must be a positive power of two")
     return s, b, n, channels
-
-
-@libentry()
-@_hpb_autotune(
-    configs=_hpb_configs(),
-    key=["C", "N", "REUSE_INPUT"],
-    prune_configs_by={"early_config_prune": _prune_hpb_configs},
-)
-@triton.jit
-def _triton_hpb_fwd_kernel(
-    hr_ptr,
-    orig_ptr,
-    hp_ptr,
-    x_ptr,
-    bias_ptr,
-    out_ptr,
-    sb,
-    C: tl.constexpr,
-    N: tl.constexpr,
-    stride_hr_s,
-    stride_hr_i,
-    stride_hr_j,
-    stride_orig_s,
-    stride_orig_n,
-    stride_orig_c,
-    stride_out_s,
-    stride_out_n,
-    stride_out_c,
-    HAS_BIAS: tl.constexpr,
-    REUSE_INPUT: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    BLOCK_S: tl.constexpr,
-):
-    pid_s = tle.program_id(0)
-    pid_c = tle.program_id(1)
-    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
-    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    mask_s = offs_s < sb
-    mask_c = offs_c < C
-    mask_2d = mask_s[:, None] & mask_c[None, :]
-
-    x_tile = tl.load(
-        x_ptr + offs_s[:, None] * C + offs_c[None, :], mask=mask_2d, other=0.0
-    ).to(tl.float32)
-    if HAS_BIAS:
-        bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
-        x_tile += bias_tile[None, :]
-
-    if REUSE_INPUT == 1:
-        offs_n = tl.arange(0, N)
-        hp = tl.load(
-            hp_ptr + offs_s[None, :] * N + offs_n[:, None],
-            mask=mask_s[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        outputs = hp[:, :, None] * x_tile[None, :, :]
-        for j in tl.static_range(N):
-            orig_j = tl.load(
-                orig_ptr
-                + offs_s[:, None] * stride_orig_s
-                + j * stride_orig_n
-                + offs_c[None, :],
-                mask=mask_2d,
-                other=0.0,
-            ).to(tl.float32)
-            hr = tl.load(
-                hr_ptr
-                + offs_s[None, :] * stride_hr_s
-                + j * stride_hr_i
-                + offs_n[:, None] * stride_hr_j,
-                mask=mask_s[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            outputs += hr[:, :, None] * orig_j[None, :, :]
-        tl.store(
-            out_ptr
-            + offs_s[None, :, None] * stride_out_s
-            + offs_n[:, None, None] * stride_out_n
-            + offs_c[None, None, :],
-            outputs.to(out_ptr.dtype.element_ty),
-            mask=mask_2d[None, :, :],
-        )
-    else:
-        for i in tl.static_range(N):
-            hp_i = tl.load(hp_ptr + offs_s * N + i, mask=mask_s, other=0.0).to(
-                tl.float32
-            )
-            out_i = hp_i[:, None] * x_tile
-            for j in tl.static_range(N):
-                hr_ji = tl.load(
-                    hr_ptr + offs_s * stride_hr_s + j * stride_hr_i + i * stride_hr_j,
-                    mask=mask_s,
-                    other=0.0,
-                ).to(tl.float32)
-                orig_j = tl.load(
-                    orig_ptr
-                    + offs_s[:, None] * stride_orig_s
-                    + j * stride_orig_n
-                    + offs_c[None, :],
-                    mask=mask_2d,
-                    other=0.0,
-                ).to(tl.float32)
-                out_i += hr_ji[:, None] * orig_j
-
-            tl.store(
-                out_ptr
-                + offs_s[:, None] * stride_out_s
-                + i * stride_out_n
-                + offs_c[None, :],
-                out_i.to(out_ptr.dtype.element_ty),
-                mask=mask_2d,
-            )
 
 
 @libentry()
@@ -727,92 +608,6 @@ def _triton_hpb_bwd_small_kernel(
             )
 
 
-def fused_h_post_bda_forward(
-    h_res: Tensor,
-    original_residual: Tensor,
-    h_post: Tensor,
-    x: Tensor,
-    bias: Optional[Tensor] = None,
-) -> Tensor:
-    """Compute ``H_res.T @ original_residual + H_post * (x + bias)``."""
-    s, b, n, channels = _validate_inputs(h_res, original_residual, h_post, x, bias)
-    sb = s * b
-    out = torch.empty(sb, n, channels, dtype=h_res.dtype, device=h_res.device)
-    hr_flat = h_res.contiguous().view(sb, n, n)
-    orig_flat = original_residual.contiguous().view(sb, n, channels)
-    hp_flat = h_post.contiguous().view(sb, n)
-    x_flat = x.contiguous().view(sb, channels)
-
-    grid = lambda meta: (
-        triton.cdiv(sb, meta["BLOCK_S"]),
-        triton.cdiv(channels, meta["BLOCK_C"]),
-    )
-    small_nvidia = (
-        runtime_device.vendor_name == "nvidia" and sb <= 8 and channels <= 1024
-    )
-    reuse_input = (
-        runtime_device.vendor_name == "nvidia"
-        and not small_nvidia
-        and (n >= 8 or sb > 512 or h_res.dtype == torch.float32)
-    )
-    if small_nvidia:
-        fwd_kernel = _triton_hpb_fwd_kernel.fn.fn
-        fixed_config = {
-            "BLOCK_C": 64 if channels <= 256 else 128,
-            "BLOCK_S": 2 if n <= 2 else 1,
-            "num_warps": 4,
-        }
-    elif (
-        runtime_device.vendor_name == "nvidia"
-        and n == 4
-        and sb == 512
-        and channels == 4096
-        and h_res.dtype in (torch.bfloat16, torch.float16)
-    ):
-        fwd_kernel = _triton_hpb_fwd_kernel.fn.fn
-        fixed_config = {
-            "BLOCK_C": 256 if h_res.dtype == torch.bfloat16 else 512,
-            "BLOCK_S": 2,
-            "num_warps": 2 if h_res.dtype == torch.bfloat16 else 4,
-        }
-    elif runtime_device.vendor_name == "nvidia":
-        fwd_kernel = _triton_hpb_fwd_kernel.fn
-        fixed_config = {}
-    else:
-        fwd_kernel = _triton_hpb_fwd_kernel
-        fixed_config = {}
-    device_context = (
-        nullcontext()
-        if runtime_device.vendor_name == "nvidia"
-        else torch_device_fn.device(h_res.device)
-    )
-    with _disable_aabs(), device_context:
-        fwd_kernel[grid](
-            hr_flat,
-            orig_flat,
-            hp_flat,
-            x_flat,
-            bias.contiguous() if bias is not None else x_flat,
-            out,
-            sb,
-            channels,
-            n,
-            hr_flat.stride(0),
-            hr_flat.stride(1),
-            hr_flat.stride(2),
-            orig_flat.stride(0),
-            orig_flat.stride(1),
-            orig_flat.stride(2),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            HAS_BIAS=(bias is not None),
-            REUSE_INPUT=reuse_input,
-            **fixed_config,
-        )
-    return out.view(s, b, n, channels)
-
-
 def fused_h_post_bda_backward(
     grad_output: Tensor,
     h_res: Tensor,
@@ -821,7 +616,8 @@ def fused_h_post_bda_backward(
     x: Tensor,
     bias: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
-    """Return gradients for the five inputs of :func:`fused_h_post_bda_forward`."""
+    """Return gradients for the five inputs of the H_post BDA forward operator."""
+    logger.debug("TRAIN FUSED_H_POST_BDA_BACKWARD")
     s, b, n, channels = _validate_inputs(h_res, original_residual, h_post, x, bias)
     if tuple(grad_output.shape) != (s, b, n, channels):
         raise ValueError("grad_output must have the same shape as original_residual")
@@ -918,8 +714,7 @@ def fused_h_post_bda_backward(
             if runtime_device.vendor_name == "nvidia" and not small_nvidia:
                 split_c = 4
             elif runtime_device.vendor_name != "nvidia":
-                # Generic backends: the g_hp_hr reduction parallelizes only over
-                # sb, which starves the device for tall-C shapes; split C wider.
+                # Generic backends need additional C parallelism for tall-C shapes.
                 split_c = 16
         if split_c:
             split_config = {"BLOCK_C": 256, "BLOCK_S": 2, "num_warps": 2}

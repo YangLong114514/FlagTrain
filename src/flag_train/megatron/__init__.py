@@ -5,7 +5,8 @@ from .fast_gelu import fast_gelu
 from .fused_gated_norm import fused_gated_norm
 from .fused_h_aggregate_backward import fused_h_aggregate_backward
 from .fused_h_aggregate_forward import fused_h_aggregate_forward
-from .fused_h_post_bda import fused_h_post_bda_backward, fused_h_post_bda_forward
+from .fused_h_post_bda_backward import fused_h_post_bda_backward
+from .fused_h_post_bda_forward import fused_h_post_bda_forward
 from .fused_indices_to_multihot import fused_indices_to_multihot
 from .fused_pad_routing_map import fused_pad_routing_map
 from .fused_proj_rms_backward import fused_proj_rms_backward

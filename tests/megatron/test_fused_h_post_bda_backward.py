@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for fused mHC H_post BDA forward and backward."""
+"""Correctness tests for fused mHC H_post BDA backward."""
 
 import contextlib
 
@@ -46,8 +46,6 @@ _GRADIENT_NAMES = ("h_res", "original_residual", "h_post", "x", "bias")
 
 @contextlib.contextmanager
 def _strict_fp32_matmul():
-    # Some backends default fp32 matmul to TF32, which would make the bmm-based
-    # reference less accurate than the fp32 kernel it is checking against.
     prev = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
@@ -56,12 +54,12 @@ def _strict_fp32_matmul():
         torch.backends.cuda.matmul.allow_tf32 = prev
 
 
-def _tolerances(dtype, backward=False):
+def _tolerances(dtype):
     if dtype == torch.bfloat16:
-        return (5e-2, 5e-2) if backward else (2e-2, 2e-2)
+        return 5e-2, 5e-2
     if dtype == torch.float16:
-        return (5e-3, 5e-3) if backward else (1e-3, 1e-3)
-    return (1e-5, 1e-5)
+        return 5e-3, 5e-3
+    return 1e-5, 1e-5
 
 
 def _rand(shape, dtype):
@@ -109,27 +107,21 @@ def _ref_h_post_bda_backward(
     inputs = (
         (h_res, original_residual, h_post, x)
         if bias is None
-        else (
-            h_res,
-            original_residual,
-            h_post,
-            x,
-            bias,
-        )
+        else (h_res, original_residual, h_post, x, bias)
     )
     with _strict_fp32_matmul():
         gradients = torch.autograd.grad(output, inputs, grad_output)
     return gradients if bias is not None else (*gradients, None)
 
 
-def _assert_close(actual, expected, dtype, name, backward=False):
-    atol, rtol = _tolerances(dtype, backward)
+def _assert_close(actual, expected, dtype, name):
+    atol, rtol = _tolerances(dtype)
     torch.testing.assert_close(
         utils.to_reference(actual),
         expected,
         atol=atol,
         rtol=rtol,
-        msg=f"{'backward' if backward else 'forward'} mismatch on {name}",
+        msg=f"backward mismatch on {name}",
     )
 
 
@@ -145,28 +137,6 @@ def _non_contiguous(tensor):
     result.copy_(tensor)
     assert not result.is_contiguous()
     return result
-
-
-@pytest.mark.fused_h_post_bda_forward
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype,s,b,n,channels", _DTYPE_SHAPE_CASES)
-def test_forward_matches_torch_reference(dtype, s, b, n, channels, with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _ref_h_post_bda(*(_reference_copy(tensor) for tensor in inputs))
-    _assert_close(actual, expected, dtype, "output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_forward_medium_shapes_match_torch_reference(dtype, with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(64, 8, 4, 4099, dtype, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(_ref_h_post_bda(*inputs))
-    _assert_close(actual, expected, dtype, "medium-shape output")
 
 
 @pytest.mark.fused_h_post_bda_backward
@@ -187,7 +157,7 @@ def test_backward_matches_torch_autograd(dtype, s, b, n, channels, with_bias):
             assert actual_grad is None
             assert expected_grad is None
         else:
-            _assert_close(actual_grad, expected_grad, dtype, name, backward=True)
+            _assert_close(actual_grad, expected_grad, dtype, name)
 
 
 @pytest.mark.fused_h_post_bda_backward
@@ -204,53 +174,7 @@ def test_backward_split_c_matches_torch_autograd(dtype, with_bias):
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, dtype, name, backward=True)
-
-
-@pytest.mark.fused_h_post_bda_forward
-def test_forward_uses_h_res_transpose():
-    h_res = torch.tensor(
-        [[[[1.0, 2.0], [3.0, 4.0]]]], dtype=torch.float32, device=flag_train.device
-    )
-    original_residual = torch.tensor(
-        [[[[10.0, 100.0], [1.0, 2.0]]]], dtype=torch.float32, device=flag_train.device
-    )
-    h_post = torch.zeros(1, 1, 2, dtype=torch.float32, device=flag_train.device)
-    x = torch.zeros(1, 1, 2, dtype=torch.float32, device=flag_train.device)
-    expected = torch.tensor(
-        [[[[13.0, 106.0], [24.0, 208.0]]]],
-        dtype=torch.float32,
-        device=flag_train.device,
-    )
-
-    actual = flag_train.megatron.fused_h_post_bda_forward(
-        h_res, original_residual, h_post, x
-    )
-    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
-
-
-@pytest.mark.fused_h_post_bda_forward
-def test_forward_accepts_non_contiguous_inputs():
-    torch.manual_seed(2026)
-    inputs = tuple(
-        _non_contiguous(tensor)
-        for tensor in _make_inputs(2, 1, 4, 130, torch.bfloat16, with_bias=True)
-    )
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _ref_h_post_bda(*(_reference_copy(tensor) for tensor in inputs))
-    _assert_close(actual, expected, torch.bfloat16, "non-contiguous output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-def test_forward_medium_shape_accepts_non_contiguous_inputs():
-    torch.manual_seed(2026)
-    inputs = tuple(
-        _non_contiguous(tensor)
-        for tensor in _make_inputs(64, 8, 4, 4096, torch.bfloat16, with_bias=True)
-    )
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(_ref_h_post_bda(*inputs))
-    _assert_close(actual, expected, torch.bfloat16, "medium non-contiguous output")
+        _assert_close(actual_grad, expected_grad, dtype, name)
 
 
 @pytest.mark.fused_h_post_bda_backward
@@ -268,9 +192,5 @@ def test_backward_accepts_non_contiguous_inputs():
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
         _assert_close(
-            actual_grad,
-            expected_grad,
-            torch.bfloat16,
-            f"non-contiguous {name}",
-            backward=True,
+            actual_grad, expected_grad, torch.bfloat16, f"non-contiguous {name}"
         )
