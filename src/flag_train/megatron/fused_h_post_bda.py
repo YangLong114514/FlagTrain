@@ -914,12 +914,7 @@ def fused_h_post_bda_backward(
             fixed_config = {}
             device_context = torch_device_fn.device(h_res.device)
         split_c = 0
-        if (
-            not native_fp32_reduction
-            and n == 8
-            and sb <= 128
-            and channels >= 4096
-        ):
+        if not native_fp32_reduction and n == 8 and sb <= 128 and channels >= 4096:
             if runtime_device.vendor_name == "nvidia" and not small_nvidia:
                 split_c = 4
             elif runtime_device.vendor_name != "nvidia":
