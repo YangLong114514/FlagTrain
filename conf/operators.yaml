@@ -134,6 +134,36 @@ ops:
   source: megatron.core.fusions.fused_mhc_kernels
   stages:
   - beta: '0.0.0'
+- id: fused_h_post_bda_backward
+  description: Gradients of fused_h_post_bda_forward with respect to all inputs and optional bias.
+  for:
+  - fused_h_post_bda_backward
+  labels:
+  - megatron
+  - hyper-connection
+  - linear
+  from:
+  - megatron
+  kind:
+  - Linear
+  source: megatron.core.fusions.fused_mhc_kernels
+  stages:
+  - beta: '0.0.0'
+- id: fused_h_post_bda_forward
+  description: 'Fused mHC H_post BDA: H_res.T @ original_residual + h_post * (x + bias).'
+  for:
+  - fused_h_post_bda_forward
+  labels:
+  - megatron
+  - hyper-connection
+  - linear
+  from:
+  - megatron
+  kind:
+  - Linear
+  source: megatron.core.fusions.fused_mhc_kernels
+  stages:
+  - beta: '0.0.0'
 - id: fused_indices_to_multihot
   description: Converts fused expert indices and routing probabilities into a multi-hot mask.
   for:
