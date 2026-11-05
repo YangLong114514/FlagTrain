@@ -155,7 +155,7 @@ def test_forward_uses_h_res_transpose():
     actual = flag_train.megatron.fused_h_post_bda_forward(
         h_res, original_residual, h_post, x
     )
-    utils.train_assert_equal(actual, expected)
+    utils.train_assert_equal(utils.to_reference(actual), utils.to_reference(expected))
 
 
 @pytest.mark.fused_h_post_bda_forward
