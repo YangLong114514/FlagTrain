@@ -115,14 +115,11 @@ def _ref_h_post_bda_backward(
 
 
 def _assert_close(actual, expected, dtype, name):
-    atol, rtol = _tolerances(dtype)
-    torch.testing.assert_close(
-        utils.to_reference(actual),
-        expected,
-        atol=atol,
-        rtol=rtol,
-        msg=f"backward mismatch on {name}",
-    )
+    if actual is None or expected is None:
+        assert actual is None and expected is None
+        return
+    atol, _ = _tolerances(dtype)
+    utils.train_assert_close(utils.to_reference(actual), expected, dtype, atol=atol)
 
 
 def _non_contiguous(tensor):

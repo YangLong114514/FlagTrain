@@ -95,14 +95,8 @@ def _ref_h_post_bda(h_res, original_residual, h_post, x, bias=None):
 
 
 def _assert_close(actual, expected, dtype, name):
-    atol, rtol = _tolerances(dtype)
-    torch.testing.assert_close(
-        utils.to_reference(actual),
-        expected,
-        atol=atol,
-        rtol=rtol,
-        msg=f"forward mismatch on {name}",
-    )
+    atol, _ = _tolerances(dtype)
+    utils.train_assert_close(utils.to_reference(actual), expected, dtype, atol=atol)
 
 
 def _non_contiguous(tensor):
@@ -158,7 +152,7 @@ def test_forward_uses_h_res_transpose():
     actual = flag_train.megatron.fused_h_post_bda_forward(
         h_res, original_residual, h_post, x
     )
-    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+    utils.train_assert_equal(actual, expected)
 
 
 @pytest.mark.fused_h_post_bda_forward
