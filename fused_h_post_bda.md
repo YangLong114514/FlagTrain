@@ -882,6 +882,54 @@ C=1/65/130 也有约 6%–16% 收益。因此最终 `N<=16` 的 forward 全部�
 forward **0.714x**、backward **0.726x**、整体 **0.720x**。整体仍未达到 1.0，但 forward
 较大形状已有多点超过 1.0，完整回归耗时进一步下降。
 
+### 6.27 固定配置预绑定直启与 backward dot 门槛扩展
+
+裸 JIT 的参数绑定和分发在小形状上占主要时间。单 kernel 对照中，原始启动的主机/Event 时间约为
+0.092/0.093 ms，固定配置预编译直启降为 0.052/0.053 ms。曾尝试直接使用 `libentry` 包装，
+但首次回归在后续 FP32 编译用例长时间停滞，未进入性能阶段，因此没有采用。最终实现使用
+Ascend 本地的 `_launch_fixed`：首次调用通过 `warmup` 取得编译 kernel，后续直接调用编译后的
+runner，不恢复 autotune。缓存 key 包含 kernel、设备、grid、warps、constexpr、输入 dtype、
+每个指针的 16 字节对齐，以及普通整数的 `1/16` 特化，避免不同输入对齐或 stride 错用 kernel。
+forward/A/B dot、小 backward 和 bias kernel 均接入该路径；通用标量回退保持不变。
+
+`bias.contiguous()` 同时移到所有启动循环外，每次公开 API 调用至多执行一次。82 项正确性（包括
+非连续输入）全部通过，完整 96 点性能 `2 passed`。算术平均 speedup 为 forward **0.741x**、
+backward **0.800x**、整体 **0.770x**，高于上一版的 0.714x/0.726x/0.720x。小 forward 通常从
+0.22–0.25 ms 降为 0.19–0.21 ms；FP32 最大 forward 减少约 2 ms 启动开销。小形状完整 API
+仍明显慢于单独 kernel，输入校验、输出分配、view/contiguous 和设备上下文是剩余固定成本。
+
+独立扫描通用标量 A、dot A、通用标量 B、dot B 后，将 backward dot 门槛从 `C>=4096` 扩到
+`C>=512、N<=16`，小 backward 融合路径仍优先。BF16/FP32、sb=8/128、N=4/8、C=512/2048
+的 16 组补充正确性全部通过。FP32、sb=128、N=4、C=512 时，A 从约 0.531 ms 降为
+0.088 ms，B 从约 0.119 ms 降为 0.100 ms。个别单项如 FP32、sb=8、N=8、C=512 的 A
+约慢 5%，但 B 约快 22%，A+B 合计仍有收益，因此没有继续增加 A/B 分离门槛。该扩展主要改善
+非标准 C=512/1024/2048 形状；标准 96 点中的对应小 backward 已由融合 kernel 接管。
+
+B 的 1024 通道块仍优于 512；warps/stages 差异约 0.003 ms，与主机波动同量级，未修改。
+最大 BF16 形状将每批 4096 tile 改为 8192/16384 后，主机入队略降，但 forward/backward 的
+Event 变化不足 0.4%，因此保留 4096 分批，不采用更大 grid。
+
+### 6.28 Backward B padding hint 和 bias 归约块
+
+`dot_pad_only_k` 必须按方向验证，不能统一加到所有 dot。N=8、sb=128、C=7168 的 BF16
+独立 B 对照两轮约快 6%–12%；最大 BF16 `(8192,4,4,7168)` 完整 backward 从约 48.67 ms
+降为 44.89 ms，约快 7.8%。相反，N=4、sb=512、C=4096 的 forward 从约 0.245 ms 退化到
+0.414 ms。因此只给 B 的 `orig/go` 输入调用 Ascend `compile_hint(...,
+"dot_pad_only_k")`，forward 和 A 不添加该 hint。
+
+大 sb bias 归约保持 16 路 FP32 partial + merge，并将 `BLOCK_S` 从 8 调为 16。最大 sb 的
+BF16 bias 从约 0.429 ms 降为 0.375 ms，FP32 从约 0.784 ms 降为 0.765 ms。SPLIT=32 没有
+收益；SPLIT=64 的 merge tile UB 溢出；BLOCK_S=32 在 BF16 下更慢，在 FP32 下也会 UB
+溢出，均未采用。归约输入仍是已经转换为输入 dtype 的 `g_x`，没有改成原生 `sum` 或改变
+输入舍入路径。
+
+B-only hint 和 BLOCK_S=16 的最终版本 82 项正确性全部通过，完整 96 点性能 `2 passed`，
+耗时 222.19 秒；算术平均 speedup 为 forward **0.774x**、backward **0.801x**、整体
+**0.787x**。Backward 均值与仅预绑定版本的 0.800x 基本持平，收益主要体现在部分大形状，
+不能声称所有形状都有稳定提升。曾根据单轮逐点对比把 hint 限制为 `C>=7168`，但该版本完整
+回归只有 forward 0.729x、backward 0.775x、整体 0.752x，因此撤回条件并恢复 B-only hint。
+不同轮次波动较大，配置选择以完整回归和可重复的大形状定向结果共同判断，整体仍未达到 1.0。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
@@ -1157,7 +1205,7 @@ Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward �
 | 文件 | 作用 |
 | --- | --- |
 | `src/flag_train/megatron/fused_h_post_bda.py` | 通用 Triton Kernel、输入校验和 forward/backward 包装 |
-| `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda.py` | 昇腾固定配置、大 grid 调整及原生 FP32 长归约 |
+| `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda.py` | 昇腾纯 Triton dot、固定配置预绑定直启、大 grid 分批及 FP32 bias 归约 |
 | `src/flag_train/megatron/__init__.py` | 算子导出和 `SpecOpRegistrar` 注册 |
 | `tests/megatron/test_fused_h_post_bda.py` | 82 项正确性测试 |
 | `benchmark/megatron/test_fused_h_post_bda.py` | Baseline 选择、输入生成和性能测试 |

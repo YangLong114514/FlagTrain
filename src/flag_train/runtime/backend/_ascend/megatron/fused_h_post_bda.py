@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
 from torch import Tensor
 
 from flag_train.runtime import torch_device_fn
@@ -31,12 +32,39 @@ _DOT_BLOCK_C = 2048
 _DOT_B_BLOCK_C = 1024
 _DOT_LAUNCH_TILES = 4096
 _BIAS_SPLIT = 16
-_BIAS_BLOCK_S = 8
+_BIAS_BLOCK_S = 16
+_FIXED_LAUNCH_CACHE = {}
 
 
 @lru_cache(maxsize=1)
 def _generic():
     return importlib.import_module("flag_train.megatron.fused_h_post_bda")
+
+
+def _launch_fixed(kernel, grid, *args, num_warps):
+    specialization = []
+    for param, arg in zip(kernel.params, args):
+        if param.is_constexpr:
+            specialization.append(arg)
+        elif hasattr(arg, "data_ptr"):
+            specialization.append((arg.dtype, arg.data_ptr() % 16))
+        elif isinstance(arg, int):
+            specialization.append((arg == 1, arg % 16 == 0))
+        else:
+            specialization.append((type(arg), arg))
+    key = (
+        kernel.cache_key,
+        torch_device_fn.current_device(),
+        grid,
+        num_warps,
+        tuple(specialization),
+    )
+    runner = _FIXED_LAUNCH_CACHE.get(key)
+    if runner is None:
+        compiled = kernel.warmup(*args, grid=grid, num_warps=num_warps)
+        runner = compiled[(grid[0], grid[1] if len(grid) > 1 else 1, 1)]
+        _FIXED_LAUNCH_CACHE[key] = runner
+    runner(*args)
 
 
 @triton.jit
@@ -177,6 +205,8 @@ def _triton_hpb_bwd_b_dot_kernel(
                 x_tile += tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(
                     tl.float32
                 )
+            al.compile_hint(orig, "dot_pad_only_k")
+            al.compile_hint(go, "dot_pad_only_k")
             g_hr += tl.dot(orig, tl.trans(go), input_precision="ieee")
             g_hp += tl.sum(go * x_tile[None, :], axis=1)
         tl.store(
@@ -265,7 +295,7 @@ def _triton_hpb_bias_merge_kernel(
 
 
 def _dot_eligible(channels, n):
-    return channels >= 4096 and n <= 16
+    return channels >= 512 and n <= 16
 
 
 def _dot_grid(sb, channels):
@@ -294,13 +324,15 @@ def _bias_gradient(g_x, sb, channels, bias):
     g_bias = torch.empty(channels, dtype=bias.dtype, device=bias.device)
     if sb <= 512:
         with torch_device_fn.device(g_x.device):
-            _triton_hpb_bias_single_kernel[(triton.cdiv(channels, 512),)](
+            _launch_fixed(
+                _triton_hpb_bias_single_kernel,
+                (triton.cdiv(channels, 512),),
                 g_x,
                 g_bias,
                 sb,
-                C=channels,
-                BLOCK_C=512,
-                BLOCK_S=_BIAS_BLOCK_S,
+                channels,
+                512,
+                _BIAS_BLOCK_S,
                 num_warps=4,
             )
         return g_bias
@@ -308,22 +340,26 @@ def _bias_gradient(g_x, sb, channels, bias):
         _BIAS_SPLIT, channels, dtype=torch.float32, device=g_x.device
     )
     with torch_device_fn.device(g_x.device):
-        _triton_hpb_bias_partial_kernel[(triton.cdiv(channels, 512), _BIAS_SPLIT)](
+        _launch_fixed(
+            _triton_hpb_bias_partial_kernel,
+            (triton.cdiv(channels, 512), _BIAS_SPLIT),
             g_x,
             partial,
             sb,
-            C=channels,
-            BLOCK_C=512,
-            BLOCK_S=_BIAS_BLOCK_S,
-            SPLIT=_BIAS_SPLIT,
+            channels,
+            512,
+            _BIAS_BLOCK_S,
+            _BIAS_SPLIT,
             num_warps=4,
         )
-        _triton_hpb_bias_merge_kernel[(triton.cdiv(channels, 512),)](
+        _launch_fixed(
+            _triton_hpb_bias_merge_kernel,
+            (triton.cdiv(channels, 512),),
             partial,
             g_bias,
-            C=channels,
-            BLOCK_C=512,
-            SPLIT=_BIAS_SPLIT,
+            channels,
+            512,
+            _BIAS_SPLIT,
             num_warps=4,
         )
     return g_bias
@@ -346,6 +382,7 @@ def fused_h_post_bda_forward(
     orig_flat = original_residual.contiguous().view(sb, n, channels)
     hp_flat = h_post.contiguous().view(sb, n)
     x_flat = x.contiguous().view(sb, channels)
+    bias_flat = bias.contiguous() if bias is not None else x_flat
 
     max_block_c = 1024 if h_res.dtype == torch.float32 else _DOT_BLOCK_C
     dot_block_c = min(max_block_c, max(64, triton.next_power_of_2(channels)))
@@ -355,20 +392,22 @@ def fused_h_post_bda_forward(
         with torch_device_fn.device(h_res.device):
             for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
                 grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
-                _triton_hpb_fwd_dot_kernel[grid](
+                _launch_fixed(
+                    _triton_hpb_fwd_dot_kernel,
+                    grid,
                     hr_flat,
                     orig_flat,
                     hp_flat,
                     x_flat,
-                    bias.contiguous() if bias is not None else x_flat,
+                    bias_flat,
                     out,
                     tile_offset,
-                    C=channels,
-                    N=n,
-                    NP=max(4, n),
-                    HAS_BIAS=(bias is not None),
-                    BLOCK_C=dot_block_c,
-                    C_BLOCKS=c_blocks,
+                    channels,
+                    n,
+                    max(4, n),
+                    bias is not None,
+                    dot_block_c,
+                    c_blocks,
                     num_warps=4,
                 )
         return out.view(s, b, n, channels)
@@ -380,7 +419,7 @@ def fused_h_post_bda_forward(
             orig_flat,
             hp_flat,
             x_flat,
-            bias.contiguous() if bias is not None else x_flat,
+            bias_flat,
             out,
             sb,
             channels,
@@ -435,6 +474,7 @@ def fused_h_post_bda_backward(
     orig_flat = original_residual.contiguous().view(sb, n, channels)
     hp_flat = h_post.contiguous().view(sb, n)
     x_flat = x.contiguous().view(sb, channels)
+    bias_flat = bias.contiguous() if bias is not None else x_flat
     dot_block_c = 1024 if h_res.dtype == torch.float32 else _DOT_BLOCK_C
     c_blocks = triton.cdiv(channels, dot_block_c)
     num_tiles = sb * c_blocks
@@ -448,13 +488,15 @@ def fused_h_post_bda_backward(
             "num_warps": 4,
         }
         with generic._disable_aabs(), torch_device_fn.device(h_res.device):
-            generic._triton_hpb_bwd_small_kernel[(triton.cdiv(sb, config["BLOCK_S"]),)](
+            _launch_fixed(
+                generic._triton_hpb_bwd_small_kernel,
+                (triton.cdiv(sb, config["BLOCK_S"]),),
                 go_flat,
                 hr_flat,
                 orig_flat,
                 hp_flat,
                 x_flat,
-                bias.contiguous() if bias is not None else x_flat,
+                bias_flat,
                 g_hr,
                 g_res,
                 g_hp,
@@ -471,40 +513,46 @@ def fused_h_post_bda_backward(
                 orig_flat.stride(0),
                 orig_flat.stride(1),
                 orig_flat.stride(2),
-                HAS_BIAS=(bias is not None),
-                **config,
+                bias is not None,
+                config["BLOCK_C"],
+                config["BLOCK_S"],
+                num_warps=config["num_warps"],
             )
     elif dot_eligible:
         with torch_device_fn.device(h_res.device):
             for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
                 grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
-                _triton_hpb_bwd_a_dot_kernel[grid](
+                _launch_fixed(
+                    _triton_hpb_bwd_a_dot_kernel,
+                    grid,
                     go_flat,
                     hr_flat,
                     hp_flat,
                     g_res,
                     g_x,
                     tile_offset,
-                    C=channels,
-                    N=n,
-                    NP=16,
-                    BLOCK_C=dot_block_c,
-                    C_BLOCKS=c_blocks,
+                    channels,
+                    n,
+                    16,
+                    dot_block_c,
+                    c_blocks,
                     num_warps=4,
                 )
-            _triton_hpb_bwd_b_dot_kernel[(min(sb, _MAX_CORE_DIM),)](
+            _launch_fixed(
+                _triton_hpb_bwd_b_dot_kernel,
+                (min(sb, _MAX_CORE_DIM),),
                 go_flat,
                 orig_flat,
                 x_flat,
-                bias.contiguous() if bias is not None else x_flat,
+                bias_flat,
                 g_hr,
                 g_hp,
                 sb,
-                C=channels,
-                N=n,
-                NP=16,
-                HAS_BIAS=(bias is not None),
-                BLOCK_C=_DOT_B_BLOCK_C,
+                channels,
+                n,
+                16,
+                bias is not None,
+                _DOT_B_BLOCK_C,
                 num_warps=8,
             )
     else:
@@ -535,7 +583,7 @@ def fused_h_post_bda_backward(
                 go_flat,
                 orig_flat,
                 x_flat,
-                bias.contiguous() if bias is not None else x_flat,
+                bias_flat,
                 g_hr,
                 g_hp,
                 sb,
