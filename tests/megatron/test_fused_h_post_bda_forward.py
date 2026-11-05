@@ -54,6 +54,9 @@ def _strict_fp32_matmul():
 
 
 def _tolerances(dtype):
+    # Megatron's official BF16 forward test uses atol=rtol=2e-2. FP16 and FP32
+    # are FlagTrain extensions. FP32 accumulation still leaves output rounding
+    # and reduction-order differences from the PyTorch reference.
     if dtype == torch.bfloat16:
         return 2e-2, 2e-2
     if dtype == torch.float16:

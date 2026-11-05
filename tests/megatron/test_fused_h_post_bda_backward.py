@@ -55,6 +55,10 @@ def _strict_fp32_matmul():
 
 
 def _tolerances(dtype):
+    # Megatron's official BF16 backward test uses atol=rtol=5e-2. FP16 and FP32
+    # are FlagTrain extensions. Long-C reductions and split-C partial merging
+    # use a different accumulation order from Autograd, while FP32 accumulators
+    # do not eliminate rounding when gradients are written in a narrow dtype.
     if dtype == torch.bfloat16:
         return 5e-2, 5e-2
     if dtype == torch.float16:
