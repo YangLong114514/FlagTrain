@@ -930,6 +930,43 @@ B-only hint 和 BLOCK_S=16 的最终版本 82 项正确性全部通过，完整 
 回归只有 forward 0.729x、backward 0.775x、整体 0.752x，因此撤回条件并恢复 B-only hint。
 不同轮次波动较大，配置选择以完整回归和可重复的大形状定向结果共同判断，整体仍未达到 1.0。
 
+### 6.29 扩展行 dot 原型、包装层精简与 B split-C 复验
+
+A 的 `H_res` 增加 `H_post` 行、B 的 `original_residual` 增加 `x` 行在代数上成立，但当前
+Ascend 编译器无法 lowering 这些结构。A 分别尝试了 dot 结果归约抽取、二维 masked store、
+目标指针选择和单一底层存储的规则/不规则偏移，均在 `TritonToLinalgIncubated` 或地址分析
+阶段触发 MLIR 断言。B 的无 bias 原型尝试了通道循环后的 16×16 小归约和 masked store，
+也在同一 lowering 阶段失败。上述原型全部撤回，没有加入额外预处理 kernel、Torch `cat`
+或大临时张量；N=16 和有 bias 的数值路径未改变。
+
+小 forward 的主机分项测量中，输入校验约 0.013 ms，连续输入上的五个扁平 view 约
+0.015–0.017 ms，启动 key 构造约 0.008 ms。dot kernel 只使用指针和显式维度，因此 forward
+和 backward 连续化后不再创建扁平 view，输出直接按最终形状分配。小 backward 融合 kernel
+仍使用通用 kernel，但 stride 直接由 N/C 计算，输入校验完整保留。`(2,4,4,1024)` BF16
+forward 从约 0.179–0.182 ms 降为 0.149 ms；同一进程旧/新 backward 对照中，无 bias 从约
+0.200 ms 降为 0.187 ms，有 bias 从约 0.314 ms 降为 0.295 ms。
+
+新增 `_launch_fixed_tiles` 在每次 API 调用内只准备一次参数特化和设备信息，逐批仅替换
+`tile_offset/grid`；它不跨调用缓存数据地址，也不复用返回张量。32 批提交的主机时间约从
+2.3–2.5 ms 降为 2.0–2.1 ms，但 NPU Event 基本不变，说明大形状仍由设备工作主导，不能把
+主机入队收益直接计为 kernel 加速。
+
+对 `(128,1,8,7168)` 独立试验 B split-C=2/4 + FP32 partial/merge，正确性均通过，但第二次
+启动和 merge 抵消了并行收益。BF16 无 bias 单阶段约 0.073 ms，split2/4 约为 0.107/0.140 ms；
+FP32 无 bias 从约 0.077 ms 增至 0.104/0.142 ms，有 bias 同样退化，因此没有接入公开路径。
+
+新增 C=512 的正式用例还暴露出冷缓存首次编译时 BF16 无 bias B 的 `grad_h_post` 出现 NaN；
+使用已有磁盘缓存或完整顺序回归可能掩盖该问题。原因是 C=512 仍强制 BLOCK_C=1024 的配置，
+全新 Triton 缓存可以稳定复现。B 的 BLOCK_C 现裁剪到不超过 C 的 next-power-of-two，C=512
+不再进行 K 填充，同一冷缓存用例通过。其他标准 C>=1024 配置不变。
+
+最终代码完整正确性为 **95 passed**（27.41 秒），全新缓存的 C=512 单项也通过。完整 96 点
+性能 `2 passed`，耗时 305.05 秒。算术平均 speedup 为 forward **0.871x**、
+backward **0.970x**、整体 **0.920x**；上一版对应值为 0.774x/0.801x/0.787x。FP32
+backward 达到 **1.023x**，但整体仍未达到 1.0。小 backward 无 bias 多数代表点达到
+1.1–1.2x，与旧/新包装定向对照一致；不同轮次的 baseline 和设备状态仍会影响均值，因此
+不能把全部均值变化都归为某一项 kernel 优化的收益。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
@@ -966,9 +1003,10 @@ B-only hint 和 BLOCK_S=16 的最终版本 82 项正确性全部通过，完整 
 - 三种 dtype 的输入复用路径，以及 BF16/FP16 的中等形状原路径。
 
 每组通用形状分别测试 `bias=None` 和有 bias，forward 和 backward 分开执行。Backward
-长通道专项由 BF16 和 FP32 覆盖 `(128,1,8,4096)`，每种 dtype 都测试有无 bias。BF16
-验证四路 C 分片、FP32 partial 和 merge；FP32 验证当前原生 `bmm` 与通道归约路径。Forward
-专项由三种 dtype 覆盖 `(64,8,4,4099)` 及有无 bias，验证中等形状分发和非整块 C。
+长通道专项由 BF16 和 FP32 覆盖 `(128,1,8,4096)`，每种 dtype 都测试有无 bias，检查纯
+Triton B dot 的通道循环和五个梯度。dot 门槛专项由三种 dtype 覆盖 `(128,1,4,512)` 和
+`(128,1,8,2048)` 及有无 bias，固定此前只记录在实验文档中的代表性形状。Forward 专项由
+三种 dtype 覆盖 `(64,8,4,4099)` 及有无 bias，验证中等形状分发和非整块 C。
 
 ### 7.3 特殊测试
 
@@ -976,10 +1014,10 @@ B-only hint 和 BLOCK_S=16 的最终版本 82 项正确性全部通过，完整 
 
 1. **固定 transpose 数值案例**：用固定小矩阵验证 `H_res.T`，防止把矩阵乘方向写反。
 2. **非连续 forward 输入**：分别覆盖小形状和 `(64,8,4,4096)` 中等形状固定配置路径。
-3. **非连续 backward 输入**：包含非连续 bias 和 `grad_output`，逐项检查五个梯度。
+3. **非连续 backward 输入**：覆盖小融合和 `(128,1,8,512)` dot 路径，包含非连续 bias
+   和 `grad_output`，逐项检查五个梯度。
 4. **无 bias 返回约定**：验证 `grad_bias is None`。
-5. **长通道 backward**：覆盖 BF16/FP32、有无 bias，检查五个梯度；分别对应 split-C/merge
-   和 FP32 原生归约路径。
+5. **长通道 backward**：覆盖 BF16/FP32、有无 bias，检查五个梯度和 B 的 C 循环归约。
 
 ### 7.4 容差
 
@@ -994,13 +1032,12 @@ B-only hint 和 BLOCK_S=16 的最终版本 82 项正确性全部通过，完整 
 - 17 组通用 dtype/shape 组合 × 2 种 bias 设置 × 2 个方向 = 68 项。
 - 2 种长通道 backward dtype × 2 种 bias 设置 = 4 项。
 - 3 种 forward dtype × 2 种 bias 设置 = 6 项。
+- 3 种 backward dot dtype × 2 组形状 × 2 种 bias 设置 = 12 项。
 - 固定 transpose 案例 = 1 项。
 - 非连续 forward = 2 项。
-- 非连续 backward = 1 项。
+- 非连续 backward = 2 项。
 
-**合计 82 项正确性测试。** FP32 通用归约修改前的完整套件为 82 passed；最新修改后，本机
-4 项长通道专项和模拟 PPU 的 2 种 bias 情况均通过。完整套件两次在后续编译/执行阶段长时间
-停滞后中止，因此最新提交暂不标记为全量通过。
+**合计 95 项正确性测试。**
 
 运行命令：
 
@@ -1207,6 +1244,6 @@ Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward �
 | `src/flag_train/megatron/fused_h_post_bda.py` | 通用 Triton Kernel、输入校验和 forward/backward 包装 |
 | `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda.py` | 昇腾纯 Triton dot、固定配置预绑定直启、大 grid 分批及 FP32 bias 归约 |
 | `src/flag_train/megatron/__init__.py` | 算子导出和 `SpecOpRegistrar` 注册 |
-| `tests/megatron/test_fused_h_post_bda.py` | 82 项正确性测试 |
+| `tests/megatron/test_fused_h_post_bda.py` | 95 项正确性测试，含 dot 门槛和冷编译敏感配置 |
 | `benchmark/megatron/test_fused_h_post_bda.py` | Baseline 选择、输入生成和性能测试 |
 | `fused_h_post_bda.md` | 本文档 |

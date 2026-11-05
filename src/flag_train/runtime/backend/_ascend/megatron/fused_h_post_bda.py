@@ -67,6 +67,33 @@ def _launch_fixed(kernel, grid, *args, num_warps):
     runner(*args)
 
 
+def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
+    specialization = []
+    for param, arg in zip(kernel.params, args):
+        if param.is_constexpr:
+            specialization.append(arg)
+        elif hasattr(arg, "data_ptr"):
+            specialization.append((arg.dtype, arg.data_ptr() % 16))
+        elif isinstance(arg, int):
+            specialization.append((arg == 1, arg % 16 == 0))
+        else:
+            specialization.append((type(arg), arg))
+    specialization = tuple(specialization)
+    device = torch_device_fn.current_device()
+    for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
+        grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
+        key = (kernel.cache_key, device, grid, num_warps, specialization)
+        runner = _FIXED_LAUNCH_CACHE.get(key)
+        batch_args = (
+            args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
+        )
+        if runner is None:
+            compiled = kernel.warmup(*batch_args, grid=grid, num_warps=num_warps)
+            runner = compiled[(grid[0], 1, 1)]
+            _FIXED_LAUNCH_CACHE[key] = runner
+        runner(*batch_args)
+
+
 @triton.jit
 def _triton_hpb_fwd_dot_kernel(
     hr_ptr,
@@ -377,41 +404,45 @@ def fused_h_post_bda_forward(
         h_res, original_residual, h_post, x, bias
     )
     sb = s * b
-    out = torch.empty(sb, n, channels, dtype=h_res.dtype, device=h_res.device)
+    out = torch.empty(s, b, n, channels, dtype=h_res.dtype, device=h_res.device)
+    if n <= 16:
+        hr_flat = h_res.contiguous()
+        orig_flat = original_residual.contiguous()
+        hp_flat = h_post.contiguous()
+        x_flat = x.contiguous()
+        bias_flat = bias.contiguous() if bias is not None else x_flat
+        max_block_c = 1024 if h_res.dtype == torch.float32 else _DOT_BLOCK_C
+        dot_block_c = min(max_block_c, max(64, triton.next_power_of_2(channels)))
+        c_blocks = triton.cdiv(channels, dot_block_c)
+        num_tiles = sb * c_blocks
+        with torch_device_fn.device(h_res.device):
+            _launch_fixed_tiles(
+                _triton_hpb_fwd_dot_kernel,
+                num_tiles,
+                hr_flat,
+                orig_flat,
+                hp_flat,
+                x_flat,
+                bias_flat,
+                out,
+                0,
+                channels,
+                n,
+                max(4, n),
+                bias is not None,
+                dot_block_c,
+                c_blocks,
+                offset_index=6,
+                num_warps=4,
+            )
+        return out
+
     hr_flat = h_res.contiguous().view(sb, n, n)
     orig_flat = original_residual.contiguous().view(sb, n, channels)
     hp_flat = h_post.contiguous().view(sb, n)
     x_flat = x.contiguous().view(sb, channels)
     bias_flat = bias.contiguous() if bias is not None else x_flat
-
-    max_block_c = 1024 if h_res.dtype == torch.float32 else _DOT_BLOCK_C
-    dot_block_c = min(max_block_c, max(64, triton.next_power_of_2(channels)))
-    c_blocks = triton.cdiv(channels, dot_block_c)
-    num_tiles = sb * c_blocks
-    if n <= 16:
-        with torch_device_fn.device(h_res.device):
-            for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
-                grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
-                _launch_fixed(
-                    _triton_hpb_fwd_dot_kernel,
-                    grid,
-                    hr_flat,
-                    orig_flat,
-                    hp_flat,
-                    x_flat,
-                    bias_flat,
-                    out,
-                    tile_offset,
-                    channels,
-                    n,
-                    max(4, n),
-                    bias is not None,
-                    dot_block_c,
-                    c_blocks,
-                    num_warps=4,
-                )
-        return out.view(s, b, n, channels)
-
+    out_flat = out.view(sb, n, channels)
     grid, config = _grid_a_config(sb, channels)
     with generic._disable_aabs(), torch_device_fn.device(h_res.device):
         generic._triton_hpb_fwd_kernel.fn.fn[grid](
@@ -420,7 +451,7 @@ def fused_h_post_bda_forward(
             hp_flat,
             x_flat,
             bias_flat,
-            out,
+            out_flat,
             sb,
             channels,
             n,
@@ -430,14 +461,14 @@ def fused_h_post_bda_forward(
             orig_flat.stride(0),
             orig_flat.stride(1),
             orig_flat.stride(2),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
+            out_flat.stride(0),
+            out_flat.stride(1),
+            out_flat.stride(2),
             HAS_BIAS=(bias is not None),
             REUSE_INPUT=False,
             **config,
         )
-    return out.view(s, b, n, channels)
+    return out
 
 
 def fused_h_post_bda_backward(
@@ -463,23 +494,25 @@ def fused_h_post_bda_backward(
         )
 
     sb = s * b
-    g_hr = torch.empty(sb, n, n, dtype=h_res.dtype, device=h_res.device)
+    g_hr = torch.empty(s, b, n, n, dtype=h_res.dtype, device=h_res.device)
     g_res = torch.empty(
-        sb, n, channels, dtype=original_residual.dtype, device=h_res.device
+        s, b, n, channels, dtype=original_residual.dtype, device=h_res.device
     )
-    g_hp = torch.empty(sb, n, dtype=h_post.dtype, device=h_res.device)
-    g_x = torch.empty(sb, channels, dtype=x.dtype, device=x.device)
-    go_flat = grad_output.contiguous().view(sb, n, channels)
-    hr_flat = h_res.contiguous().view(sb, n, n)
-    orig_flat = original_residual.contiguous().view(sb, n, channels)
-    hp_flat = h_post.contiguous().view(sb, n)
-    x_flat = x.contiguous().view(sb, channels)
+    g_hp = torch.empty(s, b, n, dtype=h_post.dtype, device=h_res.device)
+    g_x = torch.empty(s, b, channels, dtype=x.dtype, device=x.device)
+    go_flat = grad_output.contiguous()
+    hr_flat = h_res.contiguous()
+    orig_flat = original_residual.contiguous()
+    hp_flat = h_post.contiguous()
+    x_flat = x.contiguous()
     bias_flat = bias.contiguous() if bias is not None else x_flat
     dot_block_c = 1024 if h_res.dtype == torch.float32 else _DOT_BLOCK_C
     c_blocks = triton.cdiv(channels, dot_block_c)
     num_tiles = sb * c_blocks
     dot_eligible = _dot_eligible(channels, n)
     small_fused = sb <= 8 and channels <= 1024 and n <= 4
+    stride_c_s = n * channels
+    stride_hr_s = n * n
 
     if small_fused:
         config = {
@@ -504,15 +537,15 @@ def fused_h_post_bda_backward(
                 sb,
                 channels,
                 n,
-                go_flat.stride(0),
-                go_flat.stride(1),
-                go_flat.stride(2),
-                hr_flat.stride(0),
-                hr_flat.stride(1),
-                hr_flat.stride(2),
-                orig_flat.stride(0),
-                orig_flat.stride(1),
-                orig_flat.stride(2),
+                stride_c_s,
+                channels,
+                1,
+                stride_hr_s,
+                n,
+                1,
+                stride_c_s,
+                channels,
+                1,
                 bias is not None,
                 config["BLOCK_C"],
                 config["BLOCK_S"],
@@ -520,24 +553,23 @@ def fused_h_post_bda_backward(
             )
     elif dot_eligible:
         with torch_device_fn.device(h_res.device):
-            for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
-                grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
-                _launch_fixed(
-                    _triton_hpb_bwd_a_dot_kernel,
-                    grid,
-                    go_flat,
-                    hr_flat,
-                    hp_flat,
-                    g_res,
-                    g_x,
-                    tile_offset,
-                    channels,
-                    n,
-                    16,
-                    dot_block_c,
-                    c_blocks,
-                    num_warps=4,
-                )
+            _launch_fixed_tiles(
+                _triton_hpb_bwd_a_dot_kernel,
+                num_tiles,
+                go_flat,
+                hr_flat,
+                hp_flat,
+                g_res,
+                g_x,
+                0,
+                channels,
+                n,
+                16,
+                dot_block_c,
+                c_blocks,
+                offset_index=5,
+                num_warps=4,
+            )
             _launch_fixed(
                 _triton_hpb_bwd_b_dot_kernel,
                 (min(sb, _MAX_CORE_DIM),),
@@ -552,7 +584,10 @@ def fused_h_post_bda_backward(
                 n,
                 16,
                 bias is not None,
-                _DOT_B_BLOCK_C,
+                min(
+                    _DOT_B_BLOCK_C,
+                    max(64, triton.next_power_of_2(channels)),
+                ),
                 num_warps=8,
             )
     else:
@@ -567,15 +602,15 @@ def fused_h_post_bda_backward(
                 sb,
                 channels,
                 n,
-                go_flat.stride(0),
-                go_flat.stride(1),
-                go_flat.stride(2),
-                hr_flat.stride(0),
-                hr_flat.stride(1),
-                hr_flat.stride(2),
-                g_res.stride(0),
-                g_res.stride(1),
-                g_res.stride(2),
+                stride_c_s,
+                channels,
+                1,
+                stride_hr_s,
+                n,
+                1,
+                stride_c_s,
+                channels,
+                1,
                 REUSE_INPUT=False,
                 **config_a,
             )
@@ -589,24 +624,18 @@ def fused_h_post_bda_backward(
                 sb,
                 channels,
                 n,
-                go_flat.stride(0),
-                go_flat.stride(1),
-                go_flat.stride(2),
-                orig_flat.stride(0),
-                orig_flat.stride(1),
-                orig_flat.stride(2),
-                g_hr.stride(0),
-                g_hr.stride(1),
-                g_hr.stride(2),
+                stride_c_s,
+                channels,
+                1,
+                stride_c_s,
+                channels,
+                1,
+                stride_hr_s,
+                n,
+                1,
                 HAS_BIAS=(bias is not None),
                 **_B_CONFIG,
             )
 
     g_bias = _bias_gradient(g_x, sb, channels, bias)
-    return (
-        g_hr.view(s, b, n, n),
-        g_res.view(s, b, n, channels),
-        g_hp.view(s, b, n),
-        g_x.view(s, b, channels),
-        g_bias,
-    )
+    return g_hr, g_res, g_hp, g_x, g_bias
