@@ -248,6 +248,17 @@ autotune key 为 `C`、`N` 和 `REUSE_INPUT`，Triton 还会把输入 dtype 纳�
 单阶段 backward B 的 key 仍为 `C` 和 `N`。`REUSE_INPUT` 可以隔离两种计算结构的调优
 结果，避免原分支的 block 配置被复用分支错误继承。
 
+昇腾不进入通用 Autotuner，也不在实现中调用 Torch 原生计算算子。普通形状直接启动通用原始
+JITFunction：forward/backward A 使用 `BLOCK_S=1、num_warps=4` 和按 C 裁剪的通道块，B
+固定 `(64,1,4)`；`sb<=8、C<=1024、N<=4` 的 backward 使用通用单 kernel 融合 A/B。
+`N<=16` 的 forward 全部使用 Ascend Triton dot，backward A/B 在 `C>=4096、N<=16` 时使用
+Ascend Triton dot。BF16/FP16 的 forward/A 使用最大 `BLOCK_C=2048`，FP32 使用 1024，
+B 使用 1024/8 warps；forward 使用 `NP=max(4,N)`
+减少 padding，backward A/B 使用 NP=16；矩阵乘均指定 IEEE 精度。forward/A 将二维 tile 映射到一维 program，每次最多 launch 4096 个 tile，包装层
+通过 `tile_offset` 覆盖更大 grid，不使用原生回退。`sb<=512` 的 bias 使用单 kernel 归约，
+较大 `sb` 使用 16 路 FP32 partial 和 merge 两个 Triton kernel。
+通用实现和其他 vendor 的配置不变。
+
 小形状、目标中等形状 forward 和 split-C/merge Kernel 使用固定配置，不进入
 Autotuner。首次编译和调优发生在正式性能测量之前。
 
@@ -382,6 +393,8 @@ partial，避免先由 Triton 计算后再用原生实现覆盖的重复开销�
 | 任意 vendor，FP32 且 `C>=4096` | A 沿用平台路径；B 使用 PyTorch | 原生 `bmm` 和通道归约 | 沿用当前平台 |
 | NVIDIA 其他满足复用条件的形状 | 直接调用 Autotuner + 裁剪配置 | 输入复用 | `nullcontext()` |
 | NVIDIA 其他形状 | 直接调用 Autotuner + 完整配置 | 原实现 | `nullcontext()` |
+| 昇腾普通形状 | 独立后端，原始 JITFunction + 固定配置 | 原 forward 和 A/B；不启用 split-C | `torch_device_fn.device()` |
+| 昇腾 `C>=4096、N<=16` | Ascend Triton dot forward/A/B | 一维 tile 映射 + 4096 tile 分批 launch | `torch_device_fn.device()` |
 | 其他 vendor N=8 split-C（非 FP32） | `LibEntry` + 通用 autotune；B 固定配置 | split-C=16/merge | `torch_device_fn.device()` |
 | 其他 vendor 的其余形状 | `LibEntry` + 通用 autotune | 原实现 | `torch_device_fn.device()` |
 
@@ -666,6 +679,209 @@ hipblasCreate(handle)`。堆栈显示被测 Triton forward 已完成，失败发
 用例因舍入路径变化超出现有容差，因此没有将该实验作为修复提交。目前此问题仍需 Hygon 实机
 最小复现结果，尚未修改测试或算子来绕过 hipBLAS。
 
+### 6.15 昇腾 autotune 触发编译器卡死
+
+**现象**：BF16 `(1,1,8,257)` 无 bias 的 backward 用例长期不返回，调用栈停在
+`bishengir-compile`，并非 NPU kernel 同步或 PyTorch reference。只隔离 `N=8` 后，完整回归又在
+FP16 `(2,1,4,130)` 的 `N=4` backward 遇到同类问题。
+
+**原因**：通用 Kernel 的部分 autotune 候选会触发该编译器问题；已在 backward A/B
+的多组 `BLOCK_C/BLOCK_S/num_warps` 上复现。`_safe_bench` 无法处理这种情况，因为编译子进程
+没有抛出异常，而是一直运行。
+
+**解决**：新增昇腾独立后端，直接启动通用 forward、backward A/B 的原始 JITFunction，完全
+跳过通用 autotune。forward/A 使用最大 512 的通道块，B 固定 `(64,1,4)` 以避开编译问题；
+大 grid 仅调整 forward/A 的 `BLOCK_S`。通用源码和其他 vendor 的搜索空间均不修改。
+
+具体接入步骤如下：
+
+1. 新增 `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda.py`，实现昇腾
+   forward/backward 包装层。包装层通过 `_generic()` 延迟导入通用模块，复用其输入校验、原始
+   Triton kernel、AABS 保护和 FP32 长通道原生归约；forward/A 的 `_FIXED_CONFIG` 为
+   `BLOCK_C=512、BLOCK_S=1、num_warps=4`，并按 C 缩小通道块；B 使用独立 `_B_CONFIG`。
+   两条路径均不进入通用 Autotuner，也不启用 split-C。
+2. 在 `src/flag_train/runtime/backend/_ascend/megatron/__init__.py` 中导出
+   `fused_h_post_bda_forward` 和 `fused_h_post_bda_backward`，并加入 `__all__`，由
+   `SpecOpRegistrar` 覆盖同名通用接口。
+3. 这两个导出必须放在 `fused_gated_norm` 导入之前，并保留该行的 `# isort: skip`。否则
+   `fused_gated_norm` 会先触发通用 Megatron 注册，形成循环导入，导致昇腾覆盖未生效。
+   昇腾实现的 `_generic()` 延迟导入同样用于避免注册阶段的循环导入。
+4. 通用文件 `src/flag_train/megatron/fused_h_post_bda.py` 不需要修改；其他 vendor 仍走原有
+   分发、autotune 和 split-C 路径。
+
+### 6.16 昇腾性能测试误选 Megatron Triton baseline
+
+**现象**：forward 核心性能测试首个正式 shape 长期不返回，中断栈位于 Ascend 的
+`triton/backends/ascend/compiler.py`。模块导入时的小 shape baseline 探测却能通过，因此测试
+错误地选择了 `megatron _triton_h_post_bda_fwd/_bwd`，而不是组合实现。
+
+**原因**：当前环境虽然能导入 Megatron Triton 实现，但其 48 组 autotune 配置同样会触发昇腾
+编译器卡死；小 shape 探测命中已有缓存，不能证明其余正式 shape 可用。
+
+**解决**：仅修改 `benchmark/megatron/test_fused_h_post_bda.py` 的 baseline 选择：昇腾不再
+探测 Megatron Triton，直接使用 Megatron-native 组合实现；其他 vendor 的选择逻辑保持不变。
+当前环境的 `torch.compile` 还会因 Inductor 与 Ascend Triton 接口不兼容而失败，已有异常处理
+会回退到 eager，最终显示 `Megatron-native torch eager (fallback)`。修复后 forward/backward
+核心性能集均通过。
+
+### 6.17 昇腾 profiler 空采样导致性能数据全为 0
+
+**现象**：直接运行完整性能命令时反复打印 `No profiling data on the device side`，表格中的
+latency 为 0，speedup 因而也为 0；算子本身已经正常执行。
+
+**原因**：Ascend Triton 的 `do_bench_npu` 在 mspti 采样失败后回退到 torch_npu profiler，
+后者的 `_collect_prof_result` 在 CSV 没有设备数据时直接返回 `0.0`。通用 benchmark 无法区分
+这个值与正常的零耗时，于是将其作为有效结果显示。此前也观察到同类采样问题产生 `inf`。
+
+**解决**：只在本算子的 `FusedHPostBDABenchmark.get_latency` 中隔离昇腾计时：kernel 模式下
+统一使用 NPU Event，对 30 次完整 API 调用计时，baseline 和 FlagTrain 使用相同口径，不再进入
+不稳定的 mspti/profiler 路径。没有修改通用 `benchmark/base.py` 或其他算子。Event 统计完整
+API 的设备时间，与 profiler 的纯 kernel 统计口径不同；昇腾结果不能与历史 profiler 绝对值
+直接比较，但同一表格内的 speedup 仍使用一致的计时方式。
+
+### 6.18 昇腾大 grid 超过启动上限
+
+**现象**：完整性能集的 `(512,4,4,4096)` forward 报 `coreDim=131072`，要求不超过 65535。
+核心集没有覆盖该 grid 规模，因此之前的核心性能回归无法发现。
+
+**原因**：基础配置 `BLOCK_C=64、BLOCK_S=1` 使该形状的 grid 为 `(2048,64)`，Ascend 将二维
+grid 展平为 coreDim 后检查总上限。最大的 `(8192,4,4,7168)` 也需要处理。
+
+**解决**：普通通用 kernel 的 `_grid_a_config` 在 grid 展平大小超过 65535 时按 2 的幂增大
+`BLOCK_S`。dot forward/A 最终使用一维 tile 映射和 `tile_offset`，每批最多 4096 个 tile，
+通过多次 launch 覆盖任意大 grid。单 kernel 持久循环和单批 65535 tile 曾触发 AICore timeout，
+未保留；最终没有原生回退。
+
+### 6.19 昇腾大通道形状加速比低
+
+**现象**：初版昇腾核心性能集中，大通道 forward/backward 的 speedup 多在 0.003–0.04；小形状
+也低于 1，但绝对耗时只有约 0.2–0.5 ms。
+
+**定位**：配置扫描必须在实际注册模块 `_ascend.ops.megatron.fused_h_post_bda` 上进行；使用
+完整包路径会重复加载文件，得到另一份模块全局配置。修正实验后，N=4 的
+`(64,8,4,4096)` BF16 forward 在 `BLOCK_C=64/128/256/512` 下分别约为
+20.03/8.85/4.86/2.12 ms。主机入队约 0.34 ms/次，Python 不是主要瓶颈。`REUSE_INPUT=True`
+在 512 配置下仅从约 2.11 ms 降到 1.98 ms，N² 重复读取不是当前首要问题。
+
+N=8 的 `(128,1,8,7168)` BF16 backward 分阶段测量为：A 使用 64 时 31.06 ms，使用 512 时
+3.25 ms；B 使用 64 时 4.84 ms。B 使用更大通道块会触发编译卡死，因此不能把 A 的配置直接
+套用到 B。
+
+**处理**：forward/A 按 C 选择最大 512 的通道块，B 独立保持 64。完整 82 项正确性测试通过，
+核心性能集 `2 passed`。BF16 无 bias 的代表数据如下：
+
+| Shape | 方向 | 调整前 (ms) | 调整后 (ms) | 降幅 |
+| --- | --- | ---: | ---: | ---: |
+| `(64,8,4,4096)` | Forward | 20.064 | 2.084 | 89.6% |
+| `(128,1,8,7168)` | Forward | 34.801 | 3.139 | 91.0% |
+| `(64,8,4,4096)` | Backward | 23.254 | 4.786 | 79.4% |
+| `(128,1,8,7168)` | Backward | 40.194 | 8.020 | 80.0% |
+
+**剩余差距**：组合 baseline 使用高效原生 `bmm` 和归约；当前 Triton kernel 仍采用标量流
+循环和 FP32 累加。调整后 N=8 backward 的 B 已占总耗时约 60%，A 和 forward 也仍明显慢于
+原生组合。小形状则主要受每次调用的固定开销影响。因此本次修正解决的是异常低效配置，并不
+意味着已经达到或超过组合 baseline。
+
+后续完整回归的 forward 48 点全部通过；`(512,4,4,4096)` BF16 forward 从约 87.6 ms 降到
+8.86 ms。但最大 `(8192,4,4,7168)` BF16/FP16 仍约为 2242 ms：grid 上限迫使
+`BLOCK_S=8`，与 512 通道块形成 4096 元素的大 tile，抵消了通道块收益。FP32 同形状从约
+296 ms 降到 88 ms。完整命令在 forward 完成后继续执行 backward，达到 20 分钟外部超时而终止，
+不是最新配置下的完整 96 点通过记录。
+
+### 6.20 Ascend `tl.dot` 与原生归约混合优化
+
+继续分阶段测量发现，N=8 原生 B 仅约 0.109 ms，相比 Triton B 的 4.84 ms 快约 44 倍；
+A 的 `REUSE_INPUT` 仅约 11% 收益。Ascend 专用 `tl.dot` 将 N 填充到 16，forward 使用
+`H_res.T @ R`，backward A 使用 `H_res @ G` 并在同一 kernel 计算 `g_x`。FP32 指定
+`input_precision="ieee"`，原型通过 1e-5 容差检查。
+
+中间方案对 `C>=4096、N<=16` 且 grid 合法的形状启用 dot forward/A，并将 B 换成原生
+`bmm + 归约`；grid 超限时整个方向使用原生组合。普通形状仍保留固定配置通用 kernel。
+该方案完整 82 项正确性通过，核心性能集 `2 passed`。BF16 无 bias 核心代表数据：
+
+| Shape | 方向 | 标量大块版本 (ms) | dot/原生混合 (ms) | 当前 Speedup |
+| --- | --- | ---: | ---: | ---: |
+| `(64,8,4,4096)` | Forward | 2.084 | 0.864 | 0.220x |
+| `(128,1,8,7168)` | Forward | 3.139 | 0.480 | 0.238x |
+| `(64,8,4,4096)` | Backward | 4.786 | 0.989 | 0.346x |
+| `(128,1,8,7168)` | Backward | 8.020 | 0.536 | 0.414x |
+
+相对最初 64 通道块版本，上述四点的总收益分别约为 23.2x、72.5x、23.5x 和 75.0x。
+核心大通道形状仍未全面超过原生 baseline；继续提升需要减少 dot padding、输出写回和多次
+原生调用开销，而不是恢复已验证会退化的配置。最终完整 96 点性能集 `2 passed`，耗时
+74.59 秒；最大 grid 形状由原生回退执行，speedup 约为 0.95–1.00，不再出现 2 秒级退化。
+
+### 6.21 原生矩阵乘与自定义后置/归约混合实验（已撤回）
+
+dot 方案仍有 N=16 padding 和中间输出开销。实验中曾用原生 `bmm` 负责矩阵乘，自定义 kernel
+负责 forward post 和 backward `g_x`，获得下表收益。但该实现不符合“代码中不调用 Torch
+原生算子”的约束，因此已撤回，最终版本不使用该路径。历史实验的 82 项正确性和 96 点性能
+均通过，耗时 63.50 秒。BF16 无 bias 代表结果：
+
+| Shape | 方向 | dot/原生方案 (ms) | 最终混合方案 (ms) | 最终 Speedup |
+| --- | --- | ---: | ---: | ---: |
+| `(64,8,4,4096)` | Forward | 0.864 | 0.442 | 0.431x |
+| `(128,1,8,7168)` | Forward | 0.480 | 0.270 | 0.425x |
+| `(64,8,4,4096)` | Backward | 0.989 | 0.438 | 0.789x |
+| `(128,1,8,7168)` | Backward | 0.536 | 0.433 | 0.509x |
+
+该实验中，N=8 FP32 有 bias forward 达到 1.116x；`(512,4,4,4096)` backward 各 dtype
+约为 0.73–0.94x；最大 grid 形状约为 1.00x。这些数据不代表当前纯 Triton 实现。
+
+### 6.22 最终纯 Triton dot、分批 grid 和 bias 归约
+
+最终 Ascend 实现不调用 Torch 原生计算算子。大通道 forward/A/B 都使用 Triton dot；forward
+计算 `H_res.T @ R + H_post*(x+bias)`，A 计算 `H_res @ G` 和 `g_x`，B 通过
+`orig @ go.T` 计算 `g_hr` 并同时计算 `g_hp`。forward 使用 `NP=max(4,N)` 减少 padding，
+backward A/B 使用 NP=16；矩阵乘使用 IEEE 精度。
+forward/A 每个 program 处理一个线性化 tile，每次 launch 最多 4096 个 tile，通过 `tile_offset`
+覆盖大 grid。持久 loop 和单批 65535 tile 曾触发 AICore timeout，未保留。
+
+BF16/FP16 的 forward/A 使用 2048 通道块；2048 在 FP32 出现数值错误，1024 则通过 1e-5
+检查，因此 FP32 使用 1024，B 使用 1024/8 warps。4096 通道块存在 UB/CC 溢出，不可使用。Bias 不再
+调用 `g_x.sum()`：`sb<=512` 使用单 kernel 归约，较大 sb 使用 16 路 FP32 partial 和 merge。
+普通小形状仍使用固定配置通用 Triton kernel。最终 82 项正确性全部通过。
+
+### 6.23 大 grid 分批 dot 和 FP32 配置优化结果
+
+最大形状曾因通用大 `BLOCK_S` 路径只有约 0.01x。改为 4096 tile 分批 dot 后，BF16
+`(8192,4,4,7168)` 稳态 forward/backward 约 29.7/52.9 ms，speedup 约 0.78/0.60；
+不是首次调用的编译耗时。FP32 从 512 改为 1024 后，最大形状 forward 约 50 ms，speedup
+约 0.74；小 sb 的单 kernel bias 进一步减少固定 launch 开销。
+
+最终完整 96 点性能 `2 passed`，耗时 701.30 秒。算术平均 speedup：forward 48 点为
+**0.689x**，backward 48 点为 **0.660x**，整体 96 点为 **0.674x**。整体均值由此前通用大
+`BLOCK_S` 版本的约 0.501x 提升约 35%；所有数据点仍为纯 Triton 实现。
+
+### 6.24 小形状融合和 B warp 优化结果
+
+`sb<=8、C<=1024、N<=4` 的 backward 改为通用单 kernel 融合，核心小形状无/有 bias 从约
+0.42/0.65 ms 降到 0.29/0.42 ms；普通小形状通道块使用 64。大通道 B 使用 1024/8 warps。
+A/B 单 kernel 融合在 512 下约 0.80 ms，比分离路径慢，1024 又有 UB 溢出，因此未采用。
+
+最终 82 项正确性通过，完整 96 点性能 `2 passed`，耗时 183.12 秒。算术平均 speedup：
+forward **0.652x**，backward **0.838x**，整体 **0.745x**。Backward 均值提升明显，但整体
+尚未达到 1.0；小形状固定启动成本和部分 forward 仍是主要限制。
+
+### 6.25 原生 N dot 实验与最终组合
+
+将 forward/A/B 全部改为 `NP=max(4,N)` 后，N=8 forward 原型约 0.170 ms、B 原型约
+0.080 ms，但完整回归均值为 forward 0.757x、backward 0.723x、整体 0.740x。随后保留
+forward 原生 N，A/B 恢复 NP=16，最新完整 96 点性能 `2 passed`，均值分别为
+**0.688x/0.715x/0.702x**。不同轮次 backward 波动较大，因此同时保留 6.24 的 0.745x
+历史结果，不将其视为当前轮次值。最终 82 项正确性通过，整体仍未达到 1.0。
+
+### 6.26 Forward 全 dot 优化
+
+小核心 forward 从通用标量路径切换到 dot 后，C=1024 的实测约从 0.240 ms 降到 0.218 ms；
+C=1/65/130 也有约 6%–16% 收益。因此最终 `N<=16` 的 forward 全部使用 dot，并按 C
+裁剪通道块，backward 的适用范围不变。小 backward 全融合因 `g_hr/g_hp` 需要跨通道归约，
+直接按通道分片写回会互相覆盖，已撤回。
+
+最新 82 项正确性通过，完整 96 点性能 `2 passed`，耗时 93.62 秒。算术平均 speedup：
+forward **0.714x**、backward **0.726x**、整体 **0.720x**。整体仍未达到 1.0，但 forward
+较大形状已有多点超过 1.0，完整回归耗时进一步下降。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
@@ -751,14 +967,13 @@ CUDA_VISIBLE_DEVICES=3 pytest tests/megatron/test_fused_h_post_bda.py \
 
 ### 8.1 Baseline 选择
 
-benchmark 在运行时实际探测 Megatron：
+非昇腾平台的 benchmark 在运行时实际探测 Megatron：优先导入并执行
+`_triton_h_post_bda_fwd/_bwd`，导入或执行失败时回退到组合实现。昇腾固定使用组合
+baseline，不探测 Megatron Triton；否则小 shape 探测可能命中已有编译缓存，而正式 shape
+仍会在 48 组 autotune 配置中触发 `bishengir-compile` 卡死。
 
-1. 优先使用 Megatron `_triton_h_post_bda_fwd/_bwd`。
-2. 用小张量实际执行 forward、backward 并同步设备。
-3. 如果导入或执行失败，则警告并回退到与 Megatron native 对齐的 `torch.compile` baseline。
-4. 如果 `torch.compile` 探测同样失败（例如环境的 torch 与 Triton 版本不匹配导致
-   inductor 不可用），再次警告并回退到同一实现的 eager 版本。
-5. 打印实际选择的 baseline，避免把 PyTorch fallback 误报成 Megatron Triton。
+组合 baseline 先实际探测 `torch.compile`，失败时警告并回退到同一实现的 eager 版本。
+测试会打印实际选择，避免把 PyTorch fallback 误报成 Megatron Triton。
 
 当前 NVIDIA 环境选择 Megatron Triton baseline。Fallback 逐行对齐 Megatron
 `native_h_post_bda` 和 `_torch_h_post_bda_bwd`，包括矩阵乘方向、view/reshape、bias 展开、
@@ -769,8 +984,10 @@ Torch 组合实现；当 `torch.compile` 不可用时显示为 `Megatron-native 
 
 ### 8.2 计时口径
 
-- 使用 GenericBenchmark 的 kernel 模式和 CUDA Event。
-- 预热 25 ms，正式测量 100 ms，取中位数。
+- NVIDIA 使用 GenericBenchmark 的 kernel 模式和 CUDA Event，预热 25 ms、正式测量 100 ms，
+  取中位数。
+- 本算子在昇腾 kernel 模式下使用 NPU Event，预热 5 次、正式测量 30 次并取平均值，不再进入
+  可能返回空采样结果的 `do_bench_npu`，见第 6.17 节。
 - 输入随机生成在计时区域之外。
 - 首次 Triton 编译、autotune 和 fallback 的 `torch.compile` 编译不属于正式测量。
 - 输出分配、`.contiguous()`、split-C partial 分配和 bias 梯度求和都包含在被测 API 内。
@@ -928,8 +1145,8 @@ Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward �
 8. **输入复用具有适用范围**：三维 accumulator 会增加寄存器压力，不能对所有形状默认
    启用；新增平台或重要形状后，应重新验证复用条件和配置裁剪规则。
 9. **Split-C 不能只看 Graph 收益**：partial 分配和 merge launch 会影响完整 API；当前仅在
-   非原生 FP32 的 N=8 受限形状启用，NVIDIA 使用 split-C=4，其他后端使用 16；其他 N 或更大的
-   sb 需要重新测量。
+   非原生 FP32 的 N=8 受限形状启用，NVIDIA 使用 split-C=4，除昇腾外的通用后端使用 16；
+   昇腾独立后端保留单阶段 B；其他 N 或更大的 sb 需要重新测量。
 10. **中等形状 forward 配置是受限特调**：固定配置只用于 BF16/FP16 的
     `(64,8,4,4096)`；全流和双流复用曾出现完整 API 回退，不能推广到其他形状或 dtype。
 11. **FP32 长归约依赖原生 PyTorch 算子**：该路径优先保证跨平台数值一致性，但会增加对平台
@@ -939,7 +1156,8 @@ Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward �
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/flag_train/megatron/fused_h_post_bda.py` | Triton Kernel、输入校验和 forward/backward 包装 |
+| `src/flag_train/megatron/fused_h_post_bda.py` | 通用 Triton Kernel、输入校验和 forward/backward 包装 |
+| `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda.py` | 昇腾固定配置、大 grid 调整及原生 FP32 长归约 |
 | `src/flag_train/megatron/__init__.py` | 算子导出和 `SpecOpRegistrar` 注册 |
 | `tests/megatron/test_fused_h_post_bda.py` | 82 项正确性测试 |
 | `benchmark/megatron/test_fused_h_post_bda.py` | Baseline 选择、输入生成和性能测试 |

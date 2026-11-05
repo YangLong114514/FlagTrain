@@ -16,7 +16,9 @@
 Megatron is optional: a small real forward/backward probe selects its kernels,
 otherwise both benchmarks warn and use torch.compile baselines that mirror
 Megatron's native implementation (eager equivalents when torch.compile is
-broken in the environment). Backward receives grad_output and the original
+broken in the environment). Ascend always uses the native baseline because the
+Megatron autotune configurations can hang its compiler. Backward receives
+grad_output and the original
 inputs directly, so is_backward stays False; enabling it would make
 GenericBenchmark run an extra autograd forward.
 """
@@ -100,55 +102,58 @@ _torch_backward = torch.compile(_eager_backward)
 
 
 def _select_baseline():
-    try:
-        from megatron.core.fusions.fused_mhc_kernels import (
-            _triton_h_post_bda_bwd,
-            _triton_h_post_bda_fwd,
-        )
-
-        hr, orig, hp, x, bias = next(
-            forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
-        )
-        with base.torch_device_fn.device(hr.device):
-            output = _triton_h_post_bda_fwd(hr, orig, hp, x, bias)
-            grad_output = torch.randn_like(output)
-            _triton_h_post_bda_bwd(grad_output, hr, orig, hp, x, bias)
-            base.torch_device_fn.synchronize()
-    except Exception as exc:
-        warnings.warn(
-            "Megatron Triton fused_h_post_bda baseline is unavailable "
-            f"({exc!r}); falling back to the Megatron-native torch.compile baseline.",
-            stacklevel=2,
-        )
+    if flag_train.vendor_name != "ascend":
         try:
+            from megatron.core.fusions.fused_mhc_kernels import (
+                _triton_h_post_bda_bwd,
+                _triton_h_post_bda_fwd,
+            )
+
             hr, orig, hp, x, bias = next(
                 forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
             )
             with base.torch_device_fn.device(hr.device):
-                output = _torch_forward(hr, orig, hp, x, bias)
+                output = _triton_h_post_bda_fwd(hr, orig, hp, x, bias)
                 grad_output = torch.randn_like(output)
-                _torch_backward(grad_output, hr, orig, hp, x, bias)
+                _triton_h_post_bda_bwd(grad_output, hr, orig, hp, x, bias)
                 base.torch_device_fn.synchronize()
-        except Exception as compile_exc:
+        except Exception as exc:
             warnings.warn(
-                "torch.compile baseline is unavailable "
-                f"({compile_exc!r}); falling back to eager execution.",
+                "Megatron Triton fused_h_post_bda baseline is unavailable "
+                f"({exc!r}); falling back to the Megatron-native torch.compile baseline.",
                 stacklevel=2,
             )
+        else:
             return (
-                _eager_forward,
-                _eager_backward,
-                "Megatron-native torch eager (fallback)",
+                _triton_h_post_bda_fwd,
+                _triton_h_post_bda_bwd,
+                "megatron _triton_h_post_bda_fwd/_bwd",
             )
+
+    try:
+        hr, orig, hp, x, bias = next(
+            forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
+        )
+        with base.torch_device_fn.device(hr.device):
+            output = _torch_forward(hr, orig, hp, x, bias)
+            grad_output = torch.randn_like(output)
+            _torch_backward(grad_output, hr, orig, hp, x, bias)
+            base.torch_device_fn.synchronize()
+    except Exception as compile_exc:
+        warnings.warn(
+            "torch.compile baseline is unavailable "
+            f"({compile_exc!r}); falling back to eager execution.",
+            stacklevel=2,
+        )
         return (
-            _torch_forward,
-            _torch_backward,
-            "Megatron-native torch.compile (fallback)",
+            _eager_forward,
+            _eager_backward,
+            "Megatron-native torch eager (fallback)",
         )
     return (
-        _triton_h_post_bda_fwd,
-        _triton_h_post_bda_bwd,
-        "megatron _triton_h_post_bda_fwd/_bwd",
+        _torch_forward,
+        _torch_backward,
+        "Megatron-native torch.compile (fallback)",
     )
 
 
@@ -180,6 +185,28 @@ _baseline_forward, _baseline_backward, _BASELINE = _select_baseline()
 class FusedHPostBDABenchmark(base.GenericBenchmark):
     DEFAULT_SHAPES = _CORE_SHAPES
     DEFAULT_SHAPE_DESC = "S, B, N, C, WITH_BIAS"
+
+    @staticmethod
+    def _event_latency(op, *args, **kwargs):
+        for _ in range(5):
+            op(*args, **kwargs)
+        torch.npu.synchronize()
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        start.record()
+        for _ in range(30):
+            op(*args, **kwargs)
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / 30
+
+    def get_latency(self, op, *args, **kwargs):
+        if (
+            base.vendor_name == "ascend"
+            and base.Config.mode == base.consts.BenchMode.KERNEL
+        ):
+            return self._event_latency(op, *args, **kwargs)
+        return super().get_latency(op, *args, **kwargs)
 
     def set_shapes(self, shape_file=None):
         self.shapes = list(_CORE_SHAPES)

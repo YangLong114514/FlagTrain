@@ -20,6 +20,9 @@ same-named generic implementation.
 """
 
 from .fast_gelu import fast_gelu
+
+# Bind h_post before fused_gated_norm triggers generic Megatron registration.
+from .fused_h_post_bda import fused_h_post_bda_backward, fused_h_post_bda_forward  # isort: skip
 from .fused_gated_norm import fused_gated_norm
 from .fused_indices_to_multihot import fused_indices_to_multihot
 from .fused_pad_routing_map import fused_pad_routing_map
@@ -33,6 +36,8 @@ from .weighted_squared_relu_impl import weighted_squared_relu_impl
 __all__ = [
     "fast_gelu",
     "fused_gated_norm",
+    "fused_h_post_bda_backward",
+    "fused_h_post_bda_forward",
     "fused_indices_to_multihot",
     "fused_pad_routing_map",
     "fused_proj_rms_compute_h_backward",
