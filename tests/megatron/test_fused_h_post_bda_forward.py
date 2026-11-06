@@ -137,6 +137,16 @@ def test_forward_medium_shapes_match_torch_reference(dtype, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+def test_forward_multiple_launch_batches_match_torch_reference(with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(1367, 1, 4, 4097, torch.bfloat16, with_bias)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(_ref_h_post_bda(*inputs))
+    _assert_close(actual, expected, torch.bfloat16, "multiple-batch output")
+
+
+@pytest.mark.fused_h_post_bda_forward
 def test_forward_uses_h_res_transpose():
     h_res = torch.tensor(
         [[[[1.0, 2.0], [3.0, 4.0]]]], dtype=torch.float32, device=flag_train.device
