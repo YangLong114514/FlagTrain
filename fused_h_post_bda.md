@@ -967,6 +967,36 @@ backward 达到 **1.023x**，但整体仍未达到 1.0。小 backward 无 bias �
 1.1–1.2x，与旧/新包装定向对照一致；不同轮次的 baseline 和设备状态仍会影响均值，因此
 不能把全部均值变化都归为某一项 kernel 优化的收益。
 
+### 6.30 标量 B 分批、冷缓存非整齐 C 与 sb=1 bias 融合
+
+通用标量 Backward B 原来直接以 `grid=(sb,)` 启动，合法输入 `(65536,1,4,65)` 会超过
+65535 的 grid 上限。昇腾包装层现将该路径按 4096 个 batch 行分批，批间通过连续视图移动
+输入和输出基址，并传入实际 `batch_sb`；常规 sb<=4096 仍只有一次启动且不增加 view。
+上述 65536 行边界用例已验证五个梯度，不再越界。
+
+新增 `(1367,1,4,4097)` BF16 forward/backward 两种 bias 回归。BF16 每行三个通道块，总计
+4101 个 tile，覆盖第二批、不足 4096 的尾部和通道尾块，四项均通过。C=513 的新增测试进一步
+发现 BF16 有无 bias 的 `grad_h_post` 都会出现 NaN，说明 6.29 的 C=512 修复不能覆盖所有
+大块填充情况。B 的 BLOCK_C 现改为不超过 C 的 2 的幂：C=513 使用 512+1 两轮，C=768
+使用 512+256 两轮，C>=1024 的标准配置不变。C=513/768 有无 bias 四项在独立进程、全新
+Triton 缓存下全部通过。
+
+大形状尾块独立处理的原型保持主体和尾部总启动次数不增加，但两轮最大 BF16 forward 旧/新
+分别约 27.49/27.47 ms，A 约 27.43/27.46 ms，均在波动范围内且主机开销略增。减小逻辑块
+没有转化为实际收益，已完整撤回，没有保留通道基址参数或额外启动计划。
+
+sb=1 且有 bias 时，`grad_bias[c] = grad_x[0,c]`。新增昇腾专用 `_triton_hpb_bwd_small_bias1_kernel`
+在小融合计算 `g_x_acc` 后，以相同 dtype 转换同时写 `grad_x` 和独立分配的 `grad_bias`，跳过
+后续 bias 归约启动；没有共享输出地址或改变舍入路径。BF16 `(1,1,1,1)`、`(1,1,4,130)`、
+`(1,1,4,1024)` 从约 0.281–0.284 ms 降为 0.188–0.191 ms，FP32 降为约 0.198–0.208 ms。
+三种 dtype 的 N=1/2/4 定向测试均通过，并检查两个输出数值一致且 `data_ptr` 不同。
+最终完整正确性为 **107 passed**（115.96 秒）。完整 96 点性能 `2 passed`，耗时 134.43 秒，
+算术平均 speedup 为 forward **0.838x**、backward **0.961x**、整体 **0.900x**。sb=1
+有 bias 的 BF16/FP16/FP32 点分别达到 **1.387x/1.448x/1.403x**。本轮没有修改 forward，
+但其均值仍从上一轮 0.871x 变为 0.838x，最大 BF16 forward 的 Train 时间也从约 27.5 ms
+变为 30.7 ms；大 backward 同类波动同样存在。因此整体均值低于上一轮 0.920x 不能归因于
+sb=1 融合，定向旧/新对照和该点的正式 benchmark 才反映其实际收益。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
@@ -1005,8 +1035,9 @@ backward 达到 **1.023x**，但整体仍未达到 1.0。小 backward 无 bias �
 每组通用形状分别测试 `bias=None` 和有 bias，forward 和 backward 分开执行。Backward
 长通道专项由 BF16 和 FP32 覆盖 `(128,1,8,4096)`，每种 dtype 都测试有无 bias，检查纯
 Triton B dot 的通道循环和五个梯度。dot 门槛专项由三种 dtype 覆盖 `(128,1,4,512)` 和
-`(128,1,8,2048)` 及有无 bias，固定此前只记录在实验文档中的代表性形状。Forward 专项由
-三种 dtype 覆盖 `(64,8,4,4099)` 及有无 bias，验证中等形状分发和非整块 C。
+`(128,1,8,2048)` 及有无 bias，固定此前只记录在实验文档中的代表性形状。多批启动专项覆盖
+`(1367,1,4,4097)` 两个方向和两种 bias；非整齐 B 块专项覆盖 BF16 的 C=513/768 和两种
+bias。Forward 专项由三种 dtype 覆盖 `(64,8,4,4099)` 及有无 bias，验证中等形状分发和尾块。
 
 ### 7.3 特殊测试
 
@@ -1018,6 +1049,8 @@ Triton B dot 的通道循环和五个梯度。dot 门槛专项由三种 dtype �
    和 `grad_output`，逐项检查五个梯度。
 4. **无 bias 返回约定**：验证 `grad_bias is None`。
 5. **长通道 backward**：覆盖 BF16/FP32、有无 bias，检查五个梯度和 B 的 C 循环归约。
+6. **标量 B grid 边界（昇腾专项）**：`(65536,1,4,65)` 验证 4096 行分批和实际批大小。
+7. **sb=1 独立 bias 输出**：三种 dtype 检查 `grad_bias` 等于 `grad_x` 且地址不同。
 
 ### 7.4 容差
 
@@ -1033,11 +1066,15 @@ Triton B dot 的通道循环和五个梯度。dot 门槛专项由三种 dtype �
 - 2 种长通道 backward dtype × 2 种 bias 设置 = 4 项。
 - 3 种 forward dtype × 2 种 bias 设置 = 6 项。
 - 3 种 backward dot dtype × 2 组形状 × 2 种 bias 设置 = 12 项。
+- 多批启动 2 个方向 × 2 种 bias 设置 = 4 项。
+- 非整齐 B 块 2 组 C × 2 种 bias 设置 = 4 项。
+- 标量 B grid 边界 = 1 项。
+- sb=1 独立 bias 输出 3 种 dtype = 3 项。
 - 固定 transpose 案例 = 1 项。
 - 非连续 forward = 2 项。
 - 非连续 backward = 2 项。
 
-**合计 95 项正确性测试。**
+**合计 107 项正确性测试。**
 
 运行命令：
 
@@ -1242,8 +1279,8 @@ Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward �
 | 文件 | 作用 |
 | --- | --- |
 | `src/flag_train/megatron/fused_h_post_bda.py` | 通用 Triton Kernel、输入校验和 forward/backward 包装 |
-| `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda.py` | 昇腾纯 Triton dot、固定配置预绑定直启、大 grid 分批及 FP32 bias 归约 |
+| `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda.py` | 昇腾纯 Triton dot、固定配置预绑定直启、大 grid 分批、sb=1 bias 融合及 FP32 bias 归约 |
 | `src/flag_train/megatron/__init__.py` | 算子导出和 `SpecOpRegistrar` 注册 |
-| `tests/megatron/test_fused_h_post_bda.py` | 95 项正确性测试，含 dot 门槛和冷编译敏感配置 |
+| `tests/megatron/test_fused_h_post_bda.py` | 107 项正确性测试，含跨批、grid 边界和冷编译敏感配置 |
 | `benchmark/megatron/test_fused_h_post_bda.py` | Baseline 选择、输入生成和性能测试 |
 | `fused_h_post_bda.md` | 本文档 |

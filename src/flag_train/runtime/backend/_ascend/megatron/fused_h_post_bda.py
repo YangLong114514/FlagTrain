@@ -249,6 +249,130 @@ def _triton_hpb_bwd_b_dot_kernel(
 
 
 @triton.jit
+def _triton_hpb_bwd_small_bias1_kernel(
+    go_ptr,
+    hr_ptr,
+    orig_ptr,
+    hp_ptr,
+    x_ptr,
+    bias_ptr,
+    g_hr_ptr,
+    g_res_ptr,
+    g_hp_ptr,
+    g_x_ptr,
+    g_bias_ptr,
+    sb,
+    C: tl.constexpr,
+    N: tl.constexpr,
+    stride_go_s,
+    stride_go_n,
+    stride_go_c,
+    stride_hr_s,
+    stride_hr_i,
+    stride_hr_j,
+    stride_orig_s,
+    stride_orig_n,
+    stride_orig_c,
+    BLOCK_C: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    pid_s = tl.program_id(0)
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_n = tl.arange(0, N)
+    mask_s = offs_s < sb
+    g_hp_acc = tl.zeros((BLOCK_S, N), dtype=tl.float32)
+    g_hr_acc = tl.zeros((BLOCK_S, N * N), dtype=tl.float32)
+
+    for c_start in range(0, C, BLOCK_C):
+        offs_c = c_start + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+        mask_2d = mask_s[:, None] & mask_c[None, :]
+        x_tile = tl.load(
+            x_ptr + offs_s[:, None] * C + offs_c[None, :], mask=mask_2d, other=0.0
+        ).to(tl.float32)
+        bias_tile = tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        x_tile += bias_tile[None, :]
+        g_x_acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+        g_res_acc = tl.zeros((N, BLOCK_S, BLOCK_C), dtype=tl.float32)
+        for i in tl.static_range(N):
+            go_i = tl.load(
+                go_ptr
+                + offs_s[:, None] * stride_go_s
+                + i * stride_go_n
+                + offs_c[None, :],
+                mask=mask_2d,
+                other=0.0,
+            ).to(tl.float32)
+            hp_i = tl.load(hp_ptr + offs_s * N + i, mask=mask_s, other=0.0).to(
+                tl.float32
+            )
+            hr_i = tl.load(
+                hr_ptr
+                + offs_s[None, :] * stride_hr_s
+                + offs_n[:, None] * stride_hr_i
+                + i * stride_hr_j,
+                mask=mask_s[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            g_x_acc += hp_i[:, None] * go_i
+            g_res_acc += hr_i[:, :, None] * go_i[None, :, :]
+            dot_hp = tl.sum(go_i * x_tile, axis=1)
+            g_hp_acc += tl.where(
+                offs_n[None, :] == i,
+                dot_hp[:, None],
+                tl.zeros((BLOCK_S, N), dtype=tl.float32),
+            )
+            for j in tl.static_range(N):
+                orig_j = tl.load(
+                    orig_ptr
+                    + offs_s[:, None] * stride_orig_s
+                    + j * stride_orig_n
+                    + offs_c[None, :],
+                    mask=mask_2d,
+                    other=0.0,
+                ).to(tl.float32)
+                dot_hr = tl.sum(go_i * orig_j, axis=1)
+                g_hr_acc += tl.where(
+                    tl.arange(0, N * N)[None, :] == j * N + i,
+                    dot_hr[:, None],
+                    tl.zeros((BLOCK_S, N * N), dtype=tl.float32),
+                )
+        tl.store(
+            g_res_ptr
+            + offs_s[None, :, None] * stride_orig_s
+            + offs_n[:, None, None] * stride_orig_n
+            + offs_c[None, None, :],
+            g_res_acc.to(g_res_ptr.dtype.element_ty),
+            mask=mask_2d[None, :, :],
+        )
+        tl.store(
+            g_x_ptr + offs_s[:, None] * C + offs_c[None, :],
+            g_x_acc.to(g_x_ptr.dtype.element_ty),
+            mask=mask_2d,
+        )
+        tl.store(
+            g_bias_ptr + offs_s[:, None] * 0 + offs_c[None, :],
+            g_x_acc.to(g_bias_ptr.dtype.element_ty),
+            mask=(offs_s == 0)[:, None] & mask_c[None, :],
+        )
+    tl.store(
+        g_hp_ptr + offs_s[:, None] * N + offs_n[None, :],
+        g_hp_acc.to(g_hp_ptr.dtype.element_ty),
+        mask=mask_s[:, None],
+    )
+    nn_offs = tl.arange(0, N * N)
+    for i in tl.static_range(N):
+        for j in tl.static_range(N):
+            col_mask = (nn_offs == (i * N + j)).to(tl.float32)
+            val = tl.sum(g_hr_acc * col_mask[None, :], axis=1)
+            tl.store(
+                g_hr_ptr + offs_s * stride_hr_s + i * stride_hr_i + j * stride_hr_j,
+                val.to(g_hr_ptr.dtype.element_ty),
+                mask=mask_s,
+            )
+
+
+@triton.jit
 def _triton_hpb_bias_single_kernel(
     g_x_ptr,
     bias_ptr,
@@ -514,6 +638,12 @@ def fused_h_post_bda_backward(
     stride_c_s = n * channels
     stride_hr_s = n * n
 
+    bias1_fused = small_fused and sb == 1 and bias is not None
+    g_bias = (
+        torch.empty(channels, dtype=bias.dtype, device=bias.device)
+        if bias1_fused
+        else None
+    )
     if small_fused:
         config = {
             "BLOCK_C": 64,
@@ -521,36 +651,68 @@ def fused_h_post_bda_backward(
             "num_warps": 4,
         }
         with generic._disable_aabs(), torch_device_fn.device(h_res.device):
-            _launch_fixed(
-                generic._triton_hpb_bwd_small_kernel,
-                (triton.cdiv(sb, config["BLOCK_S"]),),
-                go_flat,
-                hr_flat,
-                orig_flat,
-                hp_flat,
-                x_flat,
-                bias_flat,
-                g_hr,
-                g_res,
-                g_hp,
-                g_x,
-                sb,
-                channels,
-                n,
-                stride_c_s,
-                channels,
-                1,
-                stride_hr_s,
-                n,
-                1,
-                stride_c_s,
-                channels,
-                1,
-                bias is not None,
-                config["BLOCK_C"],
-                config["BLOCK_S"],
-                num_warps=config["num_warps"],
-            )
+            if bias1_fused:
+                _launch_fixed(
+                    _triton_hpb_bwd_small_bias1_kernel,
+                    (1,),
+                    go_flat,
+                    hr_flat,
+                    orig_flat,
+                    hp_flat,
+                    x_flat,
+                    bias_flat,
+                    g_hr,
+                    g_res,
+                    g_hp,
+                    g_x,
+                    g_bias,
+                    sb,
+                    channels,
+                    n,
+                    stride_c_s,
+                    channels,
+                    1,
+                    stride_hr_s,
+                    n,
+                    1,
+                    stride_c_s,
+                    channels,
+                    1,
+                    config["BLOCK_C"],
+                    config["BLOCK_S"],
+                    num_warps=config["num_warps"],
+                )
+            else:
+                _launch_fixed(
+                    generic._triton_hpb_bwd_small_kernel,
+                    (triton.cdiv(sb, config["BLOCK_S"]),),
+                    go_flat,
+                    hr_flat,
+                    orig_flat,
+                    hp_flat,
+                    x_flat,
+                    bias_flat,
+                    g_hr,
+                    g_res,
+                    g_hp,
+                    g_x,
+                    sb,
+                    channels,
+                    n,
+                    stride_c_s,
+                    channels,
+                    1,
+                    stride_hr_s,
+                    n,
+                    1,
+                    stride_c_s,
+                    channels,
+                    1,
+                    bias is not None,
+                    config["BLOCK_C"],
+                    config["BLOCK_S"],
+                    num_warps=config["num_warps"],
+                )
     elif dot_eligible:
         with torch_device_fn.device(h_res.device):
             _launch_fixed_tiles(
@@ -584,10 +746,7 @@ def fused_h_post_bda_backward(
                 n,
                 16,
                 bias is not None,
-                min(
-                    _DOT_B_BLOCK_C,
-                    max(64, triton.next_power_of_2(channels)),
-                ),
+                min(_DOT_B_BLOCK_C, max(64, 1 << (channels.bit_length() - 1))),
                 num_warps=8,
             )
     else:
@@ -614,28 +773,55 @@ def fused_h_post_bda_backward(
                 REUSE_INPUT=False,
                 **config_a,
             )
-            generic._triton_hpb_bwd_g_hp_hr_kernel.fn.fn[(sb,)](
-                go_flat,
-                orig_flat,
-                x_flat,
-                bias_flat,
-                g_hr,
-                g_hp,
-                sb,
-                channels,
-                n,
-                stride_c_s,
-                channels,
-                1,
-                stride_c_s,
-                channels,
-                1,
-                stride_hr_s,
-                n,
-                1,
-                HAS_BIAS=(bias is not None),
-                **_B_CONFIG,
-            )
+            if sb > _DOT_LAUNCH_TILES:
+                go_rows = go_flat.view(sb, n, channels)
+                orig_rows = orig_flat.view(sb, n, channels)
+                x_rows = x_flat.view(sb, channels)
+                g_hr_rows = g_hr.view(sb, n, n)
+                g_hp_rows = g_hp.view(sb, n)
+            else:
+                go_rows = go_flat
+                orig_rows = orig_flat
+                x_rows = x_flat
+                g_hr_rows = g_hr
+                g_hp_rows = g_hp
+            for s_start in range(0, sb, _DOT_LAUNCH_TILES):
+                batch_sb = min(sb - s_start, _DOT_LAUNCH_TILES)
+                if s_start:
+                    go_batch = go_rows[s_start:]
+                    orig_batch = orig_rows[s_start:]
+                    x_batch = x_rows[s_start:]
+                    g_hr_batch = g_hr_rows[s_start:]
+                    g_hp_batch = g_hp_rows[s_start:]
+                else:
+                    go_batch = go_rows
+                    orig_batch = orig_rows
+                    x_batch = x_rows
+                    g_hr_batch = g_hr_rows
+                    g_hp_batch = g_hp_rows
+                generic._triton_hpb_bwd_g_hp_hr_kernel.fn.fn[(batch_sb,)](
+                    go_batch,
+                    orig_batch,
+                    x_batch,
+                    bias_flat,
+                    g_hr_batch,
+                    g_hp_batch,
+                    batch_sb,
+                    channels,
+                    n,
+                    stride_c_s,
+                    channels,
+                    1,
+                    stride_c_s,
+                    channels,
+                    1,
+                    stride_hr_s,
+                    n,
+                    1,
+                    HAS_BIAS=(bias is not None),
+                    **_B_CONFIG,
+                )
 
-    g_bias = _bias_gradient(g_x, sb, channels, bias)
+    if not bias1_fused:
+        g_bias = _bias_gradient(g_x, sb, channels, bias)
     return g_hr, g_res, g_hp, g_x, g_bias
