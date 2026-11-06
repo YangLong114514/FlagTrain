@@ -63,37 +63,41 @@ _torch_forward = torch.compile(_eager_forward)
 
 
 def _select_baseline():
-    try:
-        from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_fwd
-
-        inputs = next(
-            forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
-        )
-        with base.torch_device_fn.device(inputs[0].device):
-            _triton_h_post_bda_fwd(*inputs)
-            base.torch_device_fn.synchronize()
-    except Exception as exc:
-        warnings.warn(
-            "Megatron Triton fused_h_post_bda_forward baseline is unavailable "
-            f"({exc!r}); falling back to the Megatron-native torch.compile baseline.",
-            stacklevel=2,
-        )
+    # Ascend provides the Megatron symbols, but probing their fused Triton
+    # kernels can stall the CANN compiler. Use the native baseline directly.
+    if flag_train.vendor_name != "ascend":
         try:
+            from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_fwd
+
             inputs = next(
                 forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
             )
             with base.torch_device_fn.device(inputs[0].device):
-                _torch_forward(*inputs)
+                _triton_h_post_bda_fwd(*inputs)
                 base.torch_device_fn.synchronize()
-        except Exception as compile_exc:
+        except Exception as exc:
             warnings.warn(
-                "torch.compile baseline is unavailable "
-                f"({compile_exc!r}); falling back to eager execution.",
+                "Megatron Triton fused_h_post_bda_forward baseline is unavailable "
+                f"({exc!r}); falling back to the Megatron-native torch.compile baseline.",
                 stacklevel=2,
             )
-            return _eager_forward, "Megatron-native torch eager (fallback)"
-        return _torch_forward, "Megatron-native torch.compile (fallback)"
-    return _triton_h_post_bda_fwd, "megatron _triton_h_post_bda_fwd"
+        else:
+            return _triton_h_post_bda_fwd, "megatron _triton_h_post_bda_fwd"
+    try:
+        inputs = next(
+            forward_input_fn((1, 1, 2, 8, 1), torch.bfloat16, flag_train.device)
+        )
+        with base.torch_device_fn.device(inputs[0].device):
+            _torch_forward(*inputs)
+            base.torch_device_fn.synchronize()
+    except Exception as compile_exc:
+        warnings.warn(
+            "torch.compile baseline is unavailable "
+            f"({compile_exc!r}); falling back to eager execution.",
+            stacklevel=2,
+        )
+        return _eager_forward, "Megatron-native torch eager (fallback)"
+    return _torch_forward, "Megatron-native torch.compile (fallback)"
 
 
 def _make_inputs(shape, dtype, device):
