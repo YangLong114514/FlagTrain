@@ -997,6 +997,41 @@ sb=1 且有 bias 时，`grad_bias[c] = grad_x[0,c]`。新增昇腾专用 `_trito
 变为 30.7 ms；大 backward 同类波动同样存在。因此整体均值低于上一轮 0.920x 不能归因于
 sb=1 融合，定向旧/新对照和该点的正式 benchmark 才反映其实际收益。
 
+### 6.31 拆分分支 NPU Event、sb=2 与 dot A bias 融合
+
+`fused_h_post_bda_ascend` 分支基于拆分后的通用 forward/backward 文件，将昇腾实现和测试也拆成
+两个文件。两个 benchmark 恢复 Ascend 专用 NPU Event：每个实现先执行 5 次 warm-up 并同步，
+再记录 30 次调用的设备时间，baseline 和候选实现口径一致。`get_latency` 显式接收并消费
+`_reference_candidate`，不会把框架参数传给算子；其他 vendor 仍调用通用实现。Ascend 不执行
+Megatron fused Triton 探测，避免 CANN 编译停滞，组合 baseline 仍先尝试 `torch.compile`，
+当前环境因 `triton_key` 接口不兼容回退 eager。
+
+小融合路径在原有 sb=1 基础上扩展到 sb=2、N<=2。此时 BLOCK_S=2，同一 program 已持有两行
+`g_x_acc`，直接执行 `g_x_acc -> 输出 dtype -> FP32 -> 行求和` 写入独立 `grad_bias`，
+与先写 `grad_x` 再做归约的舍入路径一致。sb=1 保持原来的单行直写分支。三种 dtype、
+C=65/130/1024 的完整 API 均有收益：BF16 C=65 约从 0.236 ms 降为 0.183 ms，C=130 从
+0.232 ms 降为 0.181 ms，C=1024 从 0.236 ms 降为 0.186 ms；FP32 C=65 从约 0.260 ms
+降为 0.211 ms。sb=1 的 BF16/FP16/FP32 对照约为 0.184/0.184/0.189 ms，未见回退。
+
+dot A 在 sb=1 且有 bias 时也同时写独立 `grad_bias`。`g_x` 先转换为目标 dtype，各 program
+只写自己负责的通道块，不修改 dot 或输入精度，也不增加预处理 kernel。N=8、C=512/2048/
+4097/7168、非连续输入和三 dtype 定向测试全部通过。多数完整 API 对照从约 0.32 ms 降为
+0.26 ms；BF16 C=512 从约 0.460 ms 降为 0.390 ms，C=7168 从约 0.444 ms 降为 0.364 ms。
+
+N=4 多 sb 块对角 forward 原型没有进入正式分发。编译产物中 NP=4/NP=16 的 workspace 分别为
+8192/32768，共享缓冲均为 221184；NP=16 实测未呈现 4 倍耗时，因此进行了四行块对角试验。
+原型完全通过加载地址和 mask 构造，没有 `cat` 或预处理 kernel，但首次数值检查失败；将地址
+简化为 `pid_group` 基址加组内偏移后，单位矩阵输入仍产生错误结果，说明当前编译器不能可靠
+lowering 该结构。原型已完整撤回，没有残留实现，也没有根据理论填充收益宣称加速。
+
+正式新增的 25 项 bias 和非连续测试全部通过；另有 12 个代表用例在独立进程、空 Triton 缓存
+下通过，覆盖三种 dtype、sb=2、dot A、C=513 历史问题和非连续输入。最终完整正确性为
+**129 passed**（228.92 秒）。恢复 NPU Event 后的完整 96 点性能为 `2 passed`，耗时 242.37 秒，
+算术平均 speedup 为 forward **0.823x**、backward **0.985x**、整体 **0.904x**，FP32
+backward 为 **1.024x**。sb=2 有 bias 的 BF16/FP16/FP32 点分别达到 **1.410x/1.389x/1.426x**；
+sb=1 对应点为 **1.425x/1.408x/1.404x**，与定向“未见回退”的结论一致。Forward 未修改，
+均值仍随轮次波动，不能把整体均值变化全部归因于本轮 bias 优化。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
