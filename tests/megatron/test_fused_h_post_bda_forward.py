@@ -147,6 +147,27 @@ def test_forward_multiple_launch_batches_match_torch_reference(with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_forward_row_dot_matches_torch_reference(dtype, with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(128, 1, 8, 7168, dtype, with_bias)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _ref_h_post_bda(*(_reference_copy(tensor) for tensor in inputs))
+    _assert_close(actual, expected, dtype, "row-dot output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+def test_forward_grouped_dot_matches_torch_reference(with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(8193, 1, 4, 4097, torch.bfloat16, with_bias)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(_ref_h_post_bda(*inputs))
+    _assert_close(actual, expected, torch.bfloat16, "grouped-dot output")
+
+
+@pytest.mark.fused_h_post_bda_forward
 def test_forward_uses_h_res_transpose():
     h_res = torch.tensor(
         [[[[1.0, 2.0], [3.0, 4.0]]]], dtype=torch.float32, device=flag_train.device
