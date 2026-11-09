@@ -1032,6 +1032,31 @@ backward 为 **1.024x**。sb=2 有 bias 的 BF16/FP16/FP32 点分别达到 **1.4
 sb=1 对应点为 **1.425x/1.408x/1.404x**，与定向“未见回退”的结论一致。Forward 未修改，
 均值仍随轮次波动，不能把整体均值变化全部归因于本轮 bias 优化。
 
+### 6.32 NPU 时间分解、B NP 自适应与双通道块分组
+
+使用独立 NPU Event 分解最大 FP16 backward：A 约 30.6 ms、B 约 14.2 ms、完整 API 约
+45 ms，主机提交约 2 ms，说明大形状主要是设备工作。A 的 NP 从 16 改为 8/4 没有收益，但
+B 的 NP=4 降到 8.82 ms，约快 38%；N=8 使用 NP=8 也有稳定收益。因此仅将 B 的 NP 改为
+`max(4,N)`，A 保持原配置。中等形状同样有效，C=512/513/768 的空缓存和完整 129 项测试
+均通过。该轮 96 点均值为 forward 0.864x、backward 1.008x、整体 0.936x。
+
+Forward 的算法优化来自通道循环结构而不是继续调整 NP。整行 C 循环只加载一次
+`H_res/H_post`，小/中 sb 能减少重复 dot 初始化，但最大 sb=32768 时从约 30 ms 退化到
+37.6 ms。双通道块分组在输入复用和并行度之间更平衡：最大 BF16 forward 从约 30.7 ms 降为
+15.5 ms，FP32 从约 53.7 ms 降为 31.0 ms。最终 `N<=8、C_BLOCKS>1` 时，sb<=8192 使用整行
+kernel，更大 sb 使用双块 kernel，单块 C 保持原 tile 路径。
+
+Backward A 采用同样的双块结构，最大 BF16/FP16 A 从约 30.6 ms 降为 15.3 ms，FP32 从
+53.6 ms 降为 30.7 ms；sb=2048 也约快 2 倍。A 在所有多通道块 dot 路径使用双块，B 保持
+`max(4,N)` 和已有 C 循环。完整 96 点均值进一步提升为 forward **1.189x**、backward
+**1.180x**、整体 **1.185x**，其中 FP32 forward 为 1.339x、FP32 backward 为 1.269x。
+
+另外排除了三种结构：增广 K 维 rank-1 dot 在 MLIR lowering 阶段失败；直接使用 dot
+accumulator 与现有实现交替测量没有稳定差异；多 sb 块对角加载在单位矩阵输入下就产生错误
+结果。它们均未保留。当前接入版本新增 forward row/grouped 回归，完整正确性为 **137 passed**；
+row、NP 和双块的独立空缓存分别为 9/9/5 项通过，完整性能 `2 passed`。对应实现提交为
+`32f9d02 perf(megatron): improve Ascend h_post bda tiling`。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
