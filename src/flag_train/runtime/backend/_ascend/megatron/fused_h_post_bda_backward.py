@@ -148,6 +148,62 @@ def _triton_hpb_bwd_a_dot_kernel(
 
 
 @triton.jit
+def _triton_hpb_bwd_a_grouped_dot_kernel(
+    go_ptr,
+    hr_ptr,
+    hp_ptr,
+    g_res_ptr,
+    g_x_ptr,
+    g_bias_ptr,
+    tile_offset,
+    C: tl.constexpr,
+    N: tl.constexpr,
+    NP: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    C_BLOCKS: tl.constexpr,
+    C_GROUP: tl.constexpr,
+    C_GROUPS: tl.constexpr,
+):
+    tile = tl.program_id(0) + tile_offset
+    pid_s = tile // C_GROUPS
+    pid_group = tile % C_GROUPS
+    offs_n = tl.arange(0, NP)
+    mask_n = offs_n < N
+    hr = tl.load(
+        hr_ptr + pid_s * N * N + offs_n[:, None] * N + offs_n[None, :],
+        mask=mask_n[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    hp = tl.load(hp_ptr + pid_s * N + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    for c_offset in range(0, C_GROUP):
+        pid_c = pid_group * C_GROUP + c_offset
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+        mask = mask_n[:, None] & mask_c[None, :]
+        go = tl.load(
+            go_ptr + pid_s * N * C + offs_n[:, None] * C + offs_c[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        g_res = tl.dot(hr, go, input_precision="ieee")
+        g_x = tl.sum(go * hp[:, None], axis=0)
+        tl.store(
+            g_res_ptr + pid_s * N * C + offs_n[:, None] * C + offs_c[None, :],
+            g_res.to(g_res_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        g_x_out = g_x.to(g_x_ptr.dtype.element_ty)
+        tl.store(g_x_ptr + pid_s * C + offs_c, g_x_out, mask=mask_c)
+        if HAS_BIAS:
+            tl.store(
+                g_bias_ptr + pid_s * C + offs_c,
+                g_x_out.to(g_bias_ptr.dtype.element_ty),
+                mask=mask_c,
+            )
+
+
+@triton.jit
 def _triton_hpb_bwd_b_dot_kernel(
     go_ptr,
     orig_ptr,
@@ -606,25 +662,49 @@ def fused_h_post_bda_backward(
                 )
     elif dot_eligible:
         with torch_device_fn.device(h_res.device):
-            _launch_fixed_tiles(
-                _triton_hpb_bwd_a_dot_kernel,
-                num_tiles,
-                go_flat,
-                hr_flat,
-                hp_flat,
-                g_res,
-                g_x,
-                g_bias if dot_bias1_fused else g_x,
-                0,
-                channels,
-                n,
-                16,
-                dot_bias1_fused,
-                dot_block_c,
-                c_blocks,
-                offset_index=6,
-                num_warps=4,
-            )
+            if c_blocks > 1:
+                c_groups = triton.cdiv(c_blocks, 2)
+                _launch_fixed_tiles(
+                    _triton_hpb_bwd_a_grouped_dot_kernel,
+                    sb * c_groups,
+                    go_flat,
+                    hr_flat,
+                    hp_flat,
+                    g_res,
+                    g_x,
+                    g_bias if dot_bias1_fused else g_x,
+                    0,
+                    channels,
+                    n,
+                    16,
+                    dot_bias1_fused,
+                    dot_block_c,
+                    c_blocks,
+                    2,
+                    c_groups,
+                    offset_index=6,
+                    num_warps=4,
+                )
+            else:
+                _launch_fixed_tiles(
+                    _triton_hpb_bwd_a_dot_kernel,
+                    num_tiles,
+                    go_flat,
+                    hr_flat,
+                    hp_flat,
+                    g_res,
+                    g_x,
+                    g_bias if dot_bias1_fused else g_x,
+                    0,
+                    channels,
+                    n,
+                    16,
+                    dot_bias1_fused,
+                    dot_block_c,
+                    c_blocks,
+                    offset_index=6,
+                    num_warps=4,
+                )
             _launch_fixed(
                 _triton_hpb_bwd_b_dot_kernel,
                 (min(sb, _MAX_CORE_DIM),),
@@ -637,7 +717,7 @@ def fused_h_post_bda_backward(
                 sb,
                 channels,
                 n,
-                16,
+                max(4, n),
                 bias is not None,
                 min(_DOT_B_BLOCK_C, max(64, 1 << (channels.bit_length() - 1))),
                 num_warps=8,

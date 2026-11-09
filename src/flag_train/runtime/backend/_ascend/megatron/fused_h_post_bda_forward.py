@@ -110,6 +110,112 @@ def _triton_hpb_fwd_dot_kernel(
     )
 
 
+@triton.jit
+def _triton_hpb_fwd_row_dot_kernel(
+    hr_ptr,
+    orig_ptr,
+    hp_ptr,
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    tile_offset,
+    sb,
+    C: tl.constexpr,
+    N: tl.constexpr,
+    NP: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    C_BLOCKS: tl.constexpr,
+):
+    pid = tl.program_id(0) + tile_offset
+    num_programs = tl.num_programs(0)
+    offs_n = tl.arange(0, NP)
+    mask_n = offs_n < N
+    for pid_s in range(pid, sb, num_programs):
+        hr = tl.load(
+            hr_ptr + pid_s * N * N + offs_n[None, :] * N + offs_n[:, None],
+            mask=mask_n[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+        hp = tl.load(hp_ptr + pid_s * N + offs_n, mask=mask_n, other=0.0).to(
+            tl.float32
+        )
+        for pid_c in range(0, C_BLOCKS):
+            offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+            mask_c = offs_c < C
+            mask = mask_n[:, None] & mask_c[None, :]
+            orig = tl.load(
+                orig_ptr + pid_s * N * C + offs_n[:, None] * C + offs_c[None, :],
+                mask=mask,
+                other=0.0,
+            )
+            x_tile = tl.load(x_ptr + pid_s * C + offs_c, mask=mask_c, other=0.0).to(
+                tl.float32
+            )
+            if HAS_BIAS:
+                x_tile += tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(
+                    tl.float32
+                )
+            out = tl.dot(hr, orig, input_precision="ieee") + hp[:, None] * x_tile[None, :]
+            tl.store(
+                out_ptr + pid_s * N * C + offs_n[:, None] * C + offs_c[None, :],
+                out.to(out_ptr.dtype.element_ty),
+                mask=mask,
+            )
+
+
+@triton.jit
+def _triton_hpb_fwd_grouped_dot_kernel(
+    hr_ptr,
+    orig_ptr,
+    hp_ptr,
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    tile_offset,
+    C: tl.constexpr,
+    N: tl.constexpr,
+    NP: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    C_BLOCKS: tl.constexpr,
+    C_GROUP: tl.constexpr,
+    C_GROUPS: tl.constexpr,
+):
+    tile = tl.program_id(0) + tile_offset
+    pid_s = tile // C_GROUPS
+    pid_group = tile % C_GROUPS
+    offs_n = tl.arange(0, NP)
+    mask_n = offs_n < N
+    hr = tl.load(
+        hr_ptr + pid_s * N * N + offs_n[None, :] * N + offs_n[:, None],
+        mask=mask_n[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+    hp = tl.load(hp_ptr + pid_s * N + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+    for c_offset in range(0, C_GROUP):
+        pid_c = pid_group * C_GROUP + c_offset
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+        mask = mask_n[:, None] & mask_c[None, :]
+        orig = tl.load(
+            orig_ptr + pid_s * N * C + offs_n[:, None] * C + offs_c[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        x_tile = tl.load(x_ptr + pid_s * C + offs_c, mask=mask_c, other=0.0).to(
+            tl.float32
+        )
+        if HAS_BIAS:
+            x_tile += tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        out = tl.dot(hr, orig, input_precision="ieee") + hp[:, None] * x_tile[None, :]
+        tl.store(
+            out_ptr + pid_s * N * C + offs_n[:, None] * C + offs_c[None, :],
+            out.to(out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
 def _grid_a_config(sb, channels):
     config = _FIXED_CONFIG.copy()
     config["BLOCK_C"] = min(
@@ -148,25 +254,70 @@ def fused_h_post_bda_forward(
         c_blocks = triton.cdiv(channels, dot_block_c)
         num_tiles = sb * c_blocks
         with torch_device_fn.device(h_res.device):
-            _launch_fixed_tiles(
-                _triton_hpb_fwd_dot_kernel,
-                num_tiles,
-                hr_flat,
-                orig_flat,
-                hp_flat,
-                x_flat,
-                bias_flat,
-                out,
-                0,
-                channels,
-                n,
-                max(4, n),
-                bias is not None,
-                dot_block_c,
-                c_blocks,
-                offset_index=6,
-                num_warps=4,
-            )
+            if n <= 8 and sb <= 8192 and c_blocks > 1:
+                _launch_fixed_tiles(
+                    _triton_hpb_fwd_row_dot_kernel,
+                    sb,
+                    hr_flat,
+                    orig_flat,
+                    hp_flat,
+                    x_flat,
+                    bias_flat,
+                    out,
+                    0,
+                    sb,
+                    channels,
+                    n,
+                    max(4, n),
+                    bias is not None,
+                    dot_block_c,
+                    c_blocks,
+                    offset_index=6,
+                    num_warps=4,
+                )
+            elif n <= 8 and c_blocks > 1:
+                c_groups = triton.cdiv(c_blocks, 2)
+                _launch_fixed_tiles(
+                    _triton_hpb_fwd_grouped_dot_kernel,
+                    sb * c_groups,
+                    hr_flat,
+                    orig_flat,
+                    hp_flat,
+                    x_flat,
+                    bias_flat,
+                    out,
+                    0,
+                    channels,
+                    n,
+                    max(4, n),
+                    bias is not None,
+                    dot_block_c,
+                    c_blocks,
+                    2,
+                    c_groups,
+                    offset_index=6,
+                    num_warps=4,
+                )
+            else:
+                _launch_fixed_tiles(
+                    _triton_hpb_fwd_dot_kernel,
+                    num_tiles,
+                    hr_flat,
+                    orig_flat,
+                    hp_flat,
+                    x_flat,
+                    bias_flat,
+                    out,
+                    0,
+                    channels,
+                    n,
+                    max(4, n),
+                    bias is not None,
+                    dot_block_c,
+                    c_blocks,
+                    offset_index=6,
+                    num_warps=4,
+                )
         return out
 
     hr_flat = h_res.contiguous().view(sb, n, n)
