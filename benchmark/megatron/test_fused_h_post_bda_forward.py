@@ -163,6 +163,30 @@ class FusedHPostBDAForwardBenchmark(base.GenericBenchmark):
     DEFAULT_SHAPES = _CORE_SHAPES
     DEFAULT_SHAPE_DESC = "S, B, N, C, WITH_BIAS"
 
+    @staticmethod
+    def _event_latency(op, *args, **kwargs):
+        for _ in range(5):
+            op(*args, **kwargs)
+        torch.npu.synchronize()
+        start = torch.npu.Event(enable_timing=True)
+        end = torch.npu.Event(enable_timing=True)
+        start.record()
+        for _ in range(30):
+            op(*args, **kwargs)
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / 30
+
+    def get_latency(self, op, *args, _reference_candidate=False, **kwargs):
+        if (
+            base.vendor_name == "ascend"
+            and base.Config.mode == base.consts.BenchMode.KERNEL
+        ):
+            return self._event_latency(op, *args, **kwargs)
+        return super().get_latency(
+            op, *args, _reference_candidate=_reference_candidate, **kwargs
+        )
+
     def set_shapes(self, shape_file=None):
         self.shapes = list(_CORE_SHAPES)
         if (

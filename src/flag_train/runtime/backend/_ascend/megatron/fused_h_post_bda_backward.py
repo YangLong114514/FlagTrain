@@ -102,10 +102,12 @@ def _triton_hpb_bwd_a_dot_kernel(
     hp_ptr,
     g_res_ptr,
     g_x_ptr,
+    g_bias_ptr,
     tile_offset,
     C: tl.constexpr,
     N: tl.constexpr,
     NP: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     BLOCK_C: tl.constexpr,
     C_BLOCKS: tl.constexpr,
 ):
@@ -135,11 +137,14 @@ def _triton_hpb_bwd_a_dot_kernel(
         g_res.to(g_res_ptr.dtype.element_ty),
         mask=mask,
     )
-    tl.store(
-        g_x_ptr + pid_s * C + offs_c,
-        g_x.to(g_x_ptr.dtype.element_ty),
-        mask=mask_c,
-    )
+    g_x_out = g_x.to(g_x_ptr.dtype.element_ty)
+    tl.store(g_x_ptr + pid_s * C + offs_c, g_x_out, mask=mask_c)
+    if HAS_BIAS:
+        tl.store(
+            g_bias_ptr + pid_s * C + offs_c,
+            g_x_out.to(g_bias_ptr.dtype.element_ty),
+            mask=mask_c,
+        )
 
 
 @triton.jit
@@ -202,7 +207,7 @@ def _triton_hpb_bwd_b_dot_kernel(
 
 
 @triton.jit
-def _triton_hpb_bwd_small_bias1_kernel(
+def _triton_hpb_bwd_small_bias_kernel(
     go_ptr,
     hr_ptr,
     orig_ptr,
@@ -228,6 +233,7 @@ def _triton_hpb_bwd_small_bias1_kernel(
     stride_orig_c,
     BLOCK_C: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    SUM_BIAS2: tl.constexpr,
 ):
     pid_s = tl.program_id(0)
     offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
@@ -303,11 +309,21 @@ def _triton_hpb_bwd_small_bias1_kernel(
             g_x_acc.to(g_x_ptr.dtype.element_ty),
             mask=mask_2d,
         )
-        tl.store(
-            g_bias_ptr + offs_s[:, None] * 0 + offs_c[None, :],
-            g_x_acc.to(g_bias_ptr.dtype.element_ty),
-            mask=(offs_s == 0)[:, None] & mask_c[None, :],
-        )
+        if SUM_BIAS2:
+            g_bias = tl.sum(
+                g_x_acc.to(g_x_ptr.dtype.element_ty).to(tl.float32), axis=0
+            )
+            tl.store(
+                g_bias_ptr + offs_c,
+                g_bias.to(g_bias_ptr.dtype.element_ty),
+                mask=mask_c,
+            )
+        else:
+            tl.store(
+                g_bias_ptr + offs_s[:, None] * 0 + offs_c[None, :],
+                g_x_acc.to(g_bias_ptr.dtype.element_ty),
+                mask=(offs_s == 0)[:, None] & mask_c[None, :],
+            )
     tl.store(
         g_hp_ptr + offs_s[:, None] * N + offs_n[None, :],
         g_hp_acc.to(g_hp_ptr.dtype.element_ty),
@@ -506,10 +522,16 @@ def fused_h_post_bda_backward(
     stride_c_s = n * channels
     stride_hr_s = n * n
 
-    bias1_fused = small_fused and sb == 1 and bias is not None
+    small_bias_fused = (
+        small_fused
+        and (sb == 1 or (sb == 2 and n <= 2))
+        and bias is not None
+    )
+    dot_bias1_fused = dot_eligible and sb == 1 and bias is not None
+    bias_fused = small_bias_fused or dot_bias1_fused
     g_bias = (
         torch.empty(channels, dtype=bias.dtype, device=bias.device)
-        if bias1_fused
+        if bias_fused
         else None
     )
     if small_fused:
@@ -519,9 +541,9 @@ def fused_h_post_bda_backward(
             "num_warps": 4,
         }
         with _disable_aabs(), torch_device_fn.device(h_res.device):
-            if bias1_fused:
+            if small_bias_fused:
                 _launch_fixed(
-                    _triton_hpb_bwd_small_bias1_kernel,
+                    _triton_hpb_bwd_small_bias_kernel,
                     (1,),
                     go_flat,
                     hr_flat,
@@ -548,6 +570,7 @@ def fused_h_post_bda_backward(
                     1,
                     config["BLOCK_C"],
                     config["BLOCK_S"],
+                    sb == 2,
                     num_warps=config["num_warps"],
                 )
             else:
@@ -591,13 +614,15 @@ def fused_h_post_bda_backward(
                 hp_flat,
                 g_res,
                 g_x,
+                g_bias if dot_bias1_fused else g_x,
                 0,
                 channels,
                 n,
                 16,
+                dot_bias1_fused,
                 dot_block_c,
                 c_blocks,
-                offset_index=5,
+                offset_index=6,
                 num_warps=4,
             )
             _launch_fixed(
@@ -690,6 +715,6 @@ def fused_h_post_bda_backward(
                     **_B_CONFIG,
                 )
 
-    if not bias1_fused:
+    if not bias_fused:
         g_bias = _bias_gradient(g_x, sb, channels, bias)
     return g_hr, g_res, g_hp, g_x, g_bias
