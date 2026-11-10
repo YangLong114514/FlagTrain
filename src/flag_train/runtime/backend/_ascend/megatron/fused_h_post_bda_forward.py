@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+from triton.runtime.driver import driver
 
 from flag_train.megatron.fused_h_post_bda_forward import _disable_aabs
 from flag_train.megatron.fused_h_post_bda_forward import _triton_hpb_fwd_kernel
@@ -48,18 +49,37 @@ def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
             specialization.append((type(arg), arg))
     specialization = tuple(specialization)
     device = torch_device_fn.current_device()
+    stream = driver.active.get_current_stream(device)
+    fast_launch = not triton.knobs.runtime.launch_enter_hook.calls and not (
+        triton.knobs.runtime.launch_exit_hook.calls
+    )
     for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
         grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
         key = (kernel.cache_key, device, grid, num_warps, specialization)
-        runner = _FIXED_LAUNCH_CACHE.get(key)
+        entry = _FIXED_LAUNCH_CACHE.get(key)
         batch_args = (
             args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
         )
-        if runner is None:
+        if entry is None:
             compiled = kernel.warmup(*batch_args, grid=grid, num_warps=num_warps)
-            runner = compiled[(grid[0], 1, 1)]
-            _FIXED_LAUNCH_CACHE[key] = runner
-        runner(*batch_args)
+            entry = (compiled, compiled[(grid[0], 1, 1)])
+            _FIXED_LAUNCH_CACHE[key] = entry
+        compiled, runner = entry
+        if fast_launch:
+            compiled.run(
+                grid[0],
+                1,
+                1,
+                stream,
+                compiled.function,
+                compiled.packed_metadata,
+                None,
+                None,
+                None,
+                *batch_args,
+            )
+        else:
+            runner(*batch_args, stream=stream)
 
 
 @triton.jit
