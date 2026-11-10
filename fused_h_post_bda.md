@@ -1066,12 +1066,31 @@ benchmark 直接导入 `_triton_hpb_fwd_kernel`、`_triton_hpb_bwd_g_x_orig_kern
 `_triton_hpb_bwd_g_hp_hr_kernel`。因此，新的 baseline 与此前 eager 组合 baseline 不是同一个比较
 对象，两轮 speedup 不能直接横向比较。
 
+不能将平台差异描述为“昇腾使用 Triton，而 NVIDIA 固定使用 torch.compile”。Megatron 在 NVIDIA
+上同样提供该算子的融合 Triton 路径，当前 benchmark 在非昇腾平台也优先调用
+`_triton_h_post_bda_fwd/_bwd`。Torch 组合加 `torch.compile` 是 native/fallback 路径，用于未启用
+融合算子或融合 kernel 不可用时；它不是 NVIDIA 平台唯一或固定的执行方式。两边的发行包和后端
+适配可以不同，但这里比较的 h_post_bda Triton kernel 来源相同。
+
 Ascend 没有直接执行 Megatron 的完整 autotune，而是绕过 Autotuner，以 `.fn[grid]` 调用同一
 JITFunction。Forward 和 backward A 固定使用 `BLOCK_C=512、BLOCK_S=8、num_warps=4`，必要时增大
 `BLOCK_S` 使总 coreDim 不超过 65535；backward B 固定为 `BLOCK_C=64、BLOCK_S=1、num_warps=4`。
-这样处理是因为完整 autotune 在该环境分别需要约 186.68/392.14 秒，部分默认配置还会产生
-3,670,016 的 coreDim，B 的大块配置则出现 UB overflow。这里改变的是配置选择和启动方式，没有
-改写 Megatron kernel 的数值计算。
+这里改变的是配置选择和启动方式，没有改写 Megatron kernel 的数值计算。所谓“autotune 有问题”
+具体包括以下三类，不应笼统理解为 autotune 在所有昇腾形状上都不可用：
+
+1. **调优耗时和停滞不可控**：每个 kernel 的原始搜索空间为 `4 种 BLOCK_C × 4 种 BLOCK_S ×
+   3 种 num_warps = 48 组`，每组都可能涉及首次编译和测量。历史实验中 forward/backward 完整调优
+   分别记录过约 186.68/392.14 秒；后续独立验证中，BF16 `(128,1,8,7168)` forward 超过 8 分钟
+   仍未完成首次调用，只能停止该测试进程。
+2. **部分候选配置的 grid 超过启动上限**：最大形状 `sb=32768、C=7168` 在 `BLOCK_S=1、
+   BLOCK_C=64` 下，grid 为 `(32768,112)`，总 coreDim 为 `32768×112=3,670,016`，超过当前
+   Ascend 启动路径的 65535 上限。Autotuner 会根据当前配置改变 grid，因此不能只检查最终选中
+   配置；搜索过程中也可能遇到非法配置。
+3. **Backward B 的大块配置发生 UB 溢出**：`BLOCK_C=512、BLOCK_S=8` 的配置需要
+   2,478,080 bits，而当前设备 UB 容量为 1,572,864 bits。该配置不能进入昇腾合法候选集合。
+
+因此，正式 benchmark 采用固定合法配置是兼容性处理，不代表 Megatron 官方为该算子规定了这个
+固定配置，也不代表完整 autotune 选出的最佳性能。
 
 完整 96 点均使用相同的 NPU Event 口径，预热 5 次、正式测量 30 次，首次编译在正式测量之外；
 测试结果为 `2 passed`，总耗时 1044.66 秒，首次编译占主要部分。固定配置 Megatron baseline 的
