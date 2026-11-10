@@ -22,9 +22,11 @@ import triton.language as tl
 from torch import Tensor
 from triton.runtime.driver import driver
 
-from flag_train.megatron.fused_h_post_bda_forward import _disable_aabs
-from flag_train.megatron.fused_h_post_bda_forward import _triton_hpb_fwd_kernel
-from flag_train.megatron.fused_h_post_bda_forward import _validate_inputs
+from flag_train.megatron.fused_h_post_bda_forward import (
+    _disable_aabs,
+    _triton_hpb_fwd_kernel,
+    _validate_inputs,
+)
 from flag_train.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
@@ -57,9 +59,7 @@ def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
         grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
         key = (kernel.cache_key, device, grid, num_warps, specialization)
         entry = _FIXED_LAUNCH_CACHE.get(key)
-        batch_args = (
-            args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
-        )
+        batch_args = args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
         if entry is None:
             compiled = kernel.warmup(*batch_args, grid=grid, num_warps=num_warps)
             entry = (compiled, compiled[(grid[0], 1, 1)])
@@ -117,9 +117,7 @@ def _triton_hpb_fwd_dot_kernel(
         other=0.0,
     )
     hp = tl.load(hp_ptr + pid_s * N + offs_n, mask=mask_n, other=0.0).to(tl.float32)
-    x_tile = tl.load(x_ptr + pid_s * C + offs_c, mask=mask_c, other=0.0).to(
-        tl.float32
-    )
+    x_tile = tl.load(x_ptr + pid_s * C + offs_c, mask=mask_c, other=0.0).to(tl.float32)
     if HAS_BIAS:
         x_tile += tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
     out = tl.dot(hr, orig, input_precision="ieee") + hp[:, None] * x_tile[None, :]
@@ -157,9 +155,7 @@ def _triton_hpb_fwd_row_dot_kernel(
             mask=mask_n[:, None] & mask_n[None, :],
             other=0.0,
         )
-        hp = tl.load(hp_ptr + pid_s * N + offs_n, mask=mask_n, other=0.0).to(
-            tl.float32
-        )
+        hp = tl.load(hp_ptr + pid_s * N + offs_n, mask=mask_n, other=0.0).to(tl.float32)
         for pid_c in range(0, C_BLOCKS):
             offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
             mask_c = offs_c < C
@@ -176,7 +172,9 @@ def _triton_hpb_fwd_row_dot_kernel(
                 x_tile += tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(
                     tl.float32
                 )
-            out = tl.dot(hr, orig, input_precision="ieee") + hp[:, None] * x_tile[None, :]
+            out = (
+                tl.dot(hr, orig, input_precision="ieee") + hp[:, None] * x_tile[None, :]
+            )
             tl.store(
                 out_ptr + pid_s * N * C + offs_n[:, None] * C + offs_c[None, :],
                 out.to(out_ptr.dtype.element_ty),
@@ -259,7 +257,7 @@ def fused_h_post_bda_forward(
     bias: Optional[Tensor] = None,
 ) -> Tensor:
     """Compute ``H_res.T @ original_residual + H_post * (x + bias)``."""
-    logger.debug("TRAIN FUSED_H_POST_BDA_FORWARD")
+    logger.debug("TRAIN_ASCEND FUSED_H_POST_BDA_FORWARD")
     s, b, n, channels = _validate_inputs(h_res, original_residual, h_post, x, bias)
     sb = s * b
     out = torch.empty(s, b, n, channels, dtype=h_res.dtype, device=h_res.device)

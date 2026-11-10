@@ -23,11 +23,13 @@ import triton.language.extra.cann.extension as al
 from torch import Tensor
 from triton.runtime.driver import driver
 
-from flag_train.megatron.fused_h_post_bda_backward import _disable_aabs
-from flag_train.megatron.fused_h_post_bda_backward import _triton_hpb_bwd_g_hp_hr_kernel
-from flag_train.megatron.fused_h_post_bda_backward import _triton_hpb_bwd_g_x_orig_kernel
-from flag_train.megatron.fused_h_post_bda_backward import _triton_hpb_bwd_small_kernel
-from flag_train.megatron.fused_h_post_bda_backward import _validate_inputs
+from flag_train.megatron.fused_h_post_bda_backward import (
+    _disable_aabs,
+    _triton_hpb_bwd_g_hp_hr_kernel,
+    _triton_hpb_bwd_g_x_orig_kernel,
+    _triton_hpb_bwd_small_kernel,
+    _validate_inputs,
+)
 from flag_train.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
@@ -108,9 +110,7 @@ def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
         grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
         key = (kernel.cache_key, device, grid, num_warps, specialization)
         entry = _FIXED_LAUNCH_CACHE.get(key)
-        batch_args = (
-            args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
-        )
+        batch_args = args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
         if entry is None:
             compiled = kernel.warmup(*batch_args, grid=grid, num_warps=num_warps)
             entry = (compiled, compiled[(grid[0], 1, 1)])
@@ -389,9 +389,7 @@ def _triton_hpb_bwd_small_bias_kernel(
             mask=mask_2d,
         )
         if SUM_BIAS2:
-            g_bias = tl.sum(
-                g_x_acc.to(g_x_ptr.dtype.element_ty).to(tl.float32), axis=0
-            )
+            g_bias = tl.sum(g_x_acc.to(g_x_ptr.dtype.element_ty).to(tl.float32), axis=0)
             tl.store(
                 g_bias_ptr + offs_c,
                 g_bias.to(g_bias_ptr.dtype.element_ty),
@@ -530,9 +528,7 @@ def _bias_gradient(g_x, sb, channels, bias):
                 num_warps=4,
             )
         return g_bias
-    partial = torch.empty(
-        _BIAS_SPLIT, channels, dtype=torch.float32, device=g_x.device
-    )
+    partial = torch.empty(_BIAS_SPLIT, channels, dtype=torch.float32, device=g_x.device)
     with torch_device_fn.device(g_x.device):
         _launch_fixed(
             _triton_hpb_bias_partial_kernel,
@@ -568,7 +564,7 @@ def fused_h_post_bda_backward(
     bias: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
     """Return gradients for the five inputs of the H_post BDA forward operator."""
-    logger.debug("TRAIN FUSED_H_POST_BDA_BACKWARD")
+    logger.debug("TRAIN_ASCEND FUSED_H_POST_BDA_BACKWARD")
     s, b, n, channels = _validate_inputs(h_res, original_residual, h_post, x, bias)
     if tuple(grad_output.shape) != (s, b, n, channels):
         raise ValueError("grad_output must have the same shape as original_residual")
@@ -602,9 +598,7 @@ def fused_h_post_bda_backward(
     stride_hr_s = n * n
 
     small_bias_fused = (
-        small_fused
-        and (sb == 1 or (sb == 2 and n <= 2))
-        and bias is not None
+        small_fused and (sb == 1 or (sb == 2 and n <= 2)) and bias is not None
     )
     dot_bias1_fused = dot_eligible and sb == 1 and bias is not None
     bias_fused = small_bias_fused or dot_bias1_fused
