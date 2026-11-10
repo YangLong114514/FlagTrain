@@ -1057,6 +1057,89 @@ accumulator 与现有实现交替测量没有稳定差异；多 sb 块对角加�
 row、NP 和双块的独立空缓存分别为 9/9/5 项通过，完整性能 `2 passed`。对应实现提交为
 `32f9d02 perf(megatron): improve Ascend h_post bda tiling`。
 
+### 6.33 昇腾 Megatron 原生 Triton baseline 与固定配置性能分析
+
+拆分分支后来恢复了对当前昇腾 Megatron 包的实际探测。当前环境安装的
+`megatron/core/fusions/fused_mhc_kernels.py` 中，forward、backward A 和 backward B 都是真正的
+`@triton.jit` kernel，并带有 `@triton.autotune`，不是 `torch.compile` 或 eager 组合实现。对应
+benchmark 直接导入 `_triton_hpb_fwd_kernel`、`_triton_hpb_bwd_g_x_orig_kernel` 和
+`_triton_hpb_bwd_g_hp_hr_kernel`。因此，新的 baseline 与此前 eager 组合 baseline 不是同一个比较
+对象，两轮 speedup 不能直接横向比较。
+
+Ascend 没有直接执行 Megatron 的完整 autotune，而是绕过 Autotuner，以 `.fn[grid]` 调用同一
+JITFunction。Forward 和 backward A 固定使用 `BLOCK_C=512、BLOCK_S=8、num_warps=4`，必要时增大
+`BLOCK_S` 使总 coreDim 不超过 65535；backward B 固定为 `BLOCK_C=64、BLOCK_S=1、num_warps=4`。
+这样处理是因为完整 autotune 在该环境分别需要约 186.68/392.14 秒，部分默认配置还会产生
+3,670,016 的 coreDim，B 的大块配置则出现 UB overflow。这里改变的是配置选择和启动方式，没有
+改写 Megatron kernel 的数值计算。
+
+完整 96 点均使用相同的 NPU Event 口径，预热 5 次、正式测量 30 次，首次编译在正式测量之外；
+测试结果为 `2 passed`，总耗时 1044.66 秒，首次编译占主要部分。固定配置 Megatron baseline 的
+统计如下：
+
+| 方向 | Baseline 算术平均耗时 (ms) | Ascend 算术平均耗时 (ms) | 算术平均 Speedup | 最低/最高 Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Forward，48 点 | 202.554 | 2.732 | 59.783x | 1.208/237.447x |
+| Backward，48 点 | 244.968 | 4.047 | 38.838x | 1.411/162.261x |
+| 整体，96 点 | 223.761 | 3.390 | 49.311x | 1.208/237.447x |
+
+按 dtype 分组的平均 speedup 为：forward BF16/FP16/FP32 分别 88.124x/88.950x/2.276x，backward
+分别 53.878x/55.761x/6.877x。上述数字只表示“当前 Ascend 实现相对固定配置 Megatron Triton
+kernel”的收益，不能解释为相对 Megatron 在昇腾上最佳合法配置的收益，也不能与第 6.32 节基于
+eager baseline 的 1.185x 直接比较。
+
+为区分主机提交、kernel 计算和配置选择，对 BF16 `(128,1,8,7168)` 做了定向分解。完整 API 使用
+30 次 NPU Event；配置扫描使用已分配输出的独立 kernel 和 10 次 Event，不属于新的完整 96 点结果。
+Forward 原始 `.fn[grid]` 与缓存底层直启分别为 37.509/37.507 ms，主机提交仅约 0.213/0.173 ms，
+Ascend 完整 API 约 0.155 ms。两种启动方式几乎相同，说明大形状 bottleneck 不是裸 JIT 参数绑定或
+Python 启动。
+
+Backward 无 bias 的同一形状中，完整 Megatron baseline 为 42.872 ms，A 为 37.869 ms，B 为
+4.794 ms，Ascend 完整 API 为 0.267 ms。A 是主要瓶颈，B 次之；即使完全去掉 bias 的
+`g_x.sum(dim=0)`，A+B 已占据几乎全部时间，因此 bias 归约不是高 baseline 耗时的主因。
+
+固定配置本身也明显偏离较优点。同一 BF16 forward 形状的定向扫描得到：
+
+| `BLOCK_C/BLOCK_S/num_warps` | Megatron kernel 时间 (ms) |
+| --- | ---: |
+| 当前固定 `512/8/4` | 约 37.51 |
+| `256/1/2` | 6.916 |
+| `512/1/2` | 3.126 |
+
+仅把 `BLOCK_S` 从 8 改为 1，在其他维度基本相同的配置下就获得约 12 倍改善。大 `BLOCK_S` 增加单
+program 的 FP32 工作块、广播和寄存器压力；小形状还会降低 grid 并行度，例如 `(2,4,4,1024)` 的
+固定 forward grid 只有 `(1,2)`。因此当前固定配置是规避编译、grid 和 UB 问题的保守选择，不是
+性能最优配置。
+
+原始 Megatron kernel 的计算结构也不同于 Ascend 实现。Forward 和 backward A 使用静态循环、标量
+权重与 FP32 向量乘加，没有使用 `tl.dot`；forward 对 original residual 的加载随 `N²` 增长，
+backward A 对 `go` 的逻辑加载次数为 `N+N²`。BF16/FP16 输入也会先转成 FP32 再做这些标量乘加。
+Ascend forward/A 使用 `tl.dot` 和 FP32 accumulator，减少了重复加载并利用矩阵计算路径，这与
+BF16/FP16 的 speedup 显著高于 FP32 一致。Megatron B 在 `C=7168、BLOCK_C=64` 时需要 112 轮通道
+循环，并混合大量逐对 `tl.sum` 和 `tl.where`；Ascend B 使用 `BLOCK_C=1024` 和
+`tl.dot(orig, trans(go))`，循环降为 7 轮。
+
+仓库中的其他“Megatron baseline”不能作为该异常耗时的直接反证。`fused_gated_norm` 和
+`fused_pad_routing_map` 只在 NVIDIA 使用原生 Megatron kernel；不少激活类 baseline 使用 Megatron
+的 `torch.compile` 封装；直接使用 Triton 的测试通常走通用 `do_bench_npu` 设备任务计时，部分还
+设置 `TRITON_ALL_BLOCKS_PARALLEL=1`。当前 h_post_bda 的 NPU Event 则覆盖完整 API。计时口径确实
+不同，但原始启动与底层直启、完整 backward 与 A/B 单项的对照已经表明，主要差距来自 kernel
+计算和固定配置，而不是计时器单独造成的假象。
+
+随后直接调用 Megatron 官方 `_triton_h_post_bda_fwd/_bwd` 封装做了独立进程验证，不通过 `.fn`
+绕过 Autotuner。BF16、有 bias 的 `(1,1,2,8)` forward 首次调用和完整调优约 7.16 秒，选中
+`BLOCK_C=64、BLOCK_S=1、num_warps=4`，调优后 30 次 NPU Event 的完整 API 均值约 0.238 ms；
+同形状 backward 首次调用约 15.47 秒，A/B 分别选中 `64/1/4` 和 `256/1/4`，调优后完整 API 约
+0.504 ms。Forward 及 backward 五个梯度均通过 BF16 数值对照，说明官方 autotune 在小形状上确实
+可用，且选中配置不同于 benchmark 的固定配置。BF16 `(128,1,8,7168)` forward 的官方完整调优
+超过 8 分钟仍未完成首次调用，随后停止该独立进程；这不证明它永远无法完成，但说明未裁剪的
+48 组配置不适合直接用于常规大形状 benchmark。该实验没有修改正式 benchmark。
+
+后续若需要更公平地评价“对 Megatron 原生 kernel 的加速比”，应在不超限且不溢出 UB 的配置集合
+内预先调优或建立按形状查表的配置，编译和调优均放在正式计时之外；B 应使用独立的合法配置集合。
+重新测量后，speedup 很可能显著低于 49.311x，但这才是对 Megatron 在昇腾上合理性能的更有解释力
+的比较。当前 49.311x 应保留为固定配置实验结果，不应作为最终端到端收益宣传。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
@@ -1152,7 +1235,9 @@ CUDA_VISIBLE_DEVICES=3 pytest tests/megatron/test_fused_h_post_bda.py \
 非昇腾平台的 benchmark 在运行时实际探测 Megatron：优先导入并执行
 `_triton_h_post_bda_fwd/_bwd`，导入或执行失败时回退到组合实现。昇腾固定使用组合
 baseline，不探测 Megatron Triton；否则小 shape 探测可能命中已有编译缓存，而正式 shape
-仍会在 48 组 autotune 配置中触发 `bishengir-compile` 卡死。
+仍会在 48 组 autotune 配置中触发 `bishengir-compile` 卡死。这里描述原分支当时的策略；
+拆分后的 `fused_h_post_bda_ascend` 分支后来改为直接运行 Megatron 原生 Triton kernel 的固定合法
+配置，其性能结果和配置问题见第 6.33 节。
 
 组合 baseline 先实际探测 `torch.compile`，失败时警告并回退到同一实现的 eager 版本。
 测试会打印实际选择，避免把 PyTorch fallback 误报成 Megatron Triton。
