@@ -18,7 +18,8 @@ megatron-core provides a kernel that can run here -- the kernel this port is a
 port *of*. When that kernel cannot run, the baseline is Megatron's own
 ``native_h_post_bda`` torch composition, compiled the way Megatron compiles it
 (eager if ``torch.compile`` fails on this platform). ``_BASELINE`` records which
-one was measured.
+one was measured. On Ascend, no local baseline is probed or executed;
+``torch_op=None`` makes the NVIDIA ``--base-data`` record the only comparison.
 
 Both take the same ``(h_res, original_residual, h_post, x, bias)`` tuple, so
 there is nothing to pre-compute outside the timed region. The functional suite
@@ -156,7 +157,10 @@ def forward_input_fn(shape, dtype, device):
     yield _make_inputs(shape, dtype, device)
 
 
-torch_op, _BASELINE = _load_baseline()
+if flag_train.vendor_name == "ascend":
+    torch_op, _BASELINE = None, "NVIDIA base-data only (no local baseline)"
+else:
+    torch_op, _BASELINE = _load_baseline()
 
 
 class FusedHPostBDAForwardBenchmark(base.GenericBenchmark):

@@ -261,7 +261,9 @@ def test_backward_small_fused_bias_is_independent(dtype, s, b, n, channels):
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
         _assert_close(actual_grad, expected_grad, dtype, name)
     assert actual[3].data_ptr() != actual[4].data_ptr()
-    expected_bias = actual[3].view(s * b, channels).to(torch.float32).sum(dim=0).to(dtype)
+    expected_bias = (
+        actual[3].view(s * b, channels).to(torch.float32).sum(dim=0).to(dtype)
+    )
     utils.train_assert_equal(
         utils.to_reference(actual[4]), utils.to_reference(expected_bias)
     )
