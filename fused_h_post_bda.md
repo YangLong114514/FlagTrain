@@ -1159,6 +1159,75 @@ BF16/FP16 的 speedup 显著高于 FP32 一致。Megatron B 在 `C=7168、BLOCK_
 重新测量后，speedup 很可能显著低于 49.311x，但这才是对 Megatron 在昇腾上合理性能的更有解释力
 的比较。当前 49.311x 应保留为固定配置实验结果，不应作为最终端到端收益宣传。
 
+### 6.34 完整 autotune 的 grid 容错与耗时复核
+
+进一步直接调用 Megatron 官方 `_triton_h_post_bda_fwd/_bwd`，验证了
+`TRITON_ALL_BLOCKS_PARALLEL=1` 对 coreDim 问题的作用。未设置该变量时，BF16
+`(512,4,4,4096)` forward 的首个 `BLOCK_C=64、BLOCK_S=1` 配置产生 `coreDim=131072`，以普通
+`RuntimeError` 中断调优；设置后，48 组配置全部完成，耗时约 7.25 秒，最终选中 `64/1/4`。
+该变量是把逻辑 block 自动映射到物理核，使大 grid 可以运行，不是捕获异常并跳过配置。
+UB 溢出则包装为 `MLIRCompilationError`，正常 Autotuner 会将其记为 `inf` 并跳过；只有通过
+`.fn` 绕过 Autotuner 时才会直接使调用失败。
+
+实验期间曾将环境变量严格限制在 Megatron baseline 调用内，返回或异常后恢复原值，并实际确认
+FlagTrain 昇腾实现运行时没有继承该变量。最终方案已改用 NVIDIA base-data，不再保留这段环境
+变量逻辑。
+
+完整 autotune 的“完整”指 48 组 block 配置全部参与搜索，不是 shape 数量多。Megatron 的
+key 为 `C、N`，Triton 额外加入 dtype，不包含 `sb` 和 bias；forward 与 backward A/B 的缓存
+彼此独立，默认也不跨进程复用最佳配置。两个唯一形状、三种 dtype 会形成 6 个 key，对应
+forward 288 次、backward 576 次配置测速；模块探测再增加 144 次。每个配置的 `do_bench`
+还会重复执行，因此两个形状也可能产生很长的首次调优时间。
+
+本轮实测的典型耗时如下：
+
+| 方向与形状 | dtype | 调优耗时 |
+| --- | --- | ---: |
+| Forward `C=7168、N=8` | FP16 | 973.82 秒 |
+| Forward `C=7168、N=8` | FP32 | 1603.61 秒 |
+| Backward A `C=7168、N=8` | BF16 | 1186.63 秒 |
+| Backward A/B `C=1024、N=4` | FP16 | 365.34/668.51 秒 |
+| Backward A/B `C=4096、N=4` | FP16 | 371.30/665.62 秒 |
+| Backward A/B `C=1024、N=4` | FP32 | 262.63/630.14 秒 |
+
+缩小 `sb` 和 `C` 均没有稳定改善。小 `sb` 的 `C=1024/4096` forward 每组仍需约 246–311 秒；
+进一步缩为 `C=256/512` 后，BF16 两组仍分别需要 303.88/311.77 秒。这证明主要成本是每个
+新 `(C,N,dtype)` 的完整编译、分发和配置测速，而不是正式形状的计算量。剔除大 `C` 和缩小
+shape 的实验均已撤回，未将这些不完整的长跑结果作为最终加速比。
+
+### 6.35 昇腾改用 NVIDIA base-data 与 backward 数据缺口
+
+昇腾代码分支已 rebase 到 `origin/main` 的 `6e1c2ca`。最新框架允许 `torch_op=None`：不执行本机
+baseline，`--base-data` 成为唯一比较来源。提交 `cd9a0b7` 仅对昇腾启用该路径，不调用
+`_load_baseline`，不导入或探测 Megatron kernel，也不再设置 `TRITON_ALL_BLOCKS_PARALLEL`。
+其他 vendor 保持原有 Megatron/Torch baseline，shape 恢复为通用 benchmark 的完整列表。
+
+NV 折算公式为：
+
+```text
+compared_speedup = (base_ms / train_ms) / factor
+factor = vendor_peak / reference_peak
+```
+
+`base_ms` 和瓶颈资源来自 `tools/op_flagtrain_perf_baseline.json`，factor 按当前芯片、dtype 和
+baseline 瓶颈资源查找。输出中的 `Torch Latency` 和本地 `Train Speedup` 为 `N/A`，有效比较值
+为 `vs Base`。昇腾候选实现仍使用独立 NPU Event，预热 5 次、正式测量 30 次。
+
+全量 pre-commit 和 **137 passed** 正确性均通过，导入拦截检查确认昇腾没有探测 Megatron。
+Forward 的 48 个核心加综合点全部匹配 NV 记录并通过，耗时 46.20 秒。Backward 前 4 个 BF16
+case 的 `vs Base` 分别为 0.527/0.463/0.506/0.655，但第 5 个 `(128,1,8,7168)` 因 NV 数据缺失
+而按框架设计失败。
+
+该失败不是 `baseline/` 接口漏写 shape。`baseline/megatron/fused_h_post_bda_forward.py` 和
+`fused_h_post_bda_backward.py` 都定义了完整 16 个 shape/bias case，与通用 benchmark 一致。
+当前 JSON 的 forward 有 16 个 case，backward 却只有前 4 个，缺少从 `(128,1,8,7168)` 开始的
+后续 12 个 case。`baseline/README.md` 说明这些接口应原样同步到外部 `ops-baseline` 仓库并生成
+数据；JSON 不是本地 FlagTrain benchmark 自动生成的，本次没有手工修改 JSON。
+
+因此，当前代码路径已经完成，但 backward 全量 NV 折算仍依赖外部重新采集完整数据。应重点检查
+外部采集在第 5 个 `(128,1,8,7168)` 处的日志，并在 JSON 的 backward 也达到 16 个 case 后再
+运行全量性能测试。不能通过伪造 NV 延迟或删减通用 shape 绕过该缺口。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
