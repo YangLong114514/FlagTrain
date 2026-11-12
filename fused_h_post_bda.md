@@ -1487,6 +1487,26 @@ BF16 0.340063x、FP16 0.566812x、FP32 0.306688x，总体 **0.404521x**，仍未
 Backward 保持第 6.41 节的大 `sb` 分组和 FP32 小 bias 融合。当前可用 BF16 前 4 点为
 **0.582/0.525/0.507/0.744**，平均 0.5895x；其余 12 个 NV case 仍缺数据，不能给出完整反向均值。
 
+### 6.43 显式 UB 驻留与 CV pipeline 能力验证
+
+继续按显式 UB 驻留和 CV 流水建议做最小探针。当前安装包的 `tle.dsa` 导出包含 `alloc/copy/subview/
+to_buffer/to_tensor/pipeline`。直接 BF16 `GM→UB` copy 因源和目标 dtype 必须一致而失败；改为
+`tl.load → FP32 → to_buffer(bind_buffer=UB) → to_tensor → store` 后，FP32/BF16 copy 均通过。这证明
+当前环境可以表达显式 UB 驻留，但不代表它会自动减少指令或临时分配。
+
+在 1D Vector 基础上为四路 residual 和 x+bias 增加显式 UB buffer。单位矩阵、随机输入、非整块 C 和
+bias 均通过，但时间与同配置的普通 1D Vector 基本相当：最大 BF16/FP32 为 9.464/9.304 ms，medium
+为 0.383/0.331 ms，没有超过第 6.42 节已接入版本。当前实现本来就让四路 residual 只读取一次，额外
+驻留不能继续减少 GM 流量，反而增加转换和生命周期管理，因此不接入正式分发。
+
+Grouped dot 还独立测试了 `enable_dynamic_cv_pipeline` 和 `enable_hivm_auto_cv_balance`。四组
+false/false、true/false、false/true、true/true 的最大 BF16 时间为 10.800/10.795/10.803/10.790 ms，
+没有可靠差异。编译器明确提示 `Add-dynamic-cv-pipeline is only supported on 91095 now.`，所以
+`enable_dynamic_cv_pipeline` 不能作为当前 910B4 的优化手段。CV balance 也没有产生实际改善。
+
+这些结果进一步限定了后续方向：优先继续优化已验证的一维 Vector 计算结构，而不是重复引入
+UB copy 或依赖 91095 专属流水选项。所有 UB/CV 实验都只存在于 pytest 缓存原型中，没有修改正式代码。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
