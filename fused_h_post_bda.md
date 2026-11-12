@@ -1534,6 +1534,26 @@ UB copy 或依赖 91095 专属流水选项。所有 UB/CV 实验都只存在于 
 这次对照证明 1D Vector 确实改变了执行路径，而不只是让原 dot 配置变快。后续若继续优化大形状，
 应重点检查输出转换/写回、输入加载与地址计算，不应再以 AIC MAC 或启动开销为主要方向。
 
+### 6.45 DSA 写回和 Vector 流水实验结论
+
+针对 MTE3 写回，参考 Ascend `swiglu` 的“完整 tile DSA copy、尾块 masked store”实现，测试了四路
+输出先转换为目标 dtype、再分别 `to_buffer(UB)` 和 `tle.dsa.copy`。尾块仍用 masked store，没有
+join/trans 或额外二维 buffer。随机输入、非整块 C 和 bias 均正确。
+
+BLOCK_C=1024 时，最大 BF16/FP32 为 7.637/8.949 ms，medium 为 0.316/0.313 ms；BLOCK_C=2048 时
+变为 8.852/8.935 ms。部分 `sb=8193` 形状从 2.318→1.914 ms，说明 DSA copy 在特定布局可能有效，
+但最大形状和总体配置没有超过第 6.42 节的普通 `tl.store`。因此不把四路 DSA 写回接入正式实现。
+输出逻辑流量本身固定，替换 store API 不能减少字节数，只可能改变搬运效率。
+
+另外将纯 Vector C 循环改为 `tl.range(..., num_stages=2)`，再按 FP32 保持 1、BF16/FP16 使用 2
+接入。局部上 `sb=8193` 从 2.318→1.830 ms，但完整 48 点均值从 0.497708x 降为 0.479500x，不能
+形成稳定整体收益，已撤回。最终保留第 6.42 节的 1D Vector 与 BF16/FP16=1024、FP32=2048 配置。
+撤回后再次通过 **153 passed、4 skipped** 和全量 pre-commit。
+
+后续若继续优化 MTE3，只能依赖更合适的写回粒度、流水或与下游融合消除 GM 写回；不能通过
+简单替换 `tl.store` 为 DSA copy 或增加 stage 就预设收益。二维拼接输出、额外 FP32 partial 和
+增加 GM 读写的两 kernel epilogue 均不建议用于本算子。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
