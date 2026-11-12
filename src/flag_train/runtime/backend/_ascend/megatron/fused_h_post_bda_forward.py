@@ -14,6 +14,7 @@
 """Ascend Triton implementation for fused mHC H_post BDA forward."""
 
 import logging
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -30,6 +31,13 @@ from flag_train.megatron.fused_h_post_bda_forward import (
 from flag_train.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
+
+
+def _device_context(device):
+    if torch_device_fn.current_device() == device.index:
+        return nullcontext()
+    return torch_device_fn.device(device)
+
 
 _FIXED_CONFIG = {"BLOCK_C": 64, "BLOCK_S": 1, "num_warps": 4}
 _MAX_CORE_DIM = 65535
@@ -271,7 +279,7 @@ def fused_h_post_bda_forward(
         dot_block_c = min(max_block_c, max(64, triton.next_power_of_2(channels)))
         c_blocks = triton.cdiv(channels, dot_block_c)
         num_tiles = sb * c_blocks
-        with torch_device_fn.device(h_res.device):
+        with _device_context(h_res.device):
             if n <= 8 and sb <= 8192 and c_blocks > 1:
                 _launch_fixed_tiles(
                     _triton_hpb_fwd_row_dot_kernel,
@@ -345,7 +353,7 @@ def fused_h_post_bda_forward(
     bias_flat = bias.contiguous() if bias is not None else x_flat
     out_flat = out.view(sb, n, channels)
     grid, config = _grid_a_config(sb, channels)
-    with _disable_aabs(), torch_device_fn.device(h_res.device):
+    with _disable_aabs(), _device_context(h_res.device):
         _triton_hpb_fwd_kernel.fn.fn[grid](
             hr_flat,
             orig_flat,

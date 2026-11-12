@@ -14,6 +14,7 @@
 """Ascend Triton implementation for fused mHC H_post BDA backward."""
 
 import logging
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -33,6 +34,13 @@ from flag_train.megatron.fused_h_post_bda_backward import (
 from flag_train.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
+
+
+def _device_context(device):
+    if torch_device_fn.current_device() == device.index:
+        return nullcontext()
+    return torch_device_fn.device(device)
+
 
 _FIXED_CONFIG = {"BLOCK_C": 64, "BLOCK_S": 1, "num_warps": 4}
 _B_CONFIG = {"BLOCK_C": 64, "BLOCK_S": 1, "num_warps": 4}
@@ -515,7 +523,7 @@ def _bias_gradient(g_x, sb, channels, bias):
         return None
     g_bias = torch.empty(channels, dtype=bias.dtype, device=bias.device)
     if sb <= 512:
-        with torch_device_fn.device(g_x.device):
+        with _device_context(g_x.device):
             _launch_fixed(
                 _triton_hpb_bias_single_kernel,
                 (triton.cdiv(channels, 512),),
@@ -529,7 +537,7 @@ def _bias_gradient(g_x, sb, channels, bias):
             )
         return g_bias
     partial = torch.empty(_BIAS_SPLIT, channels, dtype=torch.float32, device=g_x.device)
-    with torch_device_fn.device(g_x.device):
+    with _device_context(g_x.device):
         _launch_fixed(
             _triton_hpb_bias_partial_kernel,
             (triton.cdiv(channels, 512), _BIAS_SPLIT),
@@ -613,7 +621,7 @@ def fused_h_post_bda_backward(
             "BLOCK_S": 2 if n <= 2 else 1,
             "num_warps": 4,
         }
-        with _disable_aabs(), torch_device_fn.device(h_res.device):
+        with _disable_aabs(), _device_context(h_res.device):
             if small_bias_fused:
                 _launch_fixed(
                     _triton_hpb_bwd_small_bias_kernel,
@@ -678,7 +686,7 @@ def fused_h_post_bda_backward(
                     num_warps=config["num_warps"],
                 )
     elif dot_eligible:
-        with torch_device_fn.device(h_res.device):
+        with _device_context(h_res.device):
             if c_blocks > 1:
                 c_groups = triton.cdiv(c_blocks, 2)
                 _launch_fixed_tiles(
@@ -741,7 +749,7 @@ def fused_h_post_bda_backward(
             )
     else:
         grid_a, config_a = _grid_a_config(sb, channels)
-        with _disable_aabs(), torch_device_fn.device(h_res.device):
+        with _disable_aabs(), _device_context(h_res.device):
             _triton_hpb_bwd_g_x_orig_kernel.fn.fn[grid_a](
                 go_flat,
                 hr_flat,
