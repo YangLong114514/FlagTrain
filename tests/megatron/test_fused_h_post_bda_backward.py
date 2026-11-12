@@ -118,6 +118,21 @@ def _ref_h_post_bda_backward(
     return gradients if bias is not None else (*gradients, None)
 
 
+def torch_op():
+    try:
+        from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
+
+        return _triton_h_post_bda_bwd
+    except Exception:
+        return _ref_h_post_bda_backward
+
+
+if flag_train.vendor_name == "ascend":
+    reference_op = _ref_h_post_bda_backward
+else:
+    reference_op = torch_op()
+
+
 def _assert_close(actual, expected, dtype, name):
     if actual is None or expected is None:
         assert actual is None and expected is None
@@ -143,13 +158,13 @@ def _non_contiguous(tensor):
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype,s,b,n,channels", _DTYPE_SHAPE_CASES)
-def test_backward_matches_torch_autograd(dtype, s, b, n, channels, with_bias):
+def test_backward_matches_reference(dtype, s, b, n, channels, with_bias):
     torch.manual_seed(2026)
     inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
     grad_output = _rand((s, b, n, channels), dtype)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     assert len(actual) == len(expected) == len(_GRADIENT_NAMES)
@@ -162,16 +177,35 @@ def test_backward_matches_torch_autograd(dtype, s, b, n, channels, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_backward
+@pytest.mark.skipif(
+    flag_train.vendor_name != "nvidia" or reference_op is _ref_h_post_bda_backward,
+    reason="Requires Megatron's native backward on NVIDIA",
+)
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+def test_backward_megatron_native_matches_torch_composition(with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(2, 3, 4, 130, torch.bfloat16, with_bias)
+    grad_output = _rand((2, 3, 4, 130), torch.bfloat16)
+    actual = reference_op(grad_output, *inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in _ref_h_post_bda_backward(grad_output, *inputs)
+    )
+
+    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
+        _assert_close(actual_grad, expected_grad, torch.bfloat16, name)
+
+
+@pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_backward_split_c_matches_torch_autograd(dtype, with_bias):
+def test_backward_split_c_matches_reference(dtype, with_bias):
     torch.manual_seed(2026)
     s, b, n, channels = 128, 1, 8, 4096
     inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
     grad_output = _rand((s, b, n, channels), dtype)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
@@ -182,15 +216,13 @@ def test_backward_split_c_matches_torch_autograd(dtype, with_bias):
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("s,b,n,channels", [(128, 1, 4, 512), (128, 1, 8, 2048)])
-def test_backward_dot_threshold_matches_torch_autograd(
-    dtype, s, b, n, channels, with_bias
-):
+def test_backward_dot_threshold_matches_reference(dtype, s, b, n, channels, with_bias):
     torch.manual_seed(2026)
     inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
     grad_output = _rand((s, b, n, channels), dtype)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
@@ -199,13 +231,13 @@ def test_backward_dot_threshold_matches_torch_autograd(
 
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-def test_backward_multiple_launch_batches_match_torch_autograd(with_bias):
+def test_backward_multiple_launch_batches_match_reference(with_bias):
     torch.manual_seed(2026)
     inputs = _make_inputs(1367, 1, 4, 4097, torch.bfloat16, with_bias)
     grad_output = _rand((1367, 1, 4, 4097), torch.bfloat16)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
@@ -215,13 +247,13 @@ def test_backward_multiple_launch_batches_match_torch_autograd(with_bias):
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("channels", [513, 768])
-def test_backward_padded_b_channel_matches_torch_autograd(channels, with_bias):
+def test_backward_padded_b_channel_matches_reference(channels, with_bias):
     torch.manual_seed(2026)
     inputs = _make_inputs(128, 1, 4, channels, torch.bfloat16, with_bias)
     grad_output = _rand((128, 1, 4, channels), torch.bfloat16)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
@@ -235,8 +267,8 @@ def test_backward_scalar_b_respects_grid_limit():
     inputs = _make_inputs(65536, 1, 4, 65, torch.bfloat16, with_bias=True)
     grad_output = _rand((65536, 1, 4, 65), torch.bfloat16)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
@@ -254,8 +286,8 @@ def test_backward_small_fused_bias_is_independent(dtype, s, b, n, channels):
     inputs = _make_inputs(s, b, n, channels, dtype, with_bias=True)
     grad_output = _rand((s, b, n, channels), dtype)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
@@ -277,8 +309,8 @@ def test_backward_dot_single_row_bias_is_independent(dtype, channels):
     inputs = _make_inputs(1, 1, 8, channels, dtype, with_bias=True)
     grad_output = _rand((1, 1, 8, channels), dtype)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
@@ -303,8 +335,8 @@ def test_backward_accepts_non_contiguous_inputs(s, b, n, channels):
     )
     grad_output = _non_contiguous(_rand((s, b, n, channels), torch.bfloat16))
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = _ref_h_post_bda_backward(
-        _reference_copy(grad_output), *(_reference_copy(tensor) for tensor in inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
