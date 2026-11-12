@@ -1228,6 +1228,47 @@ case 的 `vs Base` 分别为 0.527/0.463/0.506/0.655，但第 5 个 `(128,1,8,71
 外部采集在第 5 个 `(128,1,8,7168)` 处的日志，并在 JSON 的 backward 也达到 16 个 case 后再
 运行全量性能测试。不能通过伪造 NV 延迟或删减通用 shape 绕过该缺口。
 
+### 6.36 测试参考接口统一与昇腾精度参考实测
+
+昇腾分支随后 rebase 到 `origin/main=3f1ffd6`，提交 `1a945df` 统一了拆分后的 forward/backward
+测试结构。Benchmark 不再携带 Torch 组合实现：非昇腾平台尝试导入 Megatron 原生接口，失败则令
+`torch_op=None` 并依赖 NV base-data；昇腾不探测，直接使用 NV 折算。功能测试在非昇腾平台优先
+使用原生 Megatron，导入失败时回退 Torch 组合；NV 专属用例额外比较有原生接口与 Torch 组合在
+有无 bias 下的结果，当前昇腾环境未执行这两个 NV 用例。
+
+为评估昇腾功能测试能否同样使用原生参考，曾在完整前后向套件中启用原生 Megatron。运行命令为：
+
+```bash
+pytest -s -v tests/megatron/test_fused_h_post_bda_forward.py \
+  tests/megatron/test_fused_h_post_bda_backward.py --durations=20
+```
+
+pytest 总耗时 **3639.46 秒（60 分 39 秒）**，墙钟时间 **3663.08 秒（61 分 3 秒）**，结果为
+**42 passed、95 failed、4 skipped**。第 9 项 BF16 `(1,1,8,257)` forward 不是永久卡死，而是
+300.02 秒后才完成；相同 `C=257、N=8` 的 FP16/FP32 no-bias 用例分别耗时 603.49/452.32 秒。
+BF16/FP16 medium forward 也分别耗时 219.19/224.40 秒。主要成本仍是每个新 `(C,N,dtype)` 的
+48 组配置编译和测速，而不是精度比较本身。
+
+原生 forward 在 `(1367,1,4,4097)` 还选择了产生 **coreDim=88855** 的配置，超过昇腾 65535 上限。
+此后 NPU Event 出现 `event recorder null`，后续大量失败是设备状态异常后的连带失败，不能解释为
+95 项独立数值错误。鉴于近一小时的耗时和原生 grid 风险，最终昇腾精度测试也不探测原生
+Megatron，直接使用 Torch 组合参考；其他平台仍保持原生优先、缺失回退。该路径全量 pre-commit
+通过，功能测试为 **137 passed、4 skipped，3.69 秒**，导入拦截确认没有访问 Megatron。
+
+### 6.37 当前 NV 折算性能与后续实验范围
+
+在 rebase 到 `3f1ffd6` 之前的工作区，按第 6.35 节口径重新实测了当前昇腾实现。Forward 48 点
+全部成功，各点 `vs Base` 的算术平均为：BF16 **0.309x**、FP16 **0.532x**、FP32 **0.268x**，
+总体 **0.370x**。FP16 均值包含 4.249x 和 1.399x 两个使用不同折算系数的高点，不能将均值
+理解为所有形状的典型收益。Backward 只有 BF16 前 4 点可用，`vs Base` 为
+**0.552/0.477/0.507/0.705**，平均 **0.560x**；第 5 点仍因外部 NV 数据缺失而停止，不能给出
+完整反向均值。
+
+小形状单次完整 API 约 0.14–0.16 ms，而大 BF16 `(8192,4,4,7168)` forward 约 14–16 ms，说明
+启动开销和设备计算需要分开处理。后续受控实验限定为主机提交/设备时间分项计时、连续输入启动
+快路径，以及编译期 `EVEN_C` mask 特化。输出和调用方指针不缓存复用，非连续输入保持支持；
+不再重复历史上失败的扩大 grid、4096 通道块、扩展行 dot、B split-C 和扩大 bias split。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
