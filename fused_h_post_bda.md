@@ -1554,6 +1554,19 @@ BLOCK_C=1024 时，最大 BF16/FP32 为 7.637/8.949 ms，medium 为 0.316/0.313 
 简单替换 `tl.store` 为 DSA copy 或增加 stage 就预设收益。二维拼接输出、额外 FP32 partial 和
 增加 GM 读写的两 kernel epilogue 均不建议用于本算子。
 
+### 6.46 无 mask、地址提示和 warps 复验
+
+继续验证完整 C tile 去除 mask 的路径，完整块 load/store 不带 mask，尾块保留原逻辑。该实现增加了
+活跃 buffer，FP32 出现 `ub overflow`（需要 1769472 bits，超过 1572864 bits），因此撤回，没有
+进入性能测量。与历史 `EVEN_C` 无收益结论一致，不能通过复制加载路径来减少谓词。
+
+另外尝试 `tl.max_contiguous(tl.multiple_of(offs_c, BLOCK_C))`，最大 BF16/FP32 为 7.321/8.342 ms，
+与原实现基本持平，说明当前编译器已能识别连续地址，未保留提示。
+
+`num_warps=2/8` 与默认 4 也没有稳定差异：2 在 FP32 上略快但 medium 基本持平；8 在部分 medium
+上更慢。最终恢复 `num_warps=4`。本轮没有新的有效改动，撤回后再次通过
+**153 passed、4 skipped** 和全量 pre-commit。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
