@@ -1507,6 +1507,33 @@ false/false、true/false、false/true、true/true 的最大 BF16 时间为 10.80
 这些结果进一步限定了后续方向：优先继续优化已验证的一维 Vector 计算结构，而不是重复引入
 UB copy 或依赖 91095 专属流水选项。所有 UB/CV 实验都只存在于 pytest 缓存原型中，没有修改正式代码。
 
+### 6.44 1D Vector 接入后的 msprof 瓶颈迁移
+
+对第 6.42 节正式接入的 1D Vector 再次采集最大 BF16 forward。当前每次 API 仍有 8 个
+`_triton_hpb_fwd_vector4_kernel`，单 kernel 平均 **915.251 μs**，合计约 7.32 ms，与同次 Event
+7.35 ms 一致；此前 grouped dot 单 kernel 为 1400.686 μs，设备时间下降约 35%。
+
+新旧指标对照如下（比例为 msprof 报告值，可能包含流水重叠，不能相加作为严格耗时拆分）：
+
+| 指标 | grouped dot | 1D Vector |
+| --- | ---: | ---: |
+| Kernel 类型 | MIX_AIC | AI_VECTOR_CORE |
+| AIC Scalar | 52.37% | 0（无 AIC 活动） |
+| AIC MAC | 6.54% | 0 |
+| AIC Fixpipe | 21.16% | 0 |
+| AIV Scalar | 37.85% | 32.42% |
+| AIV Vector | 16.17% | **76.31%** |
+| AIV MTE2 | 30.01% | 34.86% |
+| AIV MTE3 | 11.18% | **46.68%** |
+| Cube utilization | 91.63% | 0 |
+
+当前瓶颈已从浅 dot、Cube/Fixpipe 和地址准备，转为 **MTE3 输出写回与 MTE2 输入搬运**，同时仍有
+约 32% 的 Scalar/地址开销。AIV bank-group/bank conflict 分别为 11.69%/7.96%，高于 grouped 的
+约 0.1%/3.48%，但 Vector resource conflict 仍为 0，不能将其视为主要瓶颈。
+
+这次对照证明 1D Vector 确实改变了执行路径，而不只是让原 dot 配置变快。后续若继续优化大形状，
+应重点检查输出转换/写回、输入加载与地址计算，不应再以 AIC MAC 或启动开销为主要方向。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
