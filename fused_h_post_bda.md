@@ -1320,6 +1320,51 @@ Ascend Triton 的约束：`mask=None` 时不能传 `other=0.0`，修正后可以
 第 6.35 节的外部 NV 数据缺口限制。没有引入 AOT/C++ 启动层；当前小形状收益不足以证明这类额外
 复杂度的必要性，大形状仍需基于生成代码和设备时间线寻找计算侧突破。
 
+### 6.39 其他算子 NV 折算对照与 forward 分组突破
+
+为判断当前低加速比是否主要来自其他算子的优化方法，在同一昇腾环境补测了三个代表算子。仓库的
+NV JSON 只保存 H800 原始延迟，不包含这些算子的历史 Ascend `vs Base`，因此下表是本轮实测：
+
+| 算子 | 总体平均 `vs Base` | 大形状表现 | NV 基线 kernel 数 |
+| --- | ---: | ---: | ---: |
+| h_post_bda forward | 0.370x（48 点） | 约 0.24–0.26x | 1 个融合 Triton kernel |
+| h_aggregate forward | 2.845x（20 点） | 0.144–0.293x | 2 个 Torch kernel |
+| fused_gated_norm | 2.523x（40 点） | regular 约 0.756–1.194x | 1 个融合 Triton kernel |
+| fast_gelu | 21.131x（21 点） | 约 3.275–6.995x | 9 个 Torch kernel |
+
+这些均值不能直接横向解释。h_aggregate 的高均值来自极小形状，大形状并不比 h_post_bda 好；
+fast_gelu 是单遍单 kernel 对 NV 的 9 个 Torch kernel；h_post_bda 则已经面对 NV 融合 kernel。
+此外，其他算子使用通用 `do_bench_npu` 设备任务计时，h_post_bda 使用完整 API 的 NPU Event，
+小形状口径不同。多数点使用相同的 mem 折算系数 0.389412，差异不是由 h_post_bda 单独受到系数
+惩罚造成的。
+
+fused_gated_norm 的 persistent 和单遍归约确实更有效。其大形状实测约 795 GB/s；当前最大 BF16
+h_post_bda forward 修改前约 304–330 GB/s。要达到该形状 NV 折算 1.0x，约需 3.71 ms、1267 GB/s，
+说明仍存在真实的设备效率差距，不能只靠启动优化解决。
+
+本轮先试验 row-dot 通道循环 `num_stages=2`。最大 BF16 bias 从 14.761 ms 变为 15.876 ms，FP32
+从约 29.55 ms 变为 31.05 ms，没有收益并撤回。随后保持 kernel 不变进行结构对照：
+
+- 中小 `sb` 全部改用 grouped=2 时，FP32 `(512,4,4,4096)` 从约 0.616 ms 退化到 0.976 ms。
+- 原始单块 dot 的 BF16 medium 约 0.975 ms、最大形状约 30.7 ms，均明显慢于现有复用路径。
+- 最大 `sb=32768` 的 grouped=4 使 BF16/FP16 从约 15.45/14.76 ms 降至约 10.94/10.98 ms，
+  FP32 降至约 20.14 ms。
+- grouped=8 时 BF16/FP16 因空块循环退化到约 18.27 ms，FP32 则进一步降至约 17.08 ms。
+
+因此提交 `c7ba7e9` 保留原有 `sb<=8192` row 路径，仅在大 `sb` grouped 路径按 dtype 选择
+`C_GROUP=4`（BF16/FP16）或 8（FP32）。中小 `sb` 不改动。没有增加临时张量、预处理 kernel 或
+Torch 原生计算，也没有改变矩阵乘精度。
+
+正式 48 点 forward 结果为：BF16 0.300250x、FP16 0.592938x、FP32 0.304875x，总体
+**0.399354x**；上一版总体为 0.369625x。BF16 均值仍受跨轮次小形状折算高点波动影响，应以最大
+形状的旧/新耗时作为这项优化的直接证据。最大 BF16 正式点为 10.800/10.841 ms，FP32 为
+17.081/17.081 ms。
+
+Grouped 精度用例新增 FP32 `C=2049`，与原有 BF16 `C=4097` 一起覆盖 8/4 分组及有无 bias。
+全量 pre-commit 通过，最终 **139 passed、4 skipped**。48 点均值仍未达到 0.8x；剩余难点是大量
+小形状的完整 API 成本和 medium/大形状的浅小 dot 效率，不能把本轮单点约 30% 的设备收益写成
+已达到目标。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
