@@ -1365,6 +1365,45 @@ Grouped 精度用例新增 FP32 `C=2049`，与原有 BF16 `C=4097` 一起覆盖 
 小形状的完整 API 成本和 medium/大形状的浅小 dot 效率，不能把本轮单点约 30% 的设备收益写成
 已达到目标。
 
+### 6.40 msprof 流水线证据与最低点小形状实验
+
+本轮使用 CANN 的 `msprof` 实测，而不是仅依赖 Event 和 Python cProfile。采集命令形式为：
+
+```bash
+msprof --output=<目录> --task-time=on --ai-core=on \
+  --aic-mode=task-based --aic-metrics=PipeUtilization python <profile脚本>
+```
+
+最大 BF16 `(8192,4,4,7168)` forward 每次 API 有 8 个 grouped kernel，单 kernel 平均
+**1.400685 ms**，合计约 11.21 ms，与同次 Event 的 11.29 ms 接近；kernel 间隙通常只有 2–3 μs。
+因此大形状耗时几乎都在 kernel 内，不是启动间隙。
+
+`PipeUtilization` 中，AIC Scalar/MAC/MTE1/MTE2/Fixpipe 的平均比值分别为
+**52.37%/6.54%/21.56%/33.07%/21.16%**；AIV Scalar/Vector/MTE2/MTE3 分别为
+**37.85%/16.17%/30.01%/11.18%**，Cube utilization 为 91.63%。这些比例可以包含流水重叠，不能
+相加作为严格耗时拆分，但说明标量/地址和搬运开销明显，真正 MAC 占比很低。资源冲突约
+0–3.48%，UB 带宽只有数 GB/s，没有显示 bank conflict 或 UB 带宽瓶颈。`Memory` 模式的 HBM 数值与
+理论流量不一致，未据此宣称 HBM 已达上限。
+
+随后对当前最低点 BF16 `(1,1,1,1)` 有 bias（约 0.102x）单独采集。其 Triton kernel 纯设备时间
+约 **2.418 μs**，正式完整 API 约 128.9 μs，约 **98%** 在主机路径。该点达到 0.8x 需要完整 API
+约 16.43 μs，即接近 8 倍的主机路径缩减；device context 或少量 Python 微调无法达到该目标。
+
+针对这一最低点做了三个独立原型：
+
+1. 用 `lru_cache` 保存 `(sb,N,C,dtype)` 派生的 shape 启动计划。不保存指针或输出，但缓存包装本身
+   抵消了整数计算收益，三个小形状没有改善，已撤回。
+2. 在固定启动缓存中保存并直接调用底层 C `launch`，保留 hook/debug 回退和 msprof 注册状态。
+   多轮测量没有稳定收益，说明 NPULauncher 的 Python 外层不是主要剩余成本，已撤回。
+3. 单批 basic-dot 按固定参数布局直接构造对齐/整数特化 key，避免遍历 `kernel.params`。定向仅约
+   2–4 μs 收益，但完整 48 点均值为 **0.395292x**，低于上一轮的 0.399354x，最小点也没有稳定
+   改善，因此撤回，未保留专用分支。
+
+上述原型最终均不在代码分支中，当前有效代码仍为 `c7ba7e9`。实验中的 139 项精度回归和
+pre-commit 通过。后续若要继续改善最低点，需要评估真正降低驱动启动和 Python API 成本的机制，
+而不是继续重复现有 Python 包装微调；大形状则应结合生成 IR 检查公共行基址、mask/地址计算和
+Cube/Vector 数据交换。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
