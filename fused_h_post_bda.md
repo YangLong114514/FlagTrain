@@ -1404,6 +1404,55 @@ pre-commit 通过。后续若要继续改善最低点，需要评估真正降低
 而不是继续重复现有 Python 包装微调；大形状则应结合生成 IR 检查公共行基址、mask/地址计算和
 Cube/Vector 数据交换。
 
+### 6.41 Row 去重、平衡分组、Backward A 与 Vector 原型
+
+继续按上述瓶颈做了四组实验。首先确认 row-dot 存在确定的跨批重复覆盖：原循环从
+`program_id + tile_offset` 开始，以当前批的 `num_programs` 为步长遍历到全局 `sb`，但启动器又会
+增加 `tile_offset`。在 `sb=8192` 时，第一批已覆盖全部行，第二批又计算后 4096 行，总计执行
+12288 行，增加 50% 无效工作。该问题影响 `4096<sb<=8192` 的 row 路径；重复写入相同结果，所以原
+精度测试无法发现。修复后每个 program 只处理 `program_id + tile_offset` 对应的一行，不再循环。
+
+`(2048,4,4,4096)` 的旧/新 Event 为：BF16 **2.319→1.848 ms**，FP32 **3.305→2.473 ms**。
+当前 48 点没有该区间的 shape，最大 `sb=32768` 仍走 grouped，因此该修复不会直接提高现有均值。
+新增 BF16 双 bias 回归覆盖该形状。
+
+Grouped 空块使用平衡分组，而不是只处理单组：
+
+```text
+c_groups = ceil(c_blocks / default_c_group)
+c_group  = ceil(c_blocks / c_groups)
+```
+
+这样不增加组数，同时减少末组无效循环。FP32 最大 forward 从 17.08 ms 降至定向约 **15.34 ms**，
+BF16 保持约 10.8 ms。除原有 BF16 `C=4097` 和 FP32 `C=2049` 外，新增 BF16 `C=9217` 多组尾块回归。
+
+Backward A 在大 `sb` 上独立扫描分组，NP=16 不变。最大完整 backward 的旧版、A=4、A=8 分别为：
+
+| dtype | A=2 原路径 | A=4 | A=8 |
+| --- | ---: | ---: | ---: |
+| BF16 | 24.233 ms | 17.542 ms | 23.424 ms |
+| FP32 | 42.338 ms | 26.184 ms | 22.979 ms |
+
+最终仅在 `sb>8192` 时使用 BF16/FP16=4、FP32=8，并应用同样的平衡分组；中小 `sb` 保持 A=2。
+新增 BF16/FP32、`sb=8193` 的非整块 C 和双 bias 五个梯度回归。
+
+小 backward bias 融合扩展到 `N=4、sb=6/8` 时有明显 dtype 分化。BF16/FP16 的 `sb=8` 从约
+0.35–0.37 ms 退化到 2.29 ms，因此不启用；FP32 `sb=8` 从 0.258→0.242 ms，`sb=6` 从
+0.266→0.174 ms，仅保留 FP32。计算仍先执行 `g_x_acc -> 输出 dtype -> FP32`，再沿行求和，
+`grad_bias` 与 `grad_x` 独立分配。多行 FP32 与 Torch 归约存在约 7.45e-9 的顺序误差，新增测试使用
+现有容差；sb=1/2 仍保留逐位检查。
+
+N=4 Vector 原型使用四个独立二维 FP32 accumulator、H/Hpost 预加载和单次 residual 读取，不使用
+`tl.dot`。首次随机精度失败后恢复“dot 后加 post”的顺序仍未通过；单位矩阵输入也出现大量错误，
+说明当前编译器不能可靠 lowering 该多 accumulator/地址结构。未进入性能扫描，所有 Vector 代码和
+分发均撤回。作为上限对照，相同输出布局的纯 Triton 连续拷贝为 **3.111 ms、约 1208 GB/s**，高于
+最大 forward 达到 0.8x 所需的约 0.9 TB/s；这说明内存系统理论上可支持目标，但当前 Vector 结构
+尚不能利用它。
+
+最终全量 pre-commit 通过，新增分支回归为 **153 passed、4 skipped**。最新 forward 48 点均值为
+BF16 0.340063x、FP16 0.566812x、FP32 0.306688x，总体 **0.404521x**，仍未达到 0.8x；最大 FP32
+正式点为 15.383/15.410 ms。Backward 的 NV JSON 缺口不变，不能用已有 4 点代表完整反向性能。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
