@@ -302,7 +302,8 @@ def fused_h_post_bda_forward(
                     num_warps=4,
                 )
             elif n <= 8 and c_blocks > 1:
-                c_groups = triton.cdiv(c_blocks, 2)
+                c_group = 8 if h_res.dtype == torch.float32 else 4
+                c_groups = triton.cdiv(c_blocks, c_group)
                 _launch_fixed_tiles(
                     _triton_hpb_fwd_grouped_dot_kernel,
                     sb * c_groups,
@@ -319,7 +320,7 @@ def fused_h_post_bda_forward(
                     bias is not None,
                     dot_block_c,
                     c_blocks,
-                    2,
+                    c_group,
                     c_groups,
                     offset_index=6,
                     num_warps=4,
