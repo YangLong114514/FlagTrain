@@ -188,12 +188,15 @@ def test_forward_row_dot_matches_reference(dtype, with_bias):
 
 @pytest.mark.fused_h_post_bda_forward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-def test_forward_grouped_dot_matches_reference(with_bias):
+@pytest.mark.parametrize(
+    "dtype,channels", [(torch.bfloat16, 4097), (torch.float32, 2049)]
+)
+def test_forward_grouped_dot_matches_reference(with_bias, dtype, channels):
     torch.manual_seed(2026)
-    inputs = _make_inputs(8193, 1, 4, 4097, torch.bfloat16, with_bias)
+    inputs = _make_inputs(8193, 1, 4, channels, dtype, with_bias)
     actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, torch.bfloat16, "grouped-dot output")
+    _assert_close(actual, expected, dtype, "grouped-dot output")
 
 
 @pytest.mark.fused_h_post_bda_forward
