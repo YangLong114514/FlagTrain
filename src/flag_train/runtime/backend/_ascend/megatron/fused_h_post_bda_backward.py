@@ -235,6 +235,82 @@ def _triton_hpb_bwd_a_grouped_dot_kernel(
 
 
 @triton.jit
+def _triton_hpb_bwd_a_vector4_kernel(
+    go_ptr,
+    hr_ptr,
+    hp_ptr,
+    g_res_ptr,
+    g_x_ptr,
+    g_bias_ptr,
+    tile_offset,
+    C: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid_s = tl.program_id(0) + tile_offset
+    hr_base = hr_ptr + pid_s * 16
+    h00 = tl.load(hr_base + 0)
+    h01 = tl.load(hr_base + 1)
+    h02 = tl.load(hr_base + 2)
+    h03 = tl.load(hr_base + 3)
+    h10 = tl.load(hr_base + 4)
+    h11 = tl.load(hr_base + 5)
+    h12 = tl.load(hr_base + 6)
+    h13 = tl.load(hr_base + 7)
+    h20 = tl.load(hr_base + 8)
+    h21 = tl.load(hr_base + 9)
+    h22 = tl.load(hr_base + 10)
+    h23 = tl.load(hr_base + 11)
+    h30 = tl.load(hr_base + 12)
+    h31 = tl.load(hr_base + 13)
+    h32 = tl.load(hr_base + 14)
+    h33 = tl.load(hr_base + 15)
+    hp_base = hp_ptr + pid_s * 4
+    hp0 = tl.load(hp_base + 0).to(tl.float32)
+    hp1 = tl.load(hp_base + 1).to(tl.float32)
+    hp2 = tl.load(hp_base + 2).to(tl.float32)
+    hp3 = tl.load(hp_base + 3).to(tl.float32)
+    for c_start in range(0, C, BLOCK_C):
+        offs_c = c_start + tl.arange(0, BLOCK_C)
+        mask_c = offs_c < C
+        go_base = go_ptr + pid_s * 4 * C
+        go0 = tl.load(go_base + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        go1 = tl.load(go_base + C + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        go2 = tl.load(go_base + 2 * C + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        go3 = tl.load(go_base + 3 * C + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+        g_res0 = h00 * go0 + h01 * go1 + h02 * go2 + h03 * go3
+        g_res1 = h10 * go0 + h11 * go1 + h12 * go2 + h13 * go3
+        g_res2 = h20 * go0 + h21 * go1 + h22 * go2 + h23 * go3
+        g_res3 = h30 * go0 + h31 * go1 + h32 * go2 + h33 * go3
+        g_x = hp0 * go0 + hp1 * go1 + hp2 * go2 + hp3 * go3
+        g_res_base = g_res_ptr + pid_s * 4 * C + offs_c
+        tl.store(
+            g_res_base,
+            g_res0.to(g_res_ptr.dtype.element_ty),
+            mask=mask_c,
+        )
+        tl.store(
+            g_res_base + C,
+            g_res1.to(g_res_ptr.dtype.element_ty),
+            mask=mask_c,
+        )
+        tl.store(
+            g_res_base + 2 * C,
+            g_res2.to(g_res_ptr.dtype.element_ty),
+            mask=mask_c,
+        )
+        tl.store(
+            g_res_base + 3 * C,
+            g_res3.to(g_res_ptr.dtype.element_ty),
+            mask=mask_c,
+        )
+        g_x_out = g_x.to(g_x_ptr.dtype.element_ty)
+        tl.store(g_x_ptr + pid_s * C + offs_c, g_x_out, mask=mask_c)
+        if HAS_BIAS:
+            tl.store(g_bias_ptr + offs_c, g_x_out, mask=mask_c)
+
+
+@triton.jit
 def _triton_hpb_bwd_b_dot_kernel(
     go_ptr,
     orig_ptr,
@@ -320,7 +396,7 @@ def _triton_hpb_bwd_small_bias_kernel(
     stride_orig_c,
     BLOCK_C: tl.constexpr,
     BLOCK_S: tl.constexpr,
-    SUM_BIAS2: tl.constexpr,
+    SUM_BIAS: tl.constexpr,
 ):
     pid_s = tl.program_id(0)
     offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
@@ -396,7 +472,7 @@ def _triton_hpb_bwd_small_bias_kernel(
             g_x_acc.to(g_x_ptr.dtype.element_ty),
             mask=mask_2d,
         )
-        if SUM_BIAS2:
+        if SUM_BIAS:
             g_bias = tl.sum(g_x_acc.to(g_x_ptr.dtype.element_ty).to(tl.float32), axis=0)
             tl.store(
                 g_bias_ptr + offs_c,
@@ -606,7 +682,13 @@ def fused_h_post_bda_backward(
     stride_hr_s = n * n
 
     small_bias_fused = (
-        small_fused and (sb == 1 or (sb == 2 and n <= 2)) and bias is not None
+        small_fused
+        and (
+            sb == 1
+            or (sb == 2 and n <= 2)
+            or (h_res.dtype == torch.float32 and n == 4 and sb in (6, 8))
+        )
+        and bias is not None
     )
     dot_bias1_fused = dot_eligible and sb == 1 and bias is not None
     bias_fused = small_bias_fused or dot_bias1_fused
@@ -618,7 +700,7 @@ def fused_h_post_bda_backward(
     if small_fused:
         config = {
             "BLOCK_C": 64,
-            "BLOCK_S": 2 if n <= 2 else 1,
+            "BLOCK_S": (2 if n <= 2 else (sb if small_bias_fused and n == 4 else 1)),
             "num_warps": 4,
         }
         with _disable_aabs(), _device_context(h_res.device):
@@ -651,7 +733,7 @@ def fused_h_post_bda_backward(
                     1,
                     config["BLOCK_C"],
                     config["BLOCK_S"],
-                    sb == 2,
+                    sb > 1,
                     num_warps=config["num_warps"],
                 )
             else:
@@ -687,8 +769,33 @@ def fused_h_post_bda_backward(
                 )
     elif dot_eligible:
         with _device_context(h_res.device):
-            if c_blocks > 1:
-                c_groups = triton.cdiv(c_blocks, 2)
+            if n == 4 and c_blocks > 1:
+                vector_block_c = (
+                    1024 if sb > 8192 and h_res.dtype != torch.float32 else 2048
+                )
+                _launch_fixed_tiles(
+                    _triton_hpb_bwd_a_vector4_kernel,
+                    sb,
+                    go_flat,
+                    hr_flat,
+                    hp_flat,
+                    g_res,
+                    g_x,
+                    g_bias if dot_bias1_fused else g_x,
+                    0,
+                    channels,
+                    dot_bias1_fused,
+                    vector_block_c,
+                    offset_index=6,
+                    num_warps=4,
+                )
+            elif c_blocks > 1:
+                if sb > 8192:
+                    default_c_group = 8 if h_res.dtype == torch.float32 else 4
+                else:
+                    default_c_group = 2
+                c_groups = triton.cdiv(c_blocks, default_c_group)
+                c_group = triton.cdiv(c_blocks, c_groups)
                 _launch_fixed_tiles(
                     _triton_hpb_bwd_a_grouped_dot_kernel,
                     sb * c_groups,
@@ -705,7 +812,7 @@ def fused_h_post_bda_backward(
                     dot_bias1_fused,
                     dot_block_c,
                     c_blocks,
-                    2,
+                    c_group,
                     c_groups,
                     offset_index=6,
                     num_warps=4,
