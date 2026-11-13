@@ -246,6 +246,24 @@ def test_backward_multiple_launch_batches_match_reference(with_bias):
 
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize(
+    "dtype,channels", [(torch.bfloat16, 4097), (torch.float32, 2049)]
+)
+def test_backward_large_a_matches_reference(with_bias, dtype, channels):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(8193, 1, 4, channels, dtype, with_bias)
+    grad_output = _rand((8193, 1, 4, channels), dtype)
+    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
+    )
+
+    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
+        _assert_close(actual_grad, expected_grad, dtype, name)
+
+
+@pytest.mark.fused_h_post_bda_backward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("channels", [513, 768])
 def test_backward_padded_b_channel_matches_reference(channels, with_bias):
     torch.manual_seed(2026)
@@ -279,7 +297,14 @@ def test_backward_scalar_b_respects_grid_limit():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "s,b,n,channels",
-    [(1, 1, 4, 130), (1, 2, 2, 65), (1, 2, 2, 130), (1, 2, 2, 1024)],
+    [
+        (1, 1, 4, 130),
+        (1, 2, 2, 65),
+        (1, 2, 2, 130),
+        (1, 2, 2, 1024),
+        (2, 3, 4, 130),
+        (2, 4, 4, 1024),
+    ],
 )
 def test_backward_small_fused_bias_is_independent(dtype, s, b, n, channels):
     torch.manual_seed(2026)
@@ -296,18 +321,24 @@ def test_backward_small_fused_bias_is_independent(dtype, s, b, n, channels):
     expected_bias = (
         actual[3].view(s * b, channels).to(torch.float32).sum(dim=0).to(dtype)
     )
-    utils.train_assert_equal(
-        utils.to_reference(actual[4]), utils.to_reference(expected_bias)
-    )
+    if s * b <= 2:
+        utils.train_assert_equal(
+            utils.to_reference(actual[4]), utils.to_reference(expected_bias)
+        )
+    else:
+        _assert_close(
+            actual[4], _reference_copy(expected_bias), dtype, "independent bias"
+        )
 
 
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("n", [4, 8])
 @pytest.mark.parametrize("channels", [512, 2048, 4097, 7168])
-def test_backward_dot_single_row_bias_is_independent(dtype, channels):
+def test_backward_dot_single_row_bias_is_independent(dtype, n, channels):
     torch.manual_seed(2026)
-    inputs = _make_inputs(1, 1, 8, channels, dtype, with_bias=True)
-    grad_output = _rand((1, 1, 8, channels), dtype)
+    inputs = _make_inputs(1, 1, n, channels, dtype, with_bias=True)
+    grad_output = _rand((1, 1, n, channels), dtype)
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
     expected = tuple(
         _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
@@ -324,8 +355,14 @@ def test_backward_dot_single_row_bias_is_independent(dtype, channels):
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize(
     "s,b,n,channels",
-    [(2, 1, 4, 130), (128, 1, 8, 512), (1, 1, 8, 513)],
-    ids=["small_fused", "dot", "dot_bias1"],
+    [
+        (2, 1, 4, 130),
+        (128, 1, 8, 512),
+        (1, 1, 8, 513),
+        (128, 1, 4, 4097),
+        (1, 1, 4, 4097),
+    ],
+    ids=["small_fused", "dot", "dot_bias1", "vector4", "vector4_bias1"],
 )
 def test_backward_accepts_non_contiguous_inputs(s, b, n, channels):
     torch.manual_seed(2026)
