@@ -198,6 +198,29 @@ def test_forward_row_dot_multiple_launch_batches_match_reference(with_bias):
 
 @pytest.mark.fused_h_post_bda_forward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_forward_vector4_rows_match_reference(dtype, with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(2048, 4, 4, 4097, dtype, with_bias)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(reference_op(*inputs))
+    _assert_close(actual, expected, dtype, "vector4-rows output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+def test_forward_vector4_rows_multiple_launch_batches_match_reference(with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(20480, 2, 4, 2049, torch.bfloat16, with_bias)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(reference_op(*inputs))
+    _assert_close(
+        actual, expected, torch.bfloat16, "vector4-rows multiple-batch output"
+    )
+
+
+@pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize(
     "dtype,channels",
     [(torch.bfloat16, 4097), (torch.float32, 2049), (torch.bfloat16, 9217)],
@@ -273,10 +296,23 @@ def test_forward_repeated_single_tile_calls_match_reference(
         )
     first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    first_sum = first.float().sum()
     expected = _reference_copy(reference_op(*inputs))
-    assert first.data_ptr() != second.data_ptr()
+    assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
+    utils.train_assert_equal(
+        utils.to_reference(first_sum), utils.to_reference(first.float().sum())
+    )
     _assert_close(first, expected, dtype, "first repeated-call output")
     _assert_close(second, expected, dtype, "second repeated-call output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+def test_forward_cached_rejects_mismatched_input():
+    inputs = _make_inputs(2, 3, 4, 130, torch.bfloat16, with_bias=False)
+    for _ in range(2):
+        flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    with pytest.raises(ValueError, match="h_res must have shape"):
+        flag_train.megatron.fused_h_post_bda_forward(inputs[0][:0], *inputs[1:])
 
 
 @pytest.mark.fused_h_post_bda_forward

@@ -126,6 +126,7 @@ class FusedHPostBDABackwardBenchmark(base.GenericBenchmark):
         return list(_COMPREHENSIVE_SHAPES)
 
 
+@pytest.mark.skip_native(vendors="ascend", reason="use NVIDIA base-data (vs Base)")
 @pytest.mark.fused_h_post_bda_backward
 def test_fused_h_post_bda_backward_perf():
     print(f"\nBaseline: {_BASELINE}")

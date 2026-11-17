@@ -30,6 +30,8 @@ _DTYPE_SHAPE_CASES = [
     (torch.bfloat16, 1, 1, 8, 257),
     (torch.bfloat16, 2, 5, 8, 257),
     (torch.bfloat16, 513, 1, 4, 130),
+    (torch.bfloat16, 513, 1, 4, 65),
+    (torch.bfloat16, 513, 1, 2, 130),
     (torch.float16, 1, 2, 2, 65),
     (torch.float16, 2, 1, 4, 130),
     (torch.float16, 1, 1, 8, 257),
@@ -215,7 +217,17 @@ def test_backward_split_c_matches_reference(dtype, with_bias):
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("s,b,n,channels", [(128, 1, 4, 512), (128, 1, 8, 2048)])
+@pytest.mark.parametrize(
+    "s,b,n,channels",
+    [
+        (128, 1, 4, 256),
+        (128, 1, 4, 300),
+        (128, 1, 8, 256),
+        (128, 1, 4, 512),
+        (128, 1, 2, 256),
+        (128, 1, 2, 100),
+    ],
+)
 def test_backward_dot_threshold_matches_reference(dtype, s, b, n, channels, with_bias):
     torch.manual_seed(2026)
     inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
@@ -359,10 +371,20 @@ def test_backward_dot_single_row_bias_is_independent(dtype, n, channels):
         (2, 1, 4, 130),
         (128, 1, 8, 512),
         (1, 1, 8, 513),
+        (128, 1, 4, 512),
+        (128, 1, 2, 256),
         (128, 1, 4, 4097),
         (1, 1, 4, 4097),
     ],
-    ids=["small_fused", "dot", "dot_bias1", "vector4", "vector4_bias1"],
+    ids=[
+        "small_fused",
+        "dot",
+        "dot_bias1",
+        "vector4_single",
+        "vecn_single",
+        "vector4",
+        "vector4_bias1",
+    ],
 )
 def test_backward_accepts_non_contiguous_inputs(s, b, n, channels):
     torch.manual_seed(2026)
@@ -380,3 +402,50 @@ def test_backward_accepts_non_contiguous_inputs(s, b, n, channels):
         _assert_close(
             actual_grad, expected_grad, torch.bfloat16, f"non-contiguous {name}"
         )
+
+
+@pytest.mark.fused_h_post_bda_backward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_backward_repeated_small_cached_calls_match_reference(dtype, with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(1, 2, 2, 65, dtype, with_bias)
+    grad_output = _rand((1, 2, 2, 65), dtype)
+    first = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+    first_sums = tuple(
+        grad.float().sum() if grad is not None else None for grad in first
+    )
+    second = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
+    )
+
+    for index, (first_grad, second_grad, expected_grad) in enumerate(
+        zip(first, second, expected)
+    ):
+        if expected_grad is None:
+            assert first_grad is None and second_grad is None
+            continue
+        assert (
+            first_grad.untyped_storage().data_ptr()
+            != second_grad.untyped_storage().data_ptr()
+        )
+        utils.train_assert_equal(
+            utils.to_reference(first_sums[index]),
+            utils.to_reference(first_grad.float().sum()),
+        )
+        _assert_close(first_grad, expected_grad, dtype, "first cached call")
+        _assert_close(second_grad, expected_grad, dtype, "second cached call")
+    assert len(
+        {grad.untyped_storage().data_ptr() for grad in second if grad is not None}
+    ) == sum(grad is not None for grad in expected)
+
+
+@pytest.mark.fused_h_post_bda_backward
+def test_backward_cached_rejects_mismatched_grad_output():
+    inputs = _make_inputs(1, 2, 2, 65, torch.bfloat16, with_bias=False)
+    grad_output = _rand((1, 2, 2, 65), torch.bfloat16)
+    for _ in range(2):
+        flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+    with pytest.raises(ValueError, match="grad_output must have shape"):
+        flag_train.megatron.fused_h_post_bda_backward(grad_output[:0], *inputs)

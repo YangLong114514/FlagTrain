@@ -32,8 +32,11 @@ from flag_train.runtime import torch_device_fn
 
 from ._hpb_native_forward import current_stream as _native_current_stream
 from ._hpb_native_forward import get_plan as _native_get_plan
+from ._hpb_native_forward import launch_cached as _native_launch_cached
 from ._hpb_native_forward import launch_plan as _native_launch_plan
+from ._hpb_native_forward import launch_vec4_plan as _native_launch_vec4_plan
 from ._hpb_native_forward import register_plan as _native_register_plan
+from ._hpb_native_forward import register_tile_plan as _native_register_tile_plan
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +310,70 @@ def _triton_hpb_fwd_vector4_kernel(
         tl.store(out_base + 3 * C, out3.to(out_ptr.dtype.element_ty), mask=mask_c)
 
 
+@triton.jit
+def _triton_hpb_fwd_vector4_rows_kernel(
+    hr_ptr,
+    orig_ptr,
+    hp_ptr,
+    x_ptr,
+    bias_ptr,
+    out_ptr,
+    tile_offset,
+    sb,
+    C: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    pid = tl.program_id(0) + tile_offset
+    for row in range(ROWS):
+        pid_s = pid * ROWS + row
+        hr_base = hr_ptr + pid_s * 16
+        h00 = tl.load(hr_base + 0)
+        h01 = tl.load(hr_base + 1)
+        h02 = tl.load(hr_base + 2)
+        h03 = tl.load(hr_base + 3)
+        h10 = tl.load(hr_base + 4)
+        h11 = tl.load(hr_base + 5)
+        h12 = tl.load(hr_base + 6)
+        h13 = tl.load(hr_base + 7)
+        h20 = tl.load(hr_base + 8)
+        h21 = tl.load(hr_base + 9)
+        h22 = tl.load(hr_base + 10)
+        h23 = tl.load(hr_base + 11)
+        h30 = tl.load(hr_base + 12)
+        h31 = tl.load(hr_base + 13)
+        h32 = tl.load(hr_base + 14)
+        h33 = tl.load(hr_base + 15)
+        hp_base = hp_ptr + pid_s * 4
+        hp0 = tl.load(hp_base + 0).to(tl.float32)
+        hp1 = tl.load(hp_base + 1).to(tl.float32)
+        hp2 = tl.load(hp_base + 2).to(tl.float32)
+        hp3 = tl.load(hp_base + 3).to(tl.float32)
+        for c_start in range(0, C, BLOCK_C):
+            offs_c = c_start + tl.arange(0, BLOCK_C)
+            mask_c = offs_c < C
+            xb = tl.load(x_ptr + pid_s * C + offs_c, mask=mask_c, other=0.0).to(
+                tl.float32
+            )
+            if HAS_BIAS:
+                xb += tl.load(bias_ptr + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+            orig_base = orig_ptr + pid_s * 4 * C + offs_c
+            orig0 = tl.load(orig_base, mask=mask_c, other=0.0).to(tl.float32)
+            orig1 = tl.load(orig_base + C, mask=mask_c, other=0.0).to(tl.float32)
+            orig2 = tl.load(orig_base + 2 * C, mask=mask_c, other=0.0).to(tl.float32)
+            orig3 = tl.load(orig_base + 3 * C, mask=mask_c, other=0.0).to(tl.float32)
+            out0 = h00 * orig0 + h10 * orig1 + h20 * orig2 + h30 * orig3 + hp0 * xb
+            out1 = h01 * orig0 + h11 * orig1 + h21 * orig2 + h31 * orig3 + hp1 * xb
+            out2 = h02 * orig0 + h12 * orig1 + h22 * orig2 + h32 * orig3 + hp2 * xb
+            out3 = h03 * orig0 + h13 * orig1 + h23 * orig2 + h33 * orig3 + hp3 * xb
+            out_base = out_ptr + pid_s * 4 * C + offs_c
+            tl.store(out_base, out0.to(out_ptr.dtype.element_ty), mask=mask_c)
+            tl.store(out_base + C, out1.to(out_ptr.dtype.element_ty), mask=mask_c)
+            tl.store(out_base + 2 * C, out2.to(out_ptr.dtype.element_ty), mask=mask_c)
+            tl.store(out_base + 3 * C, out3.to(out_ptr.dtype.element_ty), mask=mask_c)
+
+
 def _grid_a_config(sb, channels):
     config = _FIXED_CONFIG.copy()
     config["BLOCK_C"] = min(
@@ -337,7 +404,7 @@ def _native_dot_shape_key(original_residual, bias):
         return None
     max_block_c = 1024 if original_residual.dtype == torch.float32 else _DOT_BLOCK_C
     dot_block_c = min(max_block_c, max(64, 1 << (channels - 1).bit_length()))
-    if channels > dot_block_c:
+    if channels > dot_block_c and n > 8:
         return None
     if triton.knobs.runtime.launch_enter_hook.calls or (
         triton.knobs.runtime.launch_exit_hook.calls
@@ -360,6 +427,12 @@ def fused_h_post_bda_forward(
 ) -> Tensor:
     """Compute ``H_res.T @ original_residual + H_post * (x + bias)``."""
     logger.debug("TRAIN_ASCEND FUSED_H_POST_BDA_FORWARD")
+    if not triton.knobs.runtime.launch_enter_hook.calls and not (
+        triton.knobs.runtime.launch_exit_hook.calls
+    ):
+        out = _native_launch_cached(h_res, original_residual, h_post, x, bias)
+        if out is not None:
+            return out
     native_shape_key = _native_dot_shape_key(original_residual, bias)
     native_plan_key = None
     if native_shape_key is not None:
@@ -368,9 +441,14 @@ def fused_h_post_bda_forward(
             native_plan_key = (*native_shape_key, stream)
             plan = _native_get_plan(native_plan_key)
             if plan is not None:
-                out = _native_launch_plan(
-                    plan, stream, h_res, original_residual, h_post, x, bias
-                )
+                if len(plan) > 4:
+                    out = _native_launch_vec4_plan(
+                        plan, stream, h_res, original_residual, h_post, x, bias
+                    )
+                else:
+                    out = _native_launch_plan(
+                        plan, stream, h_res, original_residual, h_post, x, bias
+                    )
                 if out is not None:
                     return out
     s, b, n, channels = _validate_inputs(h_res, original_residual, h_post, x, bias)
@@ -387,7 +465,32 @@ def fused_h_post_bda_forward(
         c_blocks = triton.cdiv(channels, dot_block_c)
         num_tiles = sb * c_blocks
         with _device_context(h_res.device):
-            if n == 4 and c_blocks > 1:
+            if (
+                n == 4
+                and c_blocks > 1
+                and h_res.dtype in (torch.bfloat16, torch.float16)
+                and sb > 4096
+                and sb % 8 == 0
+            ):
+                _launch_fixed_tiles(
+                    _triton_hpb_fwd_vector4_rows_kernel,
+                    sb // 8,
+                    hr_flat,
+                    orig_flat,
+                    hp_flat,
+                    x_flat,
+                    bias_flat,
+                    out,
+                    0,
+                    sb,
+                    channels,
+                    bias is not None,
+                    1024,
+                    8,
+                    offset_index=6,
+                    num_warps=4,
+                )
+            elif n == 4 and c_blocks > 1:
                 _launch_fixed_tiles(
                     _triton_hpb_fwd_vector4_kernel,
                     sb,
@@ -405,6 +508,30 @@ def fused_h_post_bda_forward(
                     offset_index=6,
                     num_warps=4,
                 )
+                if native_plan_key is not None:
+                    compiled = _triton_hpb_fwd_vector4_kernel.warmup(
+                        hr_flat,
+                        orig_flat,
+                        hp_flat,
+                        x_flat,
+                        bias_flat,
+                        out,
+                        0,
+                        sb,
+                        channels,
+                        bias is not None,
+                        2048 if h_res.dtype == torch.float32 else 1024,
+                        grid=(sb, 1, 1),
+                        num_warps=4,
+                    )
+                    _native_register_tile_plan(
+                        native_plan_key,
+                        compiled,
+                        sb,
+                        {"tile_offset": 0, "sb": sb},
+                        (hr_flat, orig_flat, hp_flat, x_flat, bias_flat, out),
+                        h_res.device,
+                    )
             elif n <= 8 and sb <= 8192 and c_blocks > 1:
                 _launch_fixed_tiles(
                     _triton_hpb_fwd_row_dot_kernel,
@@ -426,6 +553,33 @@ def fused_h_post_bda_forward(
                     offset_index=6,
                     num_warps=4,
                 )
+                if native_plan_key is not None:
+                    compiled = _triton_hpb_fwd_row_dot_kernel.warmup(
+                        hr_flat,
+                        orig_flat,
+                        hp_flat,
+                        x_flat,
+                        bias_flat,
+                        out,
+                        0,
+                        sb,
+                        channels,
+                        n,
+                        max(4, n),
+                        bias is not None,
+                        dot_block_c,
+                        c_blocks,
+                        grid=(sb, 1, 1),
+                        num_warps=4,
+                    )
+                    _native_register_tile_plan(
+                        native_plan_key,
+                        compiled,
+                        sb,
+                        {"tile_offset": 0, "sb": sb},
+                        (hr_flat, orig_flat, hp_flat, x_flat, bias_flat, out),
+                        h_res.device,
+                    )
             elif n <= 8 and c_blocks > 1:
                 default_c_group = 8 if h_res.dtype == torch.float32 else 4
                 c_groups = triton.cdiv(c_blocks, default_c_group)

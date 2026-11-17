@@ -38,15 +38,116 @@ _PLANS = {}
 
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
+#include <torch/csrc/Exceptions.h>
+#include <torch/csrc/autograd/python_variable.h>
+#include <ATen/EmptyTensor.h>
 #include <runtime/runtime/rt.h>
+#include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
+#include <torch_npu/csrc/core/npu/NPUGuard.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 
 #include <cstdint>
+#include <cstring>
+#include <deque>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace {
+
+struct PlanKey {
+    int64_t shape[4];
+    int dtype;
+    int device;
+    bool has_bias;
+    uint64_t stream;
+
+    bool operator==(const PlanKey& other) const {
+        return shape[0] == other.shape[0] && shape[1] == other.shape[1] &&
+            shape[2] == other.shape[2] && shape[3] == other.shape[3] &&
+            dtype == other.dtype && device == other.device &&
+            has_bias == other.has_bias && stream == other.stream;
+    }
+};
+
+struct PlanKeyHash {
+    size_t operator()(const PlanKey& key) const {
+        size_t hash = key.dtype * 31 + key.device;
+        for (int64_t dim : key.shape) {
+            hash = hash * 131 + static_cast<size_t>(dim);
+        }
+        hash = hash * 131 + key.has_bias;
+        return hash * 131 + static_cast<size_t>(key.stream);
+    }
+};
+
+PlanKey make_plan_key(
+    const at::Tensor& orig, bool has_bias, uint64_t stream) {
+    return PlanKey{
+        {orig.size(0), orig.size(1), orig.size(2), orig.size(3)},
+        static_cast<int>(orig.scalar_type()),
+        orig.get_device(),
+        has_bias,
+        stream,
+    };
+}
+
+std::unordered_map<PlanKey, std::pair<int, int>, PlanKeyHash> plan_lookup;
+std::unordered_map<int, void*> ffts_addresses;
+
+void* ffts_address(int device) {
+    auto found = ffts_addresses.find(device);
+    if (found != ffts_addresses.end()) {
+        return found->second;
+    }
+    void* ffts_addr = nullptr;
+    uint32_t ffts_len = 0;
+    rtError_t ret = rtGetC2cCtrlAddr(
+        reinterpret_cast<uint64_t*>(&ffts_addr), &ffts_len);
+    TORCH_CHECK(ret == RT_ERROR_NONE, "rtGetC2cCtrlAddr failed: ", ret);
+    ffts_addresses[device] = ffts_addr;
+    return ffts_addr;
+}
+
+at::Tensor empty_output(at::IntArrayRef sizes, at::ScalarType dtype) {
+    return at::detail::empty_generic(
+        sizes,
+        c10_npu::NPUCachingAllocator::get(),
+        c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
+        dtype,
+        c10::MemoryFormat::Contiguous);
+}
+
+struct ContiguousTensor {
+    const at::Tensor* tensor;
+    at::Tensor owned;
+
+    explicit ContiguousTensor(const at::Tensor& input) : tensor(&input) {
+        if (!input.is_contiguous()) {
+            owned = input.contiguous();
+            tensor = &owned;
+        }
+    }
+
+    const at::Tensor& get() const {
+        return *tensor;
+    }
+
+    const void* data_ptr() const {
+        return tensor->data_ptr();
+    }
+};
+
+void bind_plan(
+    int plan_id,
+    int kind,
+    const at::Tensor& orig,
+    bool has_bias,
+    uint64_t stream) {
+    plan_lookup[make_plan_key(orig, has_bias, stream)] = {kind, plan_id};
+}
 
 struct DotPlan {
     const void* function;
@@ -124,41 +225,32 @@ c10::optional<at::Tensor> forward_dot(
     require(n > 0 && (n & (n - 1)) == 0, "n must be a positive power of two");
 
     const DotPlan& plan = plans.at(plan_id);
-    at::Tensor hr_c = hr.contiguous();
-    at::Tensor orig_c = orig.contiguous();
-    at::Tensor hp_c = hp.contiguous();
-    at::Tensor x_c = x.contiguous();
-    c10::optional<at::Tensor> bias_c;
-    if (bias.has_value()) {
-        bias_c = bias->contiguous();
-    }
-    auto aligned = [](const at::Tensor& tensor) {
+    ContiguousTensor hr_c(hr);
+    ContiguousTensor orig_c(orig);
+    ContiguousTensor hp_c(hp);
+    ContiguousTensor x_c(x);
+    ContiguousTensor bias_c(bias.has_value() ? bias.value() : x_c.get());
+    auto aligned = [](const ContiguousTensor& tensor) {
         return reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0;
     };
     if (!aligned(hr_c) || !aligned(orig_c) || !aligned(hp_c) || !aligned(x_c) ||
-        (bias_c.has_value() && !aligned(*bias_c))) {
+        (bias.has_value() && !aligned(bias_c))) {
         return c10::nullopt;
     }
 
-    at::Tensor out = at::empty(orig.sizes(), orig.options());
-    const void* bias_ptr = bias_c.has_value() ? bias_c->data_ptr() : x_c.data_ptr();
+    at::Tensor out = empty_output(orig.sizes(), orig.scalar_type());
+    const void* bias_ptr = bias.has_value() ? bias_c.data_ptr() : x_c.data_ptr();
     const void* function = plan.function;
     const int grid = plan.grid;
-    const std::string name = plan.name;
+    const std::string& name = plan.name;
     const void* hr_ptr = hr_c.data_ptr();
     const void* orig_ptr = orig_c.data_ptr();
     const void* hp_ptr = hp_c.data_ptr();
     const void* x_ptr = x_c.data_ptr();
     const void* out_ptr = out.data_ptr();
     const void* workspace = plan.workspace.data_ptr();
+    void* ffts_addr = ffts_address(orig.get_device());
     auto launch_call = [=]() -> rtError_t {
-        void* ffts_addr = nullptr;
-        uint32_t ffts_len = 0;
-        rtError_t ret = rtGetC2cCtrlAddr(
-            reinterpret_cast<uint64_t*>(&ffts_addr), &ffts_len);
-        if (ret != RT_ERROR_NONE) {
-            return ret;
-        }
         struct __attribute__((packed)) {
             void* ffts_addr __attribute__((aligned(8)));
             void* sync_block_lock __attribute__((aligned(8)));
@@ -198,11 +290,244 @@ c10::optional<at::Tensor> forward_dot(
     return out;
 }
 
+struct Vec4Plan {
+    const void* function;
+    int grid;
+    std::string name;
+    at::Tensor workspace;
+    std::vector<int64_t> ints;
+};
+
+std::deque<Vec4Plan> vec4_plans;
+
+int register_vec4_plan(
+    uint64_t function,
+    int grid,
+    std::string name,
+    at::Tensor workspace,
+    std::vector<int64_t> ints) {
+    vec4_plans.push_back(Vec4Plan{
+        reinterpret_cast<const void*>(function),
+        grid,
+        std::move(name),
+        std::move(workspace),
+        std::move(ints),
+    });
+    return static_cast<int>(vec4_plans.size() - 1);
+}
+
+rtError_t launch_packed(
+    const void* function,
+    int grid,
+    const void* workspace,
+    void* ffts_addr,
+    const void* const* ptrs,
+    size_t ptr_count,
+    const std::vector<int64_t>& ints,
+    uint64_t stream) {
+    alignas(8) uint8_t args[256];
+    size_t args_size = 24 + ptr_count * 8 + ints.size() * 4 + 12;
+    if (args_size > sizeof(args)) {
+        return -1;
+    }
+    size_t offset = 0;
+    auto put_ptr = [&](const void* value) {
+        std::memcpy(args + offset, &value, sizeof(value));
+        offset += sizeof(value);
+    };
+    put_ptr(ffts_addr);
+    put_ptr(nullptr);
+    put_ptr(workspace);
+    for (size_t i = 0; i < ptr_count; ++i) {
+        put_ptr(ptrs[i]);
+    }
+    for (int64_t value : ints) {
+        int32_t v = static_cast<int32_t>(value);
+        std::memcpy(args + offset, &v, sizeof(v));
+        offset += sizeof(v);
+    }
+    int32_t dims[3] = {grid, 1, 1};
+    std::memcpy(args + offset, dims, sizeof(dims));
+    return rtKernelLaunch(
+        function, grid, static_cast<void*>(args), args_size, nullptr,
+        reinterpret_cast<rtStream_t>(stream));
+}
+
+c10::optional<at::Tensor> forward_vec4(
+    int plan_id,
+    uint64_t stream,
+    const at::Tensor& hr,
+    const at::Tensor& orig,
+    const at::Tensor& hp,
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& bias) {
+    auto require = [](bool condition, const char* message) {
+        if (!condition) {
+            throw pybind11::value_error(message);
+        }
+    };
+    require(orig.dim() == 4, "original_residual must have shape [s, b, n, C]");
+    const int64_t s = orig.size(0);
+    const int64_t b = orig.size(1);
+    const int64_t n = orig.size(2);
+    const int64_t channels = orig.size(3);
+    require(n > 0 && n <= 16, "native tile forward requires 0 < n <= 16");
+    require(
+        hr.dim() == 4 && hr.size(0) == s && hr.size(1) == b &&
+            hr.size(2) == n && hr.size(3) == n,
+        "h_res must have shape [s, b, n, n]");
+    require(
+        hp.dim() == 3 && hp.size(0) == s && hp.size(1) == b && hp.size(2) == n,
+        "h_post must have shape [s, b, n]");
+    require(
+        x.dim() == 3 && x.size(0) == s && x.size(1) == b && x.size(2) == channels,
+        "x must have shape [s, b, C]");
+    require(
+        hr.device() == orig.device() && hp.device() == orig.device() &&
+            x.device() == orig.device(),
+        "all inputs must be on the same device");
+    require(
+        hr.scalar_type() == orig.scalar_type() &&
+            hp.scalar_type() == orig.scalar_type() &&
+            x.scalar_type() == orig.scalar_type(),
+        "all inputs must have the same dtype");
+    if (bias.has_value()) {
+        require(
+            bias->dim() == 1 && bias->size(0) == channels,
+            "bias must have shape [C]");
+        require(
+            bias->device() == orig.device() &&
+                bias->scalar_type() == orig.scalar_type(),
+            "bias must have the same device and dtype as the other inputs");
+    }
+    require(
+        orig.device().type() == at::kPrivateUse1,
+        "fused_h_post_bda only supports Ascend tensors");
+    require(s * b != 0 && channels != 0, "empty inputs are not supported");
+
+    const Vec4Plan& plan = vec4_plans.at(plan_id);
+    ContiguousTensor hr_c(hr);
+    ContiguousTensor orig_c(orig);
+    ContiguousTensor hp_c(hp);
+    ContiguousTensor x_c(x);
+    ContiguousTensor bias_c(bias.has_value() ? bias.value() : x_c.get());
+    auto aligned = [](const ContiguousTensor& tensor) {
+        return reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0;
+    };
+    if (!aligned(hr_c) || !aligned(orig_c) || !aligned(hp_c) || !aligned(x_c) ||
+        (bias.has_value() && !aligned(bias_c))) {
+        return c10::nullopt;
+    }
+
+    at::Tensor out = empty_output(orig.sizes(), orig.scalar_type());
+    const void* bias_ptr = bias.has_value() ? bias_c.data_ptr() : x_c.data_ptr();
+    const void* function = plan.function;
+    const int grid = plan.grid;
+    const std::string& name = plan.name;
+    const void* hr_ptr = hr_c.data_ptr();
+    const void* orig_ptr = orig_c.data_ptr();
+    const void* hp_ptr = hp_c.data_ptr();
+    const void* x_ptr = x_c.data_ptr();
+    const void* out_ptr = out.data_ptr();
+    const void* workspace = plan.workspace.data_ptr();
+    const std::vector<int64_t>* ints = &plan.ints;
+    void* ffts_addr = ffts_address(orig.get_device());
+    auto launch_call = [=]() -> rtError_t {
+        const void* ptrs[6] = {
+            hr_ptr, orig_ptr, hp_ptr, x_ptr, bias_ptr, out_ptr,
+        };
+        return launch_packed(
+            function, grid, workspace, ffts_addr, ptrs, 6, *ints, stream);
+    };
+    at_npu::native::OpCommand cmd;
+    cmd.Name(name.c_str()).SetCustomHandler(launch_call).Run();
+    return out;
+}
+
+c10::optional<at::Tensor> forward_cached(
+    const at::Tensor& hr,
+    const at::Tensor& orig,
+    const at::Tensor& hp,
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& bias) {
+    if (orig.dim() != 4 || orig.device().type() != at::kPrivateUse1) {
+        return c10::nullopt;
+    }
+    c10_npu::NPUGuard guard(orig.device());
+    uint64_t stream = reinterpret_cast<uint64_t>(
+        c10_npu::getCurrentNPUStream(orig.get_device()).stream());
+    auto found = plan_lookup.find(make_plan_key(orig, bias.has_value(), stream));
+    if (found == plan_lookup.end()) {
+        return c10::nullopt;
+    }
+    int kind = found->second.first;
+    int plan_id = found->second.second;
+    if (kind == 0) {
+        return forward_dot(plan_id, stream, hr, orig, hp, x, bias);
+    }
+    return forward_vec4(plan_id, stream, hr, orig, hp, x, bias);
+}
+
+PyObject* forward_cached_fast(
+    PyObject*, PyObject* const* args, Py_ssize_t nargs) {
+    HANDLE_TH_ERRORS
+    if (nargs != 5) {
+        PyErr_SetString(PyExc_TypeError, "forward expects five arguments");
+        return nullptr;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (!THPVariable_Check(args[i])) {
+            PyErr_SetString(PyExc_TypeError, "forward inputs must be tensors");
+            return nullptr;
+        }
+    }
+    if (args[4] != Py_None && !THPVariable_Check(args[4])) {
+        PyErr_SetString(PyExc_TypeError, "bias must be a tensor or None");
+        return nullptr;
+    }
+    c10::optional<at::Tensor> bias;
+    if (args[4] != Py_None) {
+        bias = THPVariable_Unpack(args[4]);
+    }
+    c10::optional<at::Tensor> out;
+    try {
+        out = forward_cached(
+            THPVariable_Unpack(args[0]),
+            THPVariable_Unpack(args[1]),
+            THPVariable_Unpack(args[2]),
+            THPVariable_Unpack(args[3]),
+            bias);
+    } catch (const py::value_error& error) {
+        PyErr_SetString(PyExc_ValueError, error.what());
+        return nullptr;
+    }
+    if (!out.has_value()) {
+        Py_RETURN_NONE;
+    }
+    return THPVariable_Wrap(std::move(*out));
+    END_HANDLE_TH_ERRORS
+}
+
+PyMethodDef fast_methods[] = {
+    {"forward_cached_fast",
+     (PyCFunction)(void (*)(void))forward_cached_fast,
+     METH_FASTCALL,
+     nullptr},
+    {nullptr, nullptr, 0, nullptr},
+};
+
 }  // namespace
 
 PYBIND11_MODULE(flag_train_hpb_native_forward, m) {
     m.def("register_dot_plan", &register_dot_plan);
     m.def("forward_dot", &forward_dot);
+    m.def("register_vec4_plan", &register_vec4_plan);
+    m.def("forward_vec4", &forward_vec4);
+    m.def("forward_cached", &forward_cached);
+    m.def("bind_plan", &bind_plan);
+    if (PyModule_AddFunctions(m.ptr(), fast_methods) != 0) {
+        throw py::error_already_set();
+    }
 }
 """
 
@@ -373,6 +698,7 @@ def register_plan(key, compiled, grid, tensors, device):
         compiled.packed_metadata["kernel_name"],
         workspace,
     )
+    native.bind_plan(plan_id, 0, tensors[1], key[3], key[4])
     plan = (plan_id, native, compiled, workspace)
     _PLANS[key] = plan
     return plan
@@ -380,6 +706,120 @@ def register_plan(key, compiled, grid, tensors, device):
 
 def launch_plan(plan, stream, h_res, original_residual, h_post, x, bias):
     return plan[1].forward_dot(
+        plan[0], stream, h_res, original_residual, h_post, x, bias
+    )
+
+
+def launch_cached(h_res, original_residual, h_post, x, bias):
+    native = _NATIVE_MODULE
+    if native is None or not _PLANS:
+        return None
+    return native.forward_cached_fast(h_res, original_residual, h_post, x, bias)
+
+
+def _check_tile_kernel(compiled, expected):
+    signature = compiled.src.signature
+    if tuple(signature) != expected:
+        return False
+    if any(signature[name][0] != "*" for name in expected[:6]):
+        return False
+    if any(
+        signature[name] not in ("i32", "constexpr") for name in ("tile_offset", "sb")
+    ):
+        return False
+    metadata = compiled.metadata
+    if getattr(metadata, "force_simt_only", True):
+        return False
+    if getattr(metadata, "compile_on_910_95", True):
+        return False
+    if getattr(metadata, "debug", True) or getattr(
+        metadata, "debug_launch_hidden_arg", False
+    ):
+        return False
+    if int(getattr(metadata, "lock_num", -1) or 0) > 0:
+        return False
+    if getattr(metadata, "enable_auto_blockify", False):
+        return False
+    try:
+        from triton.backends.ascend.utils import (
+            _is_auto_map_parallel_blocks_enabled,
+            force_disable_ffts,
+            get_ascend_arch_from_env,
+            is_ffts_supported,
+        )
+    except ImportError:
+        return False
+    if _is_auto_map_parallel_blocks_enabled():
+        return False
+    arch = get_ascend_arch_from_env()
+    return is_ffts_supported(arch) and not force_disable_ffts()
+
+
+def _tile_signature(compiled):
+    suffix = {
+        "_triton_hpb_fwd_vector4_kernel": ("C", "HAS_BIAS", "BLOCK_C"),
+        "_triton_hpb_fwd_row_dot_kernel": (
+            "C",
+            "N",
+            "NP",
+            "HAS_BIAS",
+            "BLOCK_C",
+            "C_BLOCKS",
+        ),
+    }.get(compiled.packed_metadata["kernel_name"])
+    if suffix is None:
+        return ()
+    return (
+        "hr_ptr",
+        "orig_ptr",
+        "hp_ptr",
+        "x_ptr",
+        "bias_ptr",
+        "out_ptr",
+        "tile_offset",
+        "sb",
+    ) + suffix
+
+
+def register_tile_plan(key, compiled, grid, int_values, tensors, device):
+    if key in _PLANS or not _check_tile_kernel(compiled, _tile_signature(compiled)):
+        return None
+    ints = []
+    for name, kind in compiled.src.signature.items():
+        if kind == "i32":
+            ints.append(int(int_values[name]))
+        elif kind == "constexpr" or kind.startswith("*"):
+            continue
+        else:
+            return None
+    if any(tensor.data_ptr() % 16 for tensor in tensors):
+        return None
+    native = _native_module()
+    if native is None:
+        return None
+    try:
+        compiled._init_handles()
+    except Exception:
+        return None
+    workspace_size = int(getattr(compiled.metadata, "workspace_size", 0) or 0)
+    workspace = torch.empty(
+        max(16, workspace_size * grid), dtype=torch.uint8, device=device
+    )
+    plan_id = native.register_vec4_plan(
+        compiled.function,
+        grid,
+        compiled.packed_metadata["kernel_name"],
+        workspace,
+        ints,
+    )
+    native.bind_plan(plan_id, 1, tensors[1], key[3], key[4])
+    plan = (plan_id, native, compiled, workspace, "tile")
+    _PLANS[key] = plan
+    return plan
+
+
+def launch_vec4_plan(plan, stream, h_res, original_residual, h_post, x, bias):
+    return plan[1].forward_vec4(
         plan[0], stream, h_res, original_residual, h_post, x, bias
     )
 
