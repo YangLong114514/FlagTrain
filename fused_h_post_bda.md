@@ -1766,8 +1766,8 @@ Forward 原生 plan 原先只覆盖 `c_blocks==1` 的 dot kernel，本轮扩展�
 每个通道位置的向量指令量为 20 次 FP32 FMA + 9 次类型转换（BF16/FP16 读入 4+1 次、
 写出 4 次），FP32 只有 20 次 FMA；单位字节的向量工作量 BF16/FP16 约为 FP32 的 2.9 倍。
 FP32 大形状已接近纯拷贝带宽（约 1027 vs 1208 GB/s），BF16/FP16 则受向量流水限制
-（约 577 GB/s）。在当前工具链下，大形状 BF16/FP16 难以达到 FP32 的折算比值；继续
-参数搜索没有空间，后续只能依赖更高效的 dot/CV 流水或指令级混合精度。
+（约 577 GB/s）。这里只说明原单行结构的参数搜索没有空间；第 6.56 节通过新的 8 行聚合
+结构进一步减少固定控制开销，但向量计算和类型转换仍是主要瓶颈。
 
 ### 6.53 当前性能汇总（NV 折算口径）
 
@@ -1801,9 +1801,137 @@ small_bias_fused 单 kernel 在大 BLOCK_S 下的已知慢点。
 原生 tile 路径 42 组与 Python 路径 bitwise 一致，小形状 45 组 bitwise 一致，非连续与
 未对齐输入回退正常，全量 pre-commit 通过。代码尚未提交。
 
+### 6.54 昇腾性能基线恢复为纯 vsBase
+
+本轮撤回了第 6.33 节之后曾用于缩短测量时间的“内嵌 Megatron Triton kernel、裁剪 autotune、
+大 C 固定配置”基线，删除对应的 `_hpb_baseline.py`、磁盘调优缓存和
+`FLAG_TRAIN_HPB_VS_BASE_ONLY/FLAG_TRAIN_HPB_INCLUDE_N8` 宏。它们属于历史实验，不是当前
+性能口径。
+
+当前 `fused_h_post_bda_ascend` 工作区的规则为：
+
+- 昇腾 benchmark 不导入、不执行 Megatron 原生基线，也不使用 Torch 组合实现计时；
+  `baseline_op=None`，并用 `skip_native(vendors="ascend")` 明确标记跳过原生基线。
+- 前向、反向均直接读取 `tools/op_flagtrain_perf_baseline.json` 中的 NVIDIA 数据，按框架的
+  硬件折算系数计算 vsBase。不再需要任何本算子专用环境变量。
+- 恢复 8 组 shape × 2 种 bias × 3 种 dtype，每个方向实测 48 点；不再按 N=8 或 C 裁形状。
+  为旧原生基线临时增加的 C=256/512 性能点已撤回，因为 NVIDIA JSON 没有相应记录。
+- Forward 48 点均有 vsBase；Backward 的 NVIDIA 数据只覆盖 `(2,4,4,1024)` 和
+  `(64,8,4,4096)`，共 12 个有效点。其他 36 点仍测昇腾完整 API，但 vsBase 为 N/A，不能用
+  12 点冒充完整 48 点均值。
+- 其他 vendor 仍探测已安装的 Megatron 原生接口；精度测试的 Ascend Torch 组合参考不变。
+  4 个 skipped 是 NVIDIA 原生实现与 Torch 组合的互验，不是跳过昇腾候选算子。
+
+昇腾 kernel 模式仍使用相同的 NPU Event 口径：预热 5 次、正式测量 30 次，完整 API 包括
+输出分配、必要的连续化、启动和 bias 梯度计算。首次编译在正式计时之外；性能回归串行执行。
+msprof、主机提交时间和独立 kernel 计时用于定位，不能与完整 API 混为同一指标。
+
+### 6.55 小形状主机路径精简与 backward 配置复核
+
+在已有 C++ plan 缓存和原生启动基础上，保留按 `(shape,dtype,device,bias,stream)` 查找编译
+plan 的设计，不缓存调用方数据地址，不复用返回 tensor。`METH_FASTCALL` 直接解包输入，
+backward 直接返回五元素 tuple；每次调用仍独立分配输出。连续输入只保存轻量引用，非连续或
+未对齐输入仍走连续化和安全回退。
+
+本轮精简了输出对象的构造：`empty_output` 只接收实际使用的 `ScalarType`，避免重复创建
+`TensorOptions`；backward 的返回数组使用 `reserve` 和移动语义，减少临时引用计数操作。最小
+`(1,1,1,1)` 无 bias 的 7 窗口主机提交时间中位数如下（每窗口 200 次，编译和预热在计时外）：
+
+| dtype | Forward 主机提交 | Backward 主机提交 |
+| --- | ---: | ---: |
+| BF16 | 26.857 μs | 29.567 μs |
+| FP16 | 27.265 μs | 29.141 μs |
+| FP32 | 27.056 μs | 29.703 μs |
+
+相比第 6.48 节最小 forward 的约 128 μs 主机路径，现在约 27 μs，主要收益来自整个 C++
+调用链，而不是设备计算量变少。剩余启动、分配和校验仍有约数十微秒量级成本；这些是主机
+提交数据，不是纯 kernel 时间，也不代表可以改用静态输出或缓存输入地址。
+
+Backward 做了两项有明确来源的配置修正：
+
+1. 取消 `sb=6/8、N=4、FP32` 的单 program `small_bias_fused`，改用普通多 program small
+   kernel 加独立 bias reduction。`(2,4,4,1024)` FP32 有 bias 从 **228.885 μs 降至
+   87.580 μs**，vsBase 从 **0.540x 升至 1.410x**。过度融合使一个 program 串行处理过多
+   工作，少一次启动并不划算。bias 仍先把 `grad_x` 转为输出 dtype，再转 FP32 求和，
+   `grad_bias` 保持独立存储。
+2. msprof 分解 `(64,8,4,4096)` 时，A 约 69.8 μs、B 约 100.5 μs；B 的通道块从 512 改为
+   1024 后约 85.5 μs，A=2048 保持最优。因此仅在 `C>=4096` 时给 B 使用 1024，其余仍用
+   512。该形状完整 API 的 vsBase 对照为：
+
+| dtype | Bias | 优化前 | 优化后 |
+| --- | --- | ---: | ---: |
+| BF16 | 无 | 0.764x | **0.848x** |
+| BF16 | 有 | 1.164x | **1.295x** |
+| FP16 | 无 | 0.760x | **0.848x** |
+| FP16 | 有 | 1.019x | **1.168x** |
+| FP32 | 无 | 1.478x | **1.702x** |
+| FP32 | 有 | 1.596x | **1.832x** |
+
+另验证过 BF16 的精确位转换原型：`BF16 -> uint16 -> uint32 -> <<16 -> FP32` 与当前实现逐位
+一致，但最大 forward 从约 7.45 ms 变为 8.95 ms，已撤回。FP16 没有等价位转换捷径，也没有
+通过降低累加精度换取速度。直接绕过 `OpCommand` 调用 `rtKernelLaunch` 同样无收益，未保留。
+
+### 6.56 大形状 forward 的 8 行聚合
+
+第 6.52 节的单行 Vector 结构仍保留，但在其外增加动态行循环：每个 program 连续处理 8 个
+独立 `sb` 行，行内仍遍历 C 块。这样减少行调度、程序入口和重复地址准备，不改变各元素的
+FP32 乘加、post 相加和输出转换顺序，也不增加 Torch 原生计算、预处理 kernel 或 GM 中间结果。
+
+新增 `_triton_hpb_fwd_vector4_rows_kernel`，仅在 `N=4、原 dot 的 C 块数>1、BF16/FP16、
+sb>4096 且 sb%8==0` 时使用；`BLOCK_C=1024、ROWS=8`。其余行数、FP32、小形状原生启动及
+N=8 路径不变。原型在最大形状上的无 bias 扫描为：
+
+| dtype | 原单行 | ROWS=2 | ROWS=4 | ROWS=8 |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 | 7.317 ms | 7.014 ms | 6.807 ms | **6.691 ms** |
+| FP16 | 6.650 ms | 5.970 ms | 5.635 ms | **5.465 ms** |
+
+ROWS=16/32 在 BF16 上没有稳定超过 8，FP16 的差异也较小且有 bias 时回退；因此统一保留 8。
+ROWS=8 下 BLOCK_C=1024 仍优于 512/2048，未恢复已失败的整块扩大方案。
+
+为验证 backward 的“增加并行 program”思路能否迁移到 forward，还试验了 Vector split-C：
+把每行 7 个 1024 通道块分给多个 program。不同 C 区间的输出相互独立，因此不需要跨 program
+归约；ROWS=1/4/8、C_GROUP=2/3/4 的所有已完成配置均与当前结果逐位一致，但性能全部回退。
+每种 dtype/bias 的最好拆分结果仍明显慢于 8 行完整 C 循环：
+
+| dtype | Bias | 当前 8 行 | 最好 split-C | 最好拆分配置 |
+| --- | --- | ---: | ---: | --- |
+| BF16 | 无 | 6.693 ms | 8.863 ms | ROWS=4、C_GROUP=4 |
+| BF16 | 有 | 6.907 ms | 9.023 ms | ROWS=8、C_GROUP=4 |
+| FP16 | 无 | 5.475 ms | 6.580 ms | ROWS=8、C_GROUP=4 |
+| FP16 | 有 | 5.682 ms | 7.121 ms | ROWS=4、C_GROUP=4 |
+
+增加 program 会重复加载每行 H/Hpost、增加地址准备和启动批次，还破坏了连续 C 循环的局部性。
+当前大 forward 已有足够多 program，瓶颈仍在向量执行而非并行度不足。该原型不接入正式分发；
+backward 小 FP32 的“解除单 program 串行”不能直接推广为大 forward 的 split-C。
+
+正式 benchmark 最大 `(8192,4,4,7168)` 的前后对照：
+
+| dtype | Bias | 优化前完整 API | 优化后完整 API | vsBase 前→后 |
+| --- | --- | ---: | ---: | ---: |
+| BF16 | 无 | 7.325 ms | **6.700 ms** | 0.506x → **0.554x** |
+| BF16 | 有 | 7.434 ms | **6.906 ms** | 0.513x → **0.552x** |
+| FP16 | 无 | 6.643 ms | **5.470 ms** | 0.560x → **0.680x** |
+| FP16 | 有 | 6.796 ms | **5.677 ms** | 0.558x → **0.668x** |
+
+FP32 未走新路径，同轮为 8.194/8.407 ms、0.913/0.892x，属于原有波动，不计作新收益。
+大 BF16/FP16 仍主要受 AIV 向量计算、转换和搬运限制；行聚合改善固定控制开销，并不等于
+已经消除向量流水瓶颈。
+
+当前 forward 48 点算术均值为 **1.064x**、中位数 **0.553x**。其中 `(2,3,4,130)` 有 bias
+的 BF16/FP16 和 `(128,1,8,7168)` FP16 无 bias 受异常小的 NVIDIA 基线或折算系数影响，
+剔除这 3 点后的 45 点均值约 **0.624x**。这些均值受基线异常和小形状波动影响，不能把相对
+旧轮次的变化全部归因于本次 kernel。Backward 可用的 12 点均值为 **1.281x**、中位数
+**1.287x**，其余点没有 NVIDIA 基线。
+
+新增 BF16/FP16、有无 bias 的 `(2048,4,4,4097)` 行聚合与非整块 C 回归，以及 BF16
+`(20480,2,4,2049)` 跨 4096 tile 启动回归。最终完整精度为 **224 passed、4 skipped**；
+独立进程、空 Triton 缓存下新增 6 项全部通过，相关文件 pre-commit 通过。
+
 ## 7. 正确性测试设计
 
-测试文件：`tests/megatron/test_fused_h_post_bda.py`。
+当前测试文件为 `tests/megatron/test_fused_h_post_bda_forward.py` 和
+`tests/megatron/test_fused_h_post_bda_backward.py`；下文保留通用参考实现和容差设计。
 
 ### 7.1 参考实现
 
@@ -1866,49 +1994,37 @@ bias。Forward 专项由三种 dtype 覆盖 `(64,8,4,4099)` 及有无 bias，验
 
 ### 7.5 用例数量
 
-- 17 组通用 dtype/shape 组合 × 2 种 bias 设置 × 2 个方向 = 68 项。
-- 2 种长通道 backward dtype × 2 种 bias 设置 = 4 项。
-- 3 种 forward dtype × 2 种 bias 设置 = 6 项。
-- 3 种 backward dot dtype × 2 组形状 × 2 种 bias 设置 = 12 项。
-- 多批启动 2 个方向 × 2 种 bias 设置 = 4 项。
-- 非整齐 B 块 2 组 C × 2 种 bias 设置 = 4 项。
-- 标量 B grid 边界 = 1 项。
-- sb=1 独立 bias 输出 3 种 dtype = 3 项。
-- 固定 transpose 案例 = 1 项。
-- 非连续 forward = 2 项。
-- 非连续 backward = 2 项。
+早期单文件版本为 107 项；拆分后陆续补充了多批 dot/Vector、非整齐 C、单行及小行数 bias
+融合、五个梯度、重复原生缓存调用、非连续/未对齐输入、输出 storage 独立性、非默认 stream
+顺序消费和缓存命中后的参数校验。最新 forward 行聚合又增加 6 项，覆盖非整块 C 和跨批启动。
 
-**合计 107 项正确性测试。**
+当前两个文件合计 228 项，实测 **224 passed、4 skipped**。4 个跳过项均为 NVIDIA 原生实现
+与 Torch 组合互验，不跳过昇腾候选算子的 dtype/shape/bias 精度用例。
 
 运行命令：
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 pytest tests/megatron/test_fused_h_post_bda.py \
-  -m "fused_h_post_bda_forward or fused_h_post_bda_backward" --ref cpu -q
+python -u -m pytest -q \
+  tests/megatron/test_fused_h_post_bda_forward.py \
+  tests/megatron/test_fused_h_post_bda_backward.py
 ```
 
 ## 8. 性能测试设计
 
-性能文件：`benchmark/megatron/test_fused_h_post_bda.py`。
+性能文件拆分为 `benchmark/megatron/test_fused_h_post_bda_forward.py` 和
+`benchmark/megatron/test_fused_h_post_bda_backward.py`。
 
 ### 8.1 Baseline 选择
 
-非昇腾平台的 benchmark 在运行时实际探测 Megatron：优先导入并执行
-`_triton_h_post_bda_fwd/_bwd`，导入或执行失败时回退到组合实现。昇腾固定使用组合
-baseline，不探测 Megatron Triton；否则小 shape 探测可能命中已有编译缓存，而正式 shape
-仍会在 48 组 autotune 配置中触发 `bishengir-compile` 卡死。这里描述原分支当时的策略；
-拆分后的 `fused_h_post_bda_ascend` 分支后来改为直接运行 Megatron 原生 Triton kernel 的固定合法
-配置，其性能结果和配置问题见第 6.33 节。
+非昇腾平台运行时探测 Megatron `_triton_h_post_bda_fwd/_bwd`；不可用时 `torch_op=None`，
+使用 `--base-data` 中的 NVIDIA 记录。Benchmark 不再添加 PyTorch 组合实现作为计时基线。
 
-组合 baseline 先实际探测 `torch.compile`，失败时警告并回退到同一实现的 eager 版本。
-测试会打印实际选择，避免把 PyTorch fallback 误报成 Megatron Triton。
+昇腾不探测 Megatron，不执行原生 autotune，直接采用 NVIDIA vsBase 折算；两个测试均以
+`skip_native(vendors="ascend")` 标记这一选择。早期原生 Triton 的 autotune 卡死、grid 和 UB
+问题见第 6.33/6.34 节；后续裁剪配置的临时基线已经撤回，见第 6.54 节。
 
-当前 NVIDIA 环境选择 Megatron Triton baseline。Fallback 逐行对齐 Megatron
-`native_h_post_bda` 和 `_torch_h_post_bda_bwd`，包括矩阵乘方向、view/reshape、bias 展开、
-加法顺序和梯度 dtype 转换，并保留 `torch.compile` 以接近未使用融合 Kernel 时的真实
-Megatron 执行方式。它显示为 `Megatron-native torch.compile (fallback)`，不是普通 eager
-Torch 组合实现；当 `torch.compile` 不可用时显示为 `Megatron-native torch eager
-(fallback)`，二者共享同一份实现代码。
+精度测试与性能测试的参考选择不同：昇腾精度测试仍使用 Torch 组合参考，NVIDIA 专属用例
+验证原生 Megatron 与 Torch 组合的一致性。性能口径不会修改这些数值参考。
 
 ### 8.2 计时口径
 
@@ -1916,36 +2032,26 @@ Torch 组合实现；当 `torch.compile` 不可用时显示为 `Megatron-native 
   取中位数。
 - 本算子在昇腾 kernel 模式下使用 NPU Event，预热 5 次、正式测量 30 次并取平均值，不再进入
   可能返回空采样结果的 `do_bench_npu`，见第 6.17 节。
-- 输入随机生成在计时区域之外。
-- 首次 Triton 编译、autotune 和 fallback 的 `torch.compile` 编译不属于正式测量。
+- 输入随机生成和首次编译在计时区域之外。
 - 输出分配、`.contiguous()`、split-C partial 分配和 bias 梯度求和都包含在被测 API 内。
-- Backward 直接传入 `grad_output` 调用 backward，**不经过 autograd，也不包含 forward
-  耗时**。
-- Speedup 定义为 `Megatron latency / FlagTrain latency`，大于 1 表示 FlagTrain 更快。
+- Backward 直接传入 `grad_output` 调用 backward，不经过 autograd，也不包含 forward 耗时。
+- 本地 `Speedup` 为原生基线耗时除以候选耗时；`vsBase` 由框架将 NVIDIA 耗时按对应硬件
+  资源系数折算后除以候选耗时。缺少 NVIDIA 对应 shape 时为 N/A，不能用本地组合实现补齐。
+- msprof、主机提交时间和独立 kernel 计时只用于定位；它们不替代完整 API 的正式性能。
 
-本轮优化还使用 CUDA Graph replay 和 Profiler 分段计时辅助定位 A、B、bias reduction 的
-GPU 时间。Graph 数据只用于分析，不替代上述完整 API 的 48 点性能结果；普通 `do_bench`
-和 Graph 的 L2 清理口径不同，Graph 还会展开多轮调用及输出分配，不适合不加限制地用于
-大形状综合集。
+历史优化使用过 CUDA Graph replay 和 Profiler 分段辅助定位 A、B、bias reduction 的设备时间。
+Graph 数据只用于分析，不替代完整 API；Graph 与普通 benchmark 的缓存和分配口径不同。
 
 ### 8.3 核心形状
 
-核心集包含三种 dtype：
-
-- BF16
-- FP16
-- FP32
-
-以及以下形状：
+核心集包含 BF16、FP16、FP32，以及：
 
 - `(2,4,4,1024)`
 - `(64,8,4,4096)`
 - `(128,1,8,7168)`
 
-每个形状分别测试 bias 有无。
-
-每个算子有 `3 dtype × 3 shape × 2 bias = 18` 个数据点，forward 和 backward 合计
-**36 个核心数据点**。
+每个形状分别测试 bias 有无。每个方向有 `3 dtype × 3 shape × 2 bias = 18` 个核心数据点，
+两个方向合计 36 点。
 
 ### 8.4 综合附加形状
 
@@ -1957,43 +2063,32 @@ GPU 时间。Graph 数据只用于分析，不替代上述完整 API 的 48 点�
 - `(512,4,4,4096)`
 - `(8192,4,4,7168)`
 
-核心和附加合计 8 组形状，均有 bias 和无 bias 各测一次：
-
-- BF16 综合集：每个算子 16 点，两个算子共 **32 点**。
-- 全精度综合集：每个算子 48 点，两个算子共 **96 点**。
-
-当前最终的 forward 和 backward 结论分别来自各自 48 个全精度综合数据点。
+核心和附加合计 8 组形状，均有 bias 和无 bias 各测一次：每个方向 48 点，两个方向合计 96
+点。Forward 48 点都有 NVIDIA 基线；Backward 48 个候选点都执行，但只有前两组 shape 的
+12 个点能计算 vsBase，其余为 N/A。
 
 ### 8.5 运行命令
 
-与最终 GPU 3 验证一致：
+昇腾当前性能验证直接运行拆分后的测试，并显式提供 NVIDIA 基线文件：
 
 ```bash
-# Forward：默认 comprehensive + 三种 dtype
-CUDA_VISIBLE_DEVICES=3 pytest -s -v benchmark/megatron/test_fused_h_post_bda.py \
-  -m "fused_h_post_bda_forward"
+export ASCEND_RT_VISIBLE_DEVICES=1
 
-# Backward：默认 comprehensive + 三种 dtype
-CUDA_VISIBLE_DEVICES=3 pytest -s -v benchmark/megatron/test_fused_h_post_bda.py \
-  -m "fused_h_post_bda_backward"
+python -u -m pytest -q benchmark/megatron/test_fused_h_post_bda_forward.py \
+  --base-data=./tools/op_flagtrain_perf_baseline.json \
+  --record json --output=.pytest_cache/hpb_forward.json
+
+python -u -m pytest -q benchmark/megatron/test_fused_h_post_bda_backward.py \
+  --base-data=./tools/op_flagtrain_perf_baseline.json \
+  --record json --output=.pytest_cache/hpb_backward.json
 ```
 
-记录 JSON：
+不需要设置 `FLAG_TRAIN_HPB_VS_BASE_ONLY` 或 `FLAG_TRAIN_HPB_INCLUDE_N8`。建议串行执行，
+不要让其他编译或 benchmark 进程争用设备、主机和编译资源。
 
-```bash
-CUDA_VISIBLE_DEVICES=3 pytest -s -v benchmark/megatron/test_fused_h_post_bda.py \
-  -m "fused_h_post_bda_forward" \
-  --record json --output /workspace/forward.json -q
+## 9. NVIDIA 历史性能结果（原生基线口径）
 
-CUDA_VISIBLE_DEVICES=3 pytest -s -v benchmark/megatron/test_fused_h_post_bda.py \
-  -m "fused_h_post_bda_backward" \
-  --record json --output /workspace/backward.json -q
-```
-
-建议串行运行性能测试，不要让多个 autotune/benchmark 进程互相争用。
-
-## 9. 当前性能结果
-
+昇腾当前的 vsBase 口径和优化结果见第 6.54–6.56 节，不与这里的 NVIDIA 原生基线数据混用。
 以下结果来自 NVIDIA H20-3e、BF16/FP16/FP32 全精度综合集，时间单位为 ms。Forward
 对应当前中等形状固定配置版本；backward 数据对应 FP32 通用原生归约修改前的小形状融合和
 N=8 split-C 版本。`1c32531` 之后 FP32 且 `C>=4096` 的 backward 尚未重新测量，下列
@@ -2060,14 +2155,16 @@ Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward �
 
 ## 10. 当前限制与后续方向
 
-1. **验证平台有限**：当前系统验证集中在 NVIDIA H20-3e，其他 vendor 尚未完成同等覆盖。
-2. **小 `n` 限制**：`n` 必须为正的 2 的幂，当前测试覆盖到 8。
+1. **验证平台有限**：通用实现的性能数据主要来自 NVIDIA H20-3e；昇腾独立分支已完成上述
+   NPU 验证，其他 vendor 尚未完成同等覆盖。
+2. **小 `n` 限制**：`n` 必须为正的 2 的幂，当前通用测试覆盖到 8，昇腾额外覆盖到 16。
 3. **无完整 autograd 公共封装**：当前公开的是直接 forward/backward API。
 4. **性能具有形状依赖性**：小形状重点优化固定开销，大形状不等于一定超过 Megatron。
-5. **测量会受系统状态影响**：不同 GPU、并发进程和 autotune 状态会影响绝对耗时，应以
-   同一测试内的 baseline 比值为主。
-6. **Bias reduction 仍有优化空间但不宜盲目重写**：Torch 目前优于已尝试的 Triton 和
-   atomic 方案。
+5. **测量会受系统状态影响**：不同设备、并发进程和 autotune 状态会影响绝对耗时；昇腾的
+   vsBase 还受 NVIDIA 数据覆盖范围和折算系数影响。
+6. **Bias reduction 不能盲目合并**：通用历史上 Torch 归约优于部分 Triton/atomic 方案；
+   昇腾独立后端不调用 Torch 原生计算，使用受限融合和纯 Triton FP32 归约，必须同时检查
+   舍入路径、输出独立性和单 program 串行开销。
 7. **不适合直接推广 batched dot**：当前 `n<=8` 的典型场景下，Tensor Core 填充和寄存器
    开销抵消了理论收益。
 8. **输入复用具有适用范围**：三维 accumulator 会增加寄存器压力，不能对所有形状默认
@@ -2077,16 +2174,21 @@ Forward 本轮优化前的平均值为 1.240x、最低值为 0.830x；backward �
    昇腾独立后端保留单阶段 B；其他 N 或更大的 sb 需要重新测量。
 10. **中等形状 forward 配置是受限特调**：固定配置只用于 BF16/FP16 的
     `(64,8,4,4096)`；全流和双流复用曾出现完整 API 回退，不能推广到其他形状或 dtype。
-11. **FP32 长归约依赖原生 PyTorch 算子**：该路径优先保证跨平台数值一致性，但会增加对平台
-    BLAS/归约实现的依赖；Hygon hipBLAS 问题尚待实机最小复现，且需要补测修改后的性能。
+11. **通用 FP32 长归约依赖原生 PyTorch 算子**：该路径优先保证跨平台数值一致性，但会增加
+    对平台 BLAS/归约实现的依赖；Hygon hipBLAS 问题尚待实机最小复现，且需要补测修改后的性能。
+12. **昇腾仍有明确弱点**：最大 forward BF16/FP16 约 0.55/0.67x，向量流水和类型转换仍是
+    设备瓶颈；最小形状主机提交仍约 27/30 μs。Backward 只有 12 个有效 NV 点，不能据此
+    推断其余 36 点已经超过基线。
 
 ## 11. 相关文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/flag_train/megatron/fused_h_post_bda.py` | 通用 Triton Kernel、输入校验和 forward/backward 包装 |
-| `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda.py` | 昇腾纯 Triton dot、固定配置预绑定直启、大 grid 分批、sb=1 bias 融合及 FP32 bias 归约 |
+| `src/flag_train/megatron/fused_h_post_bda_forward.py` / `fused_h_post_bda_backward.py` | 通用前向、反向接口与 Triton kernel |
+| `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda_forward.py` | 昇腾 forward、dot/Vector、行聚合和分批启动 |
+| `src/flag_train/runtime/backend/_ascend/megatron/fused_h_post_bda_backward.py` | 昇腾 backward A/B、small fused 和 bias 归约 |
+| `src/flag_train/runtime/backend/_ascend/megatron/_hpb_native_forward.py` / `_hpb_native_backward.py` | 昇腾 C++ plan 缓存、输出分配和原生启动；不执行 Torch 原生计算 |
 | `src/flag_train/megatron/__init__.py` | 算子导出和 `SpecOpRegistrar` 注册 |
-| `tests/megatron/test_fused_h_post_bda.py` | 107 项正确性测试，含跨批、grid 边界和冷编译敏感配置 |
-| `benchmark/megatron/test_fused_h_post_bda.py` | Baseline 选择、输入生成和性能测试 |
+| `tests/megatron/test_fused_h_post_bda_forward.py` / `test_fused_h_post_bda_backward.py` | 精度、边界、非连续输入、原生缓存和输出独立性测试 |
+| `benchmark/megatron/test_fused_h_post_bda_forward.py` / `test_fused_h_post_bda_backward.py` | 原生基线选择、昇腾 NPU Event 和 NVIDIA vsBase 性能测试 |
 | `fused_h_post_bda.md` | 本文档 |
