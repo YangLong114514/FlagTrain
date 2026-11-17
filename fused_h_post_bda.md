@@ -1763,8 +1763,10 @@ Forward 原生 plan 原先只覆盖 `c_blocks==1` 的 dot kernel，本轮扩展�
 - msprof（BF16 `(8192,4,4,7168)`）：单次启动约 933 μs×8；`aiv_vec_ratio` 76.1%、
   scalar 35.4%、mte2 38%、mte3 45%、cube 0。瓶颈是 AIV 向量流水线。
 
-每个通道位置的向量指令量为 20 次 FP32 FMA + 9 次类型转换（BF16/FP16 读入 4+1 次、
-写出 4 次），FP32 只有 20 次 FMA；单位字节的向量工作量 BF16/FP16 约为 FP32 的 2.9 倍。
+按数学结构估算，每个通道位置可融合为 20 次 FP32 乘加，另有 9 次类型转换
+（BF16/FP16 读入 4+1 次、写出 4 次），FP32 不需要这些转换。这里不是实际硬件指令计数；
+原表达式的 TTIR 乘加结构和显式 FMA 对照见第 6.57 节。按上述模型估算，单位字节的向量
+工作量 BF16/FP16 约为 FP32 的 2.9 倍。
 FP32 大形状已接近纯拷贝带宽（约 1027 vs 1208 GB/s），BF16/FP16 则受向量流水限制
 （约 577 GB/s）。这里只说明原单行结构的参数搜索没有空间；第 6.56 节通过新的 8 行聚合
 结构进一步减少固定控制开销，但向量计算和类型转换仍是主要瓶颈。
@@ -1927,6 +1929,121 @@ FP32 未走新路径，同轮为 8.194/8.407 ms、0.913/0.892x，属于原有波
 新增 BF16/FP16、有无 bias 的 `(2048,4,4,4097)` 行聚合与非整块 C 回归，以及 BF16
 `(20480,2,4,2049)` 跨 4096 tile 启动回归。最终完整精度为 **224 passed、4 skipped**；
 独立进程、空 Triton 缓存下新增 6 项全部通过，相关文件 pre-commit 通过。
+
+### 6.57 ROWS=8 新 profile、H 转换、FMA 与 B 延迟归约复核
+
+本轮按新的优化建议逐项做了独立原型，没有同时叠加改动。所有原型只位于 `.pytest_cache`，
+未进入正式算子；正式源码仍是第 6.56 节的版本。
+
+首先重新采集最大 `(8192,4,4,7168)` BF16 无 bias 的 ROWS=8 msprof。当前每次 API 只有
+**1 个** `_triton_hpb_fwd_vector4_rows_kernel`，grid=4096，平均 **6692.54 μs**，与 Event
+约 6.69 ms 一致；旧单行实现的 933 μs×8 不再适用。新指标为：
+
+| 指标 | ROWS=8 当前值 |
+| --- | ---: |
+| AIV Vector | **82.1%** |
+| AIV Scalar | 34.1% |
+| AIV MTE2 | 37.7% |
+| AIV MTE3 | 50.8% |
+| AIC / Cube | 0 |
+
+这些比例可能包含流水重叠，不能直接相加。它们仍支持“向量计算、地址控制和搬运是主要瓶颈”，
+但不提供逐条硬件指令计数。当前达到 0.8x 所需的时间和降时幅度为：
+
+| dtype | 当前完整 API | 当前 vsBase | 0.8x 目标 | 所需降时 |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 | 6.700 ms | 0.554x | 约 4.640 ms | 约 31% |
+| FP16 | 5.470 ms | 0.680x | 约 4.650 ms | 约 15% |
+| FP32 | 8.194 ms | 0.913x | 已超过 | — |
+
+**H_res 显式 FP32 转换：不接入。** 原 TTIR 中 16 个 H 标量的 `arith.extf` 确实位于 C
+`scf.for` 内；显式 `.to(tl.float32)` 后移动到行级 C 循环之外，不是整向量转换。总 extf 数量
+仍为 25（16H+4Hpost+4residual+x）。但最大无 bias 实测 BF16 为 6.6975→6.7608 ms，约慢
+0.9%；FP16 为 5.4747→5.4629 ms，仅约 0.2% 波动。没有稳定收益，不同步修改普通 vector4
+或 backward A。
+
+**显式 `tl.fma`：不接入。** 原表达式的 TTIR 是 20 次 `arith.mulf` 和 16 次 `arith.addf`；
+显式 FMA 后变为 4 次 Mul 和 16 次 `math.fma`。这证明前端写法改变了 IR，但不等于最终硬件
+一定多执行或少执行对应数量的指令。BF16/FP16 随机结果与当前实现逐位一致，最大无 bias
+时间分别为 6.6867/5.4597 ms，相对当前只有约 0.2%/0.3% 差异，低于有意义的稳定收益门槛。
+不需要为了源码形式替换现有表达式。
+
+**Backward B 延迟归约：不接入。** 原型把 16 路 g_hr 和 4 路 g_hp 改为 20 个一维 FP32
+向量累加器，C 循环内只做逐元素乘加，行末分别 `tl.sum`。在 `(64,8,4,4096)` 无 bias 的
+独立 B kernel 上：
+
+| dtype | 当前 BC=1024 | 延迟归约 BC=256 | BC=512 | BC=1024 |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 | 85.804 μs | 214.589 μs | 218.673 μs | 225.941 μs |
+| FP32 | 87.616 μs | 173.356 μs | **147.498 μs** | 173.250 μs |
+
+BF16 的有无 bias 结果满足现有容差；FP32 的归约顺序改变后，有无 bias 的 g_hr/g_hp 均不满足
+当前 `atol=rtol=1e-5` 检查。即使只看性能，常驻 accumulator 和最终 20 路归约也抵消了减少
+块内归约的收益，因此不进入完整 API 或全量回归。
+
+FP16 混合精度 AXPY 仍只是后续编译器方向：当前环境有 `tl.fma`，但已安装 Python 包中没有
+找到可直接调用的 AXPY 接口，显式 FMA 实测也没有带来收益。没有据此宣称硬件已经或不能生成
+混合精度指令；若继续，需要先找到实际指令选择和舍入行为的证据，不能用降低 `x+bias` 精度
+或放松累加精度来代替。
+
+### 6.58 广播物化定位与 PTO 混合精度 AXPY 线索
+
+继续寻找“真正删除工作”的方向，新增两个针对性原型，仍未产生可接入收益：
+
+- **每次调用先把 bias 转成 FP32**：用独立 Triton 小 kernel 生成 C 个 FP32 临时值，再让
+  ROWS=8 主 kernel 直接读取。输出与当前实现逐位一致，但包含准备 kernel 和临时分配后，
+  BF16 有 bias 为 6.9108→6.9042 ms，FP16 为 5.6784→5.6988 ms。重复 bias 转换不是主要
+  成本，不增加预处理路径。
+- **完整 C 块使用无 mask kernel**：仅对 C=7168、BC=1024 的完整块试验，不保留同一循环内
+  的尾块双路径。BF16 无/有 bias 为 6.6998→6.6714、6.9145→6.9183 ms；FP16 为
+  5.4786→5.5908、5.6856→5.7382 ms。数值逐位一致，但收益为零或回退，不接入。
+
+生成代码检查给出了比“多一次 Cast”更具体的线索：BC=1024 时，当前 C 块在 bc mlir 中有
+**20 次 `linalg.fill`**，分别把 H/Hpost 标量填成完整 FP32 向量，再执行 tensor 乘法。
+masked load 也会生成尾部大小计算和条件填充，但无 mask 实测说明后者不是当前主要矛盾。
+这些是最终二进制前的中间表示，不能直接当成硬件指令计数。CANN `llvm-objdump` 能识别
+`npubin` 的 ELF `.text`，但当前命令只返回 `<not available>`，尚未获得可读硬件指令，因此
+没有据此宣称最终仍执行 20 次广播。
+
+当前 TLE `tle.dsa.mul` 的 Python semantic 仍转换到 tensor 后走普通乘法和 broadcast，
+没有提供直接标量×向量接口；简单换成 DSA buffer 不能自动解决这个问题。需要针对
+“scalar × vector + accumulator”做特定 lowering 或专用实现，而不是继续改等价 Triton 写法。
+
+一个可继续验证的底层线索来自当前 CANN 9.0 安装包的
+`include/pto/npu/a2a3/TAxpy.hpp:126`：A2/A3 PTO `TAXPY` 模板允许目标是 half 或 float，
+并明确允许 **dst=float、src=half**，标量类型与 half 源一致。这与 FP16 residual 输入和
+FP32 accumulator 相匹配，可研究是否能同时避免标量广播物化和显式 FP16→FP32 转换。
+同一 static_assert 不支持 BF16 源，不能把这条路线直接推广到 BF16。
+
+下一步仍需独立的 FP16 `TAXPY` 微基准；`x+bias` 保持 FP32，不能为了套用 AXPY 改成
+FP16。实际尝试及当前集成阻塞见第 6.59 节。
+
+### 6.59 FP16 PTO AXPY 原型与 custom-op 工具链阻塞
+
+已把上述线索实际实现为临时 C++ custom op：调用
+`pto::AxpyCountMode<float, half, 1024, 1024>`，输入是 FP16 UB 向量和单元素 FP16 系数，
+目标是 FP32 UB accumulator。用当前 CANN 的 `ccec`、`dav-c220-vec` 成功生成 8596 字节
+bitcode；使用本地 `memref_t` ABI 和 `__aiv__=[aicore]`，没有修改系统安装包。
+
+随后用 `@al.register_custom_op` 注册临时 `axpy_fp16_fp32`，尝试标量参数、单元素 tensor
+参数及一维 indexing map。它们都在 `BytecodeToLinalgIRByBishengirOpt` 阶段失败：
+
+```text
+'hivm.hir.custom' op operand count (...) does not match with the total size (0)
+specified in attribute 'operandSegmentSizes'
+operandSegmentSizes = array<i32: 0, 0>
+```
+
+新版文档中的 `iterator_type` 属性也不能直接使用，当前 CANN 9.0 报
+`unknown attribute 'iterator_type' in dialect 'hivm'`。为排除临时 AXPY 注册或 C++ 实现的个体
+问题，使用安装包自带的 `compare_scalar` 和 `custom_ops.bc` 做了最小对照，仍出现完全相同的
+operandSegmentSizes 错误。因此这是当前 wheel/CANN 组合下 custom-op 通用集成问题，不是
+AXPY 特有的编译或数值失败。
+
+普通 `acc + scalar * src` 的对照 kernel 可以运行，但 custom AXPY 从未完成编译和启动，所以
+本轮**没有 AXPY 数值结果，也没有新旧性能比值**，不能记成“AXPY 无收益”。原型仅保留在
+`.pytest_cache`，正式代码没有改动。后续需要匹配 custom-op 的 wheel/CANN 修复，或建立独立
+PTO kernel 编译/加载链后再做微基准；在此之前不引入未经验证的专用实现。
 
 ## 7. 正确性测试设计
 
