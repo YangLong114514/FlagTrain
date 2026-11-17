@@ -1687,6 +1687,120 @@ N=4 单行 bias 的三种 dtype 与多组 C 覆盖、N=4 Vector 的非连续输�
 低于上一轮，但前两个小形状未修改且主机时间波动明显；A 的收益以本节同进程旧新对照为准，
 不把不同轮次均值变化全部归因于代码优化。
 
+### 6.49 Backward C++ 原生启动与 n=1/2 Vector 扩展
+
+本轮把 backward 的 kernel 启动从 Python 固定缓存路径迁到 C++ 扩展：新增
+`_hpb_native_backward.py`，在一次 `OpCommand` 内用 `rtKernelLaunch` 连续启动
+A、B 和可选的 bias_single 三个 kernel，绕开 Python 侧的参数绑定与分发。注册条件为
+n=4、`sb<=4096` 且 16 对齐、带 bias 时 `sb<=512`，失败静默回退 Python 路径。
+
+ABI 关键细节（后续原生工作都依赖）：
+
+- `compiled._init_handles()` 必须在读取 `compiled.function` 之前调用。
+- 本工具链（Triton 3.5.1 + FlagTree 0.7.0+ascend3.5）中，纯 Vector kernel 的 metadata
+  没有 `workspace_size` 字段，16 字节占位即可；dot kernel 有该字段且随形状变化
+  （实测 1024/4096/16384 字节，per-program，分配时需乘 grid），不能用固定占位，
+  否则 kernel 越界写工作区会污染后续分配的 tensor，表现为大面积 NaN。
+
+计算结构同步扩展：dot 门槛放宽为 `n<=16 and (C>=256 or (n in (1,2,4) and C>=64))`；
+n=4 的 A/B 全部走一维 Vector（A 为五输出 vector4，B 为 (4,4,BLOCK_C) 广播乘加）；
+n<=2 新增 vecn 泛化 A/B kernel，与 vector4 同族但保留 N 维。A/B 合成单 kernel 的
+fused 实验出现与数据无关的 flaky NaN（干净进程同样复现，疑 Cube/Vector 同步竞态），
+已撤回，不再重复。
+
+完整 backward API 改善（同口径交替对照）：
+
+| Shape / dtype | 优化前 | C++ 原生启动 |
+| --- | ---: | ---: |
+| `(128,1,4,256)` 有 bias BF16/FP16/FP32 | 419/424/434 μs | 155/151/178 μs |
+| `(128,1,4,512)` 有 bias BF16/FP16/FP32 | 316/300/308 μs | 178/170/156 μs |
+
+### 6.50 小形状 backward 的原生启动：动态参数缓冲
+
+把 `sb<=8、C<=1024、n<=4` 的 small fused backward 也纳入 C++ 启动。第一版用 JIT 包装
+kernel 把 stride 折叠成 constexpr 以固定 ABI，结果 n=2 且 BF16/FP16 时 `g_res` 出现
+垃圾值甚至 inf（FP32 与 n=4 正常）：constexpr 奇数 stride 的三维 store 在该编译器下
+生成了不同的错误代码。放弃包装方案，改为**复用与 Python 路径完全相同的原 small
+kernel 编译产物**（同实参 warmup → 同特化 → 同一份二进制），C++ 按
+`compiled.src.signature` 动态拼接参数缓冲区：指针 8 字节、运行时 i32 4 字节、
+`constexpr`（含被特化为 1 的参数）自动跳过。任何形状的 ABI 都由签名驱动，数值与
+Python 路径 bitwise 一致（45 组），非连续输入与未对齐存储偏移的回退也正常。
+
+性能对照必须同时禁用注册函数：只清空 plan 字典时，下一次调用会重新注册并命中原生
+路径，"Python 对照"实际测的仍是原生（曾因此误判无收益）。正确对照下小形状 backward
+为 2.4–3.5x，正式 benchmark 中 `(2,4,4,1024)` BF16 由 250/379 μs 降至 140/142 μs
+（无/有 bias），小形状整体由 170–190 μs 降至 106–120 μs。
+
+### 6.51 Forward tile 原生启动（vector4/row_dot）与 tensor 捕获 OOM
+
+Forward 原生 plan 原先只覆盖 `c_blocks==1` 的 dot kernel，本轮扩展到 vector4（n=4）
+和 row_dot（n<=8），把 `(64,8,4,4096)`、`(128,1,8,7168)` 等中等形状纳入 C++ 启动。
+`sb<=4096` 单批启动；更大形状保持 Python 分批，主机时间被设备时间掩盖。C++ 入口
+泛化为 `0<n<=16`，plan 携带签名提取的运行时整型列表（tile_offset、sb）。
+
+调试中发现一类必须避免的写法：启动 lambda 按值捕获 `at::Tensor` 时，torch_npu 的
+异步任务处理器会持有这些 tensor 直到设备执行完。主机连续提交、设备尚未消化时输出
+全部堆积——FP32 `(512,4,4,4096)` 每个输出 134 MB，350 次迭代约 47 GB，直接 OOM。
+三个原生入口（forward_tile、backward、backward_small）统一改为 lambda 外提取裸
+指针/整型/string，lambda 只捕获 POD，tensor 在函数返回时正常析构。
+
+另纠正一个此前的误判：曾认为 forward 原生 plan 因 metadata 检查"从未生效"，实测
+旧代码即可注册并命中（`workspace_size` 字段存在、句柄已由 runner 初始化），该判断
+不成立，相关"修复"已回退，forward 原有 dot 路径保持原样。
+
+同进程对照中等形状 forward 提速 2.4–3.6x，42 组正确性全对；正式 48 点 NV 折算均值
+由 0.587x 升至 0.794x。
+
+### 6.52 大形状 BF16/FP16 forward 的瓶颈定论
+
+针对"BF16/FP16 大形状折算加速比（约 0.51/0.56）能否达到 FP32（约 0.90）"做了完整
+扫描与 profile：
+
+- BLOCK_C：BF16/FP16 的 vector4 以 1024 最优（512 更差、2048 更差、4096 编译失败），
+  num_warps 4/8 无差异；num_stages=2 已饱和，3/4 无变化。
+- 2D tile 原型（(4,BLOCK_C) 广播乘加、单个二维 accumulator）：更慢
+  （BF16 最大形状 12.6 ms vs 7.4 ms），广播物化开销抵消指令数减少，不采用。
+- msprof（BF16 `(8192,4,4,7168)`）：单次启动约 933 μs×8；`aiv_vec_ratio` 76.1%、
+  scalar 35.4%、mte2 38%、mte3 45%、cube 0。瓶颈是 AIV 向量流水线。
+
+每个通道位置的向量指令量为 20 次 FP32 FMA + 9 次类型转换（BF16/FP16 读入 4+1 次、
+写出 4 次），FP32 只有 20 次 FMA；单位字节的向量工作量 BF16/FP16 约为 FP32 的 2.9 倍。
+FP32 大形状已接近纯拷贝带宽（约 1027 vs 1208 GB/s），BF16/FP16 则受向量流水限制
+（约 577 GB/s）。在当前工具链下，大形状 BF16/FP16 难以达到 FP32 的折算比值；继续
+参数搜索没有空间，后续只能依赖更高效的 dot/CV 流水或指令级混合精度。
+
+### 6.53 当前性能汇总（NV 折算口径）
+
+以下为 `fused_h_post_bda_ascend` 分支当前工作区实测（`FLAG_TRAIN_HPB_VS_BASE_ONLY=1`、
+全量形状集），与第 6.48 节相比的变化：
+
+| 算子 | 数据点 | 优化前均值 | 当前均值 | 当前中位 |
+| --- | ---: | ---: | ---: | ---: |
+| Forward（48 点） | 全 dtype | 0.587x | **0.794x** | 0.506x |
+| Backward（12 点，NV 基线仅覆盖 2 组形状） | 全 dtype | 0.666x | **1.000x** | 0.997x |
+
+Forward 代表性形状（无/有 bias 取均值附近值）：
+
+| Shape | BF16 前→今 | FP16 前→今 | FP32 前→今 |
+| --- | --- | --- | --- |
+| `(64,8,4,4096)` | 0.37→0.65x | 0.35→0.73x | 0.63→1.22x |
+| `(128,1,8,7168)` | 0.33→0.73x | 0.33→0.67x | 0.50→0.90x |
+| `(512,4,4,4096)` | 0.51x（不变） | 0.57x（不变） | 1.03x（不变） |
+| `(8192,4,4,7168)` | 0.51x（不变） | 0.56x（不变） | 0.90x（不变） |
+| 小形状（C<=1024 各组） | 约 0.2x（不变） | 约 0.2x（不变） | 约 0.2x（不变） |
+
+Backward 两组有 NV 基线的形状：`(2,4,4,1024)` BF16/FP16 带 bias 已达 1.05–1.07x，
+`(64,8,4,4096)` FP32 达 1.40–1.59x；FP32 `(2,4,4,1024)` 带 bias 仍为 0.51x，是
+small_bias_fused 单 kernel 在大 BLOCK_S 下的已知慢点。
+
+注意事项：个别数据点受 NV 基线异常影响虚高（如 FP16 `(128,1,8,7168)` 无 bias 9.09x、
+`(2,3,4,130)` 带 bias 3–4x），也有单窗口计时尖刺造成的异常低点，解读均值时应剔除
+这两类噪声；C=256/512 的形状 NV 基线 JSON 无记录，始终为 N/A。
+
+验证：forward 72 passed、backward 138 passed（合计 210 passed / 4 skipped），
+原生 tile 路径 42 组与 Python 路径 bitwise 一致，小形状 45 组 bitwise 一致，非连续与
+未对齐输入回退正常，全量 pre-commit 通过。代码尚未提交。
+
 ## 7. 正确性测试设计
 
 测试文件：`tests/megatron/test_fused_h_post_bda.py`。
