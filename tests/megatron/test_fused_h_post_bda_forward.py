@@ -190,7 +190,7 @@ def test_forward_row_dot_matches_reference(dtype, with_bias):
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 def test_forward_row_dot_multiple_launch_batches_match_reference(with_bias):
     torch.manual_seed(2026)
-    inputs = _make_inputs(2048, 4, 4, 4096, torch.bfloat16, with_bias)
+    inputs = _make_inputs(2048, 4, 8, 4096, torch.bfloat16, with_bias)
     actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _reference_copy(reference_op(*inputs))
     _assert_close(actual, expected, torch.bfloat16, "row-dot multiple-batch output")
@@ -198,10 +198,91 @@ def test_forward_row_dot_multiple_launch_batches_match_reference(with_bias):
 
 @pytest.mark.fused_h_post_bda_forward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_forward_vector4_rows_match_reference(dtype, with_bias):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("channels", [65, 1024])
+def test_forward_vector8_single_channel_block_matches_reference(
+    dtype, channels, with_bias
+):
     torch.manual_seed(2026)
-    inputs = _make_inputs(2048, 4, 4, 4097, dtype, with_bias)
+    inputs = _make_inputs(256, 1, 8, channels, dtype, with_bias)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(reference_op(*inputs))
+    _assert_close(actual, expected, dtype, "vector8 single-channel-block output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+def test_forward_vector8_multiple_launch_batches_match_reference(with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(8192, 1, 8, 65, torch.bfloat16, with_bias)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(reference_op(*inputs))
+    _assert_close(actual, expected, torch.bfloat16, "vector8 multiple-batch output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+def test_forward_vector8_accepts_non_contiguous_inputs():
+    torch.manual_seed(2026)
+    inputs = tuple(
+        _non_contiguous(tensor)
+        for tensor in _make_inputs(256, 1, 8, 130, torch.float16, with_bias=True)
+        if tensor is not None
+    )
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(reference_op(*inputs))
+    _assert_close(actual, expected, torch.float16, "vector8 non-contiguous output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("channels", [65, 1024])
+def test_forward_vector4_single_channel_block_matches_reference(
+    dtype, channels, with_bias
+):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(512, 1, 4, channels, dtype, with_bias)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(reference_op(*inputs))
+    _assert_close(actual, expected, dtype, "vector4 single-channel-block output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("channels", [1024, 4097])
+def test_forward_vector4_medium_rows_match_reference(dtype, channels, with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(256, 4, 4, channels, dtype, with_bias)
+    first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(reference_op(*inputs))
+    assert first.data_ptr() != second.data_ptr()
+    _assert_close(first, expected, dtype, "vector4-medium-rows first output")
+    _assert_close(second, expected, dtype, "vector4-medium-rows cached output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+def test_forward_vector4_medium_rows_accept_non_contiguous_inputs():
+    torch.manual_seed(2026)
+    inputs = tuple(
+        _non_contiguous(tensor)
+        for tensor in _make_inputs(256, 4, 4, 130, torch.bfloat16, with_bias=True)
+    )
+    first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    expected = _reference_copy(reference_op(*inputs))
+    _assert_close(first, expected, torch.bfloat16, "medium-rows non-contiguous output")
+    _assert_close(second, expected, torch.bfloat16, "medium-rows cached output")
+
+
+@pytest.mark.fused_h_post_bda_forward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("channels", [1024, 4097])
+def test_forward_vector4_rows_match_reference(dtype, channels, with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(2048, 4, 4, channels, dtype, with_bias)
     actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _reference_copy(reference_op(*inputs))
     _assert_close(actual, expected, dtype, "vector4-rows output")
@@ -227,7 +308,7 @@ def test_forward_vector4_rows_multiple_launch_batches_match_reference(with_bias)
 )
 def test_forward_grouped_dot_matches_reference(with_bias, dtype, channels):
     torch.manual_seed(2026)
-    inputs = _make_inputs(8193, 1, 4, channels, dtype, with_bias)
+    inputs = _make_inputs(8193, 1, 8, channels, dtype, with_bias)
     actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _reference_copy(reference_op(*inputs))
     _assert_close(actual, expected, dtype, "grouped-dot output")

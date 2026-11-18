@@ -758,6 +758,13 @@ def _check_tile_kernel(compiled, expected):
 def _tile_signature(compiled):
     suffix = {
         "_triton_hpb_fwd_vector4_kernel": ("C", "HAS_BIAS", "BLOCK_C"),
+        "_triton_hpb_fwd_vector4_rows_kernel": (
+            "C",
+            "HAS_BIAS",
+            "BLOCK_C",
+            "ROWS",
+        ),
+        "_triton_hpb_fwd_vector8_kernel": ("C", "HAS_BIAS", "BLOCK_C"),
         "_triton_hpb_fwd_row_dot_kernel": (
             "C",
             "N",

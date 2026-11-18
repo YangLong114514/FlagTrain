@@ -315,6 +315,89 @@ def _triton_hpb_bwd_a_vector4_kernel(
 
 
 @triton.jit
+def _triton_hpb_bwd_a_vector4_rows_kernel(
+    go_ptr,
+    hr_ptr,
+    hp_ptr,
+    g_res_ptr,
+    g_x_ptr,
+    g_bias_ptr,
+    tile_offset,
+    C: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    pid = tl.program_id(0) + tile_offset
+    for row in range(ROWS):
+        pid_s = pid * ROWS + row
+        hr_base = hr_ptr + pid_s * 16
+        h00 = tl.load(hr_base + 0)
+        h01 = tl.load(hr_base + 1)
+        h02 = tl.load(hr_base + 2)
+        h03 = tl.load(hr_base + 3)
+        h10 = tl.load(hr_base + 4)
+        h11 = tl.load(hr_base + 5)
+        h12 = tl.load(hr_base + 6)
+        h13 = tl.load(hr_base + 7)
+        h20 = tl.load(hr_base + 8)
+        h21 = tl.load(hr_base + 9)
+        h22 = tl.load(hr_base + 10)
+        h23 = tl.load(hr_base + 11)
+        h30 = tl.load(hr_base + 12)
+        h31 = tl.load(hr_base + 13)
+        h32 = tl.load(hr_base + 14)
+        h33 = tl.load(hr_base + 15)
+        hp_base = hp_ptr + pid_s * 4
+        hp0 = tl.load(hp_base + 0).to(tl.float32)
+        hp1 = tl.load(hp_base + 1).to(tl.float32)
+        hp2 = tl.load(hp_base + 2).to(tl.float32)
+        hp3 = tl.load(hp_base + 3).to(tl.float32)
+        for c_start in range(0, C, BLOCK_C):
+            offs_c = c_start + tl.arange(0, BLOCK_C)
+            mask_c = offs_c < C
+            go_base = go_ptr + pid_s * 4 * C
+            go0 = tl.load(go_base + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+            go1 = tl.load(go_base + C + offs_c, mask=mask_c, other=0.0).to(tl.float32)
+            go2 = tl.load(go_base + 2 * C + offs_c, mask=mask_c, other=0.0).to(
+                tl.float32
+            )
+            go3 = tl.load(go_base + 3 * C + offs_c, mask=mask_c, other=0.0).to(
+                tl.float32
+            )
+            g_res0 = h00 * go0 + h01 * go1 + h02 * go2 + h03 * go3
+            g_res1 = h10 * go0 + h11 * go1 + h12 * go2 + h13 * go3
+            g_res2 = h20 * go0 + h21 * go1 + h22 * go2 + h23 * go3
+            g_res3 = h30 * go0 + h31 * go1 + h32 * go2 + h33 * go3
+            g_x = hp0 * go0 + hp1 * go1 + hp2 * go2 + hp3 * go3
+            g_res_base = g_res_ptr + pid_s * 4 * C + offs_c
+            tl.store(
+                g_res_base,
+                g_res0.to(g_res_ptr.dtype.element_ty),
+                mask=mask_c,
+            )
+            tl.store(
+                g_res_base + C,
+                g_res1.to(g_res_ptr.dtype.element_ty),
+                mask=mask_c,
+            )
+            tl.store(
+                g_res_base + 2 * C,
+                g_res2.to(g_res_ptr.dtype.element_ty),
+                mask=mask_c,
+            )
+            tl.store(
+                g_res_base + 3 * C,
+                g_res3.to(g_res_ptr.dtype.element_ty),
+                mask=mask_c,
+            )
+            g_x_out = g_x.to(g_x_ptr.dtype.element_ty)
+            tl.store(g_x_ptr + pid_s * C + offs_c, g_x_out, mask=mask_c)
+            if HAS_BIAS:
+                tl.store(g_bias_ptr + offs_c, g_x_out, mask=mask_c)
+
+
+@triton.jit
 def _triton_hpb_bwd_b_dot_kernel(
     go_ptr,
     orig_ptr,
@@ -1251,22 +1334,41 @@ def fused_h_post_bda_backward(
                     vector_block_c = min(
                         vector_block_c, max(64, triton.next_power_of_2(channels))
                     )
-                _launch_fixed_tiles(
-                    _triton_hpb_bwd_a_vector4_kernel,
-                    sb,
-                    go_flat,
-                    hr_flat,
-                    hp_flat,
-                    g_res,
-                    g_x,
-                    g_bias if dot_bias1_fused else g_x,
-                    0,
-                    channels,
-                    dot_bias1_fused,
-                    vector_block_c,
-                    offset_index=6,
-                    num_warps=4,
-                )
+                if sb > 4096 and sb % 8 == 0:
+                    _launch_fixed_tiles(
+                        _triton_hpb_bwd_a_vector4_rows_kernel,
+                        sb // 8,
+                        go_flat,
+                        hr_flat,
+                        hp_flat,
+                        g_res,
+                        g_x,
+                        g_x,
+                        0,
+                        channels,
+                        False,
+                        vector_block_c,
+                        8,
+                        offset_index=6,
+                        num_warps=4,
+                    )
+                else:
+                    _launch_fixed_tiles(
+                        _triton_hpb_bwd_a_vector4_kernel,
+                        sb,
+                        go_flat,
+                        hr_flat,
+                        hp_flat,
+                        g_res,
+                        g_x,
+                        g_bias if dot_bias1_fused else g_x,
+                        0,
+                        channels,
+                        dot_bias1_fused,
+                        vector_block_c,
+                        offset_index=6,
+                        num_warps=4,
+                    )
             elif n <= 2 and channels <= 2048:
                 _launch_fixed_tiles(
                     _triton_hpb_bwd_a_vecn_kernel,

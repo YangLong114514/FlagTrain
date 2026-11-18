@@ -276,6 +276,40 @@ def test_backward_large_a_matches_reference(with_bias, dtype, channels):
 
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_backward_vector4_rows_matches_reference(dtype, with_bias):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(2048, 4, 4, 2049, dtype, with_bias)
+    grad_output = _rand((2048, 4, 4, 2049), dtype)
+    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
+    )
+
+    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
+        _assert_close(actual_grad, expected_grad, dtype, name)
+
+
+@pytest.mark.fused_h_post_bda_backward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_backward_vector4_rows_multiple_launch_batches_match_reference(
+    dtype, with_bias
+):
+    torch.manual_seed(2026)
+    inputs = _make_inputs(40960, 1, 4, 65, dtype, with_bias)
+    grad_output = _rand((40960, 1, 4, 65), dtype)
+    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+    expected = tuple(
+        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
+    )
+
+    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
+        _assert_close(actual_grad, expected_grad, dtype, name)
+
+
+@pytest.mark.fused_h_post_bda_backward
+@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("channels", [513, 768])
 def test_backward_padded_b_channel_matches_reference(channels, with_bias):
     torch.manual_seed(2026)
@@ -375,6 +409,7 @@ def test_backward_dot_single_row_bias_is_independent(dtype, n, channels):
         (128, 1, 2, 256),
         (128, 1, 4, 4097),
         (1, 1, 4, 4097),
+        (2048, 4, 4, 65),
     ],
     ids=[
         "small_fused",
@@ -384,6 +419,7 @@ def test_backward_dot_single_row_bias_is_independent(dtype, n, channels):
         "vecn_single",
         "vector4",
         "vector4_bias1",
+        "vector4_rows",
     ],
 )
 def test_backward_accepts_non_contiguous_inputs(s, b, n, channels):
