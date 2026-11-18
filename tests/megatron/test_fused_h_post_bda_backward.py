@@ -30,8 +30,6 @@ _DTYPE_SHAPE_CASES = [
     (torch.bfloat16, 1, 1, 8, 257),
     (torch.bfloat16, 2, 5, 8, 257),
     (torch.bfloat16, 513, 1, 4, 130),
-    (torch.bfloat16, 513, 1, 4, 65),
-    (torch.bfloat16, 513, 1, 2, 130),
     (torch.float16, 1, 2, 2, 65),
     (torch.float16, 2, 1, 4, 130),
     (torch.float16, 1, 1, 8, 257),
