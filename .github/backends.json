@@ -26,7 +26,7 @@
     "gpu_check": "tools/gpu_check_ascend.sh",
     "label_gated": true,
     "prebuilt_env": true,
-    "enabled": false,
+    "enabled": true,
     "container": {
       "image": "harbor.baai.ac.cn/flagos-app/megatron_rl0.17.1-ascend-cann9.0.0-910c:2.2.0-0.2.3",
       "options": "--ipc=host --privileged --device=/dev/davinci_manager --device=/dev/devmm_svm --device=/dev/hisi_hdc -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi",
