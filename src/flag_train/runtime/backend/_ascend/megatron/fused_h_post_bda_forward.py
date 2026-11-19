@@ -30,14 +30,6 @@ from flag_train.megatron.fused_h_post_bda_forward import (
 )
 from flag_train.runtime import torch_device_fn
 
-from ._hpb_native_forward import current_stream as _native_current_stream
-from ._hpb_native_forward import get_plan as _native_get_plan
-from ._hpb_native_forward import launch_cached as _native_launch_cached
-from ._hpb_native_forward import launch_plan as _native_launch_plan
-from ._hpb_native_forward import launch_vec4_plan as _native_launch_vec4_plan
-from ._hpb_native_forward import register_plan as _native_register_plan
-from ._hpb_native_forward import register_tile_plan as _native_register_tile_plan
-
 logger = logging.getLogger(__name__)
 
 
@@ -52,12 +44,166 @@ _MAX_CORE_DIM = 65535
 _DOT_BLOCK_C = 2048
 _DOT_LAUNCH_TILES = 4096
 _FIXED_LAUNCH_CACHE = {}
+_FORWARD_PLAN_CACHE = {}
+_KERNEL_SIGNATURES = {}
+_RAW_STREAM_NO_WAIT = getattr(
+    __import__("torch_npu")._C, "_npu_getCurrentRawStreamNoWait", None
+)
+
+
+def _kernel_signature(kernel):
+    signature = _KERNEL_SIGNATURES.get(kernel)
+    if signature is None:
+        signature = (
+            kernel.cache_key,
+            tuple(param.is_constexpr for param in kernel.params),
+        )
+        _KERNEL_SIGNATURES[kernel] = signature
+    return signature
+
+
+def _current_stream(device):
+    if _RAW_STREAM_NO_WAIT is not None:
+        return _RAW_STREAM_NO_WAIT(device)
+    return driver.active.get_current_stream(device)
+
+
+def _forward_plan_key(h_res, original_residual, h_post, x, bias):
+    if not isinstance(original_residual, Tensor) or original_residual.dim() != 4:
+        return None
+    s, b, n, channels = original_residual.shape
+    sb = s * b
+    if sb <= 0 or sb > _DOT_LAUNCH_TILES or channels <= 0:
+        return None
+    if n <= 0 or n > 16 or n & (n - 1):
+        return None
+    dtype = original_residual.dtype
+    device = original_residual.device
+    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return None
+    if device.type != "npu":
+        return None
+    if channels > (1024 if dtype == torch.float32 else _DOT_BLOCK_C):
+        return None
+    tensors = (h_res, original_residual, h_post, x)
+    if any(not isinstance(tensor, Tensor) for tensor in tensors):
+        return None
+    if (
+        h_res.shape != (s, b, n, n)
+        or h_post.shape != (s, b, n)
+        or x.shape != (s, b, channels)
+    ):
+        return None
+    if h_res.dtype != dtype or h_post.dtype != dtype or x.dtype != dtype:
+        return None
+    if h_res.device != device or h_post.device != device or x.device != device:
+        return None
+    if not (
+        h_res.is_contiguous()
+        and original_residual.is_contiguous()
+        and h_post.is_contiguous()
+        and x.is_contiguous()
+    ):
+        return None
+    if bias is not None:
+        if not isinstance(bias, Tensor) or bias.dim() != 1:
+            return None
+        if bias.shape[0] != channels or bias.dtype != dtype or bias.device != device:
+            return None
+        if not bias.is_contiguous():
+            return None
+    if triton.knobs.runtime.launch_enter_hook.calls or (
+        triton.knobs.runtime.launch_exit_hook.calls
+    ):
+        return None
+    if bias is None:
+        alignment = (
+            h_res.data_ptr() % 16,
+            original_residual.data_ptr() % 16,
+            h_post.data_ptr() % 16,
+            x.data_ptr() % 16,
+        )
+    else:
+        alignment = (
+            h_res.data_ptr() % 16,
+            original_residual.data_ptr() % 16,
+            h_post.data_ptr() % 16,
+            x.data_ptr() % 16,
+            bias.data_ptr() % 16,
+        )
+    stream = _current_stream(device.index)
+    return (
+        tuple(original_residual.shape),
+        dtype,
+        device,
+        bias is not None,
+        alignment,
+        stream,
+    )
+
+
+def _launch_forward_plan(plan, stream, h_res, original_residual, h_post, x, bias):
+    compiled, grid, constants, out_alignment = plan
+    out = torch.empty(
+        original_residual.shape,
+        dtype=original_residual.dtype,
+        device=original_residual.device,
+    )
+    if out.data_ptr() % 16 != out_alignment:
+        return None
+    bias_arg = bias if bias is not None else x
+    args = (h_res, original_residual, h_post, x, bias_arg, out, 0) + constants
+    with _device_context(original_residual.device):
+        compiled.run(
+            grid,
+            1,
+            1,
+            stream,
+            compiled.function,
+            compiled.packed_metadata,
+            None,
+            None,
+            None,
+            *args,
+        )
+    return out
+
+
+def _register_forward_plan(
+    key, h_res, original_residual, h_post, x, bias, out, channels, n, dot_block_c
+):
+    if key in _FORWARD_PLAN_CACHE:
+        return
+    constants = (channels, n, max(4, n), bias is not None, dot_block_c, 1)
+    sb = original_residual.shape[0] * original_residual.shape[1]
+    try:
+        compiled = _triton_hpb_fwd_dot_kernel.warmup(
+            h_res,
+            original_residual,
+            h_post,
+            x,
+            bias if bias is not None else x,
+            out,
+            0,
+            *constants,
+            grid=(sb, 1, 1),
+            num_warps=4,
+        )
+    except Exception:
+        return
+    _FORWARD_PLAN_CACHE[key] = (
+        compiled,
+        sb,
+        constants,
+        out.data_ptr() % 16,
+    )
 
 
 def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
+    cache_key, constexpr = _kernel_signature(kernel)
     specialization = []
-    for param, arg in zip(kernel.params, args):
-        if param.is_constexpr:
+    for is_constexpr, arg in zip(constexpr, args):
+        if is_constexpr:
             specialization.append(arg)
         elif hasattr(arg, "data_ptr"):
             specialization.append((arg.dtype, arg.data_ptr() % 16))
@@ -67,13 +213,13 @@ def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
             specialization.append((type(arg), arg))
     specialization = tuple(specialization)
     device = torch_device_fn.current_device()
-    stream = driver.active.get_current_stream(device)
+    stream = _current_stream(device)
     fast_launch = not triton.knobs.runtime.launch_enter_hook.calls and not (
         triton.knobs.runtime.launch_exit_hook.calls
     )
     for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
         grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
-        key = (kernel.cache_key, device, grid, num_warps, specialization)
+        key = (cache_key, device, grid, num_warps, specialization)
         entry = _FIXED_LAUNCH_CACHE.get(key)
         batch_args = args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
         if entry is None:
@@ -592,35 +738,6 @@ def _grid_a_config(sb, channels):
     return grid, config
 
 
-def _native_dot_shape_key(original_residual, bias):
-    if not isinstance(original_residual, Tensor) or original_residual.dim() != 4:
-        return None
-    s, b, n, channels = original_residual.shape
-    if original_residual.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        return None
-    if original_residual.device.type != "npu":
-        return None
-    if n <= 0 or n > 16 or n & (n - 1):
-        return None
-    sb = s * b
-    if sb <= 0 or sb > _DOT_LAUNCH_TILES or channels <= 0:
-        return None
-    max_block_c = 1024 if original_residual.dtype == torch.float32 else _DOT_BLOCK_C
-    dot_block_c = min(max_block_c, max(64, 1 << (channels - 1).bit_length()))
-    if channels > dot_block_c and n > 8:
-        return None
-    if triton.knobs.runtime.launch_enter_hook.calls or (
-        triton.knobs.runtime.launch_exit_hook.calls
-    ):
-        return None
-    return (
-        tuple(original_residual.shape),
-        original_residual.dtype,
-        original_residual.device,
-        bias is not None,
-    )
-
-
 def fused_h_post_bda_forward(
     h_res: Tensor,
     original_residual: Tensor,
@@ -630,30 +747,21 @@ def fused_h_post_bda_forward(
 ) -> Tensor:
     """Compute ``H_res.T @ original_residual + H_post * (x + bias)``."""
     logger.debug("TRAIN_ASCEND FUSED_H_POST_BDA_FORWARD")
-    if not triton.knobs.runtime.launch_enter_hook.calls and not (
-        triton.knobs.runtime.launch_exit_hook.calls
-    ):
-        out = _native_launch_cached(h_res, original_residual, h_post, x, bias)
-        if out is not None:
-            return out
-    native_shape_key = _native_dot_shape_key(original_residual, bias)
-    native_plan_key = None
-    if native_shape_key is not None:
-        with _device_context(original_residual.device):
-            stream = _native_current_stream(original_residual.device.index)
-            native_plan_key = (*native_shape_key, stream)
-            plan = _native_get_plan(native_plan_key)
-            if plan is not None:
-                if len(plan) > 4:
-                    out = _native_launch_vec4_plan(
-                        plan, stream, h_res, original_residual, h_post, x, bias
-                    )
-                else:
-                    out = _native_launch_plan(
-                        plan, stream, h_res, original_residual, h_post, x, bias
-                    )
-                if out is not None:
-                    return out
+    plan_key = _forward_plan_key(h_res, original_residual, h_post, x, bias)
+    if plan_key is not None:
+        plan = _FORWARD_PLAN_CACHE.get(plan_key)
+        if plan is not None:
+            out = _launch_forward_plan(
+                plan,
+                plan_key[-1],
+                h_res,
+                original_residual,
+                h_post,
+                x,
+                bias,
+            )
+            if out is not None:
+                return out
     s, b, n, channels = _validate_inputs(h_res, original_residual, h_post, x, bias)
     sb = s * b
     out = torch.empty(s, b, n, channels, dtype=h_res.dtype, device=h_res.device)
@@ -699,31 +807,6 @@ def fused_h_post_bda_forward(
                     offset_index=6,
                     num_warps=4,
                 )
-                if native_plan_key is not None:
-                    compiled = _triton_hpb_fwd_vector4_rows_kernel.warmup(
-                        hr_flat,
-                        orig_flat,
-                        hp_flat,
-                        x_flat,
-                        bias_flat,
-                        out,
-                        0,
-                        sb,
-                        channels,
-                        bias is not None,
-                        vector_block_c,
-                        rows,
-                        grid=(sb // rows, 1, 1),
-                        num_warps=4,
-                    )
-                    _native_register_tile_plan(
-                        native_plan_key,
-                        compiled,
-                        sb // rows,
-                        {"tile_offset": 0, "sb": sb},
-                        (hr_flat, orig_flat, hp_flat, x_flat, bias_flat, out),
-                        h_res.device,
-                    )
             elif n == 4 and channels >= 64 and (c_blocks > 1 or sb >= 512):
                 _launch_fixed_tiles(
                     _triton_hpb_fwd_vector4_kernel,
@@ -742,30 +825,6 @@ def fused_h_post_bda_forward(
                     offset_index=6,
                     num_warps=4,
                 )
-                if native_plan_key is not None:
-                    compiled = _triton_hpb_fwd_vector4_kernel.warmup(
-                        hr_flat,
-                        orig_flat,
-                        hp_flat,
-                        x_flat,
-                        bias_flat,
-                        out,
-                        0,
-                        sb,
-                        channels,
-                        bias is not None,
-                        vector_block_c,
-                        grid=(sb, 1, 1),
-                        num_warps=4,
-                    )
-                    _native_register_tile_plan(
-                        native_plan_key,
-                        compiled,
-                        sb,
-                        {"tile_offset": 0, "sb": sb},
-                        (hr_flat, orig_flat, hp_flat, x_flat, bias_flat, out),
-                        h_res.device,
-                    )
             elif n == 8 and 64 <= channels <= 1024 and sb >= 256:
                 _launch_fixed_tiles(
                     _triton_hpb_fwd_vector8_kernel,
@@ -784,30 +843,6 @@ def fused_h_post_bda_forward(
                     offset_index=6,
                     num_warps=4,
                 )
-                if native_plan_key is not None:
-                    compiled = _triton_hpb_fwd_vector8_kernel.warmup(
-                        hr_flat,
-                        orig_flat,
-                        hp_flat,
-                        x_flat,
-                        bias_flat,
-                        out,
-                        0,
-                        sb,
-                        channels,
-                        bias is not None,
-                        vector_block_c,
-                        grid=(sb, 1, 1),
-                        num_warps=4,
-                    )
-                    _native_register_tile_plan(
-                        native_plan_key,
-                        compiled,
-                        sb,
-                        {"tile_offset": 0, "sb": sb},
-                        (hr_flat, orig_flat, hp_flat, x_flat, bias_flat, out),
-                        h_res.device,
-                    )
             elif n <= 8 and sb <= 8192 and c_blocks > 1:
                 _launch_fixed_tiles(
                     _triton_hpb_fwd_row_dot_kernel,
@@ -829,33 +864,6 @@ def fused_h_post_bda_forward(
                     offset_index=6,
                     num_warps=4,
                 )
-                if native_plan_key is not None:
-                    compiled = _triton_hpb_fwd_row_dot_kernel.warmup(
-                        hr_flat,
-                        orig_flat,
-                        hp_flat,
-                        x_flat,
-                        bias_flat,
-                        out,
-                        0,
-                        sb,
-                        channels,
-                        n,
-                        max(4, n),
-                        bias is not None,
-                        dot_block_c,
-                        c_blocks,
-                        grid=(sb, 1, 1),
-                        num_warps=4,
-                    )
-                    _native_register_tile_plan(
-                        native_plan_key,
-                        compiled,
-                        sb,
-                        {"tile_offset": 0, "sb": sb},
-                        (hr_flat, orig_flat, hp_flat, x_flat, bias_flat, out),
-                        h_res.device,
-                    )
             elif n <= 8 and c_blocks > 1:
                 default_c_group = 8 if h_res.dtype == torch.float32 else 4
                 c_groups = triton.cdiv(c_blocks, default_c_group)
@@ -901,30 +909,18 @@ def fused_h_post_bda_forward(
                     offset_index=6,
                     num_warps=4,
                 )
-                if native_plan_key is not None:
-                    compiled = _triton_hpb_fwd_dot_kernel.warmup(
+                if plan_key is not None:
+                    _register_forward_plan(
+                        plan_key,
                         hr_flat,
                         orig_flat,
                         hp_flat,
                         x_flat,
-                        bias_flat,
+                        bias if bias is not None else None,
                         out,
-                        0,
                         channels,
                         n,
-                        max(4, n),
-                        bias is not None,
                         dot_block_c,
-                        c_blocks,
-                        grid=(num_tiles, 1, 1),
-                        num_warps=4,
-                    )
-                    _native_register_plan(
-                        native_plan_key,
-                        compiled,
-                        num_tiles,
-                        (hr_flat, orig_flat, hp_flat, x_flat, bias_flat, out),
-                        h_res.device,
                     )
         return out
 

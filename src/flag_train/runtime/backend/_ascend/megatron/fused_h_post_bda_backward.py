@@ -33,8 +33,6 @@ from flag_train.megatron.fused_h_post_bda_backward import (
 )
 from flag_train.runtime import torch_device_fn
 
-from . import _hpb_native_backward as _native_bwd
-
 logger = logging.getLogger(__name__)
 
 
@@ -53,8 +51,349 @@ _DOT_LAUNCH_TILES = 4096
 _BIAS_SPLIT = 16
 _BIAS_BLOCK_S = 16
 _FIXED_LAUNCH_CACHE = {}
-_NATIVE_BWD_MAX_SB = 4096
-_NATIVE_BWD_MAX_SB_BIAS = 512
+_BACKWARD_PLAN_CACHE = {}
+_KERNEL_SIGNATURES = {}
+_RAW_STREAM_NO_WAIT = getattr(
+    __import__("torch_npu")._C, "_npu_getCurrentRawStreamNoWait", None
+)
+
+
+def _kernel_signature(kernel):
+    signature = _KERNEL_SIGNATURES.get(kernel)
+    if signature is None:
+        signature = (
+            kernel.cache_key,
+            tuple(param.is_constexpr for param in kernel.params),
+        )
+        _KERNEL_SIGNATURES[kernel] = signature
+    return signature
+
+
+def _current_stream(device):
+    if _RAW_STREAM_NO_WAIT is not None:
+        return _RAW_STREAM_NO_WAIT(device)
+    return driver.active.get_current_stream(device)
+
+
+def _backward_plan_key(grad_output, h_res, original_residual, h_post, x, bias):
+    tensors = (grad_output, h_res, original_residual, h_post, x)
+    if any(not isinstance(tensor, Tensor) for tensor in tensors):
+        return None
+    if original_residual.dim() != 4:
+        return None
+    s, b, n, channels = original_residual.shape
+    sb = s * b
+    if sb <= 0 or sb > 8 or channels <= 0 or channels > 1024:
+        return None
+    if n <= 0 or n > 4 or n & (n - 1):
+        return None
+    dtype = original_residual.dtype
+    device = original_residual.device
+    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        return None
+    if device.type != "npu":
+        return None
+    if (
+        grad_output.shape != (s, b, n, channels)
+        or h_res.shape != (s, b, n, n)
+        or h_post.shape != (s, b, n)
+        or x.shape != (s, b, channels)
+    ):
+        return None
+    if (
+        grad_output.dtype != dtype
+        or h_res.dtype != dtype
+        or h_post.dtype != dtype
+        or x.dtype != dtype
+    ):
+        return None
+    if (
+        grad_output.device != device
+        or h_res.device != device
+        or h_post.device != device
+        or x.device != device
+    ):
+        return None
+    if not (
+        grad_output.is_contiguous()
+        and h_res.is_contiguous()
+        and original_residual.is_contiguous()
+        and h_post.is_contiguous()
+        and x.is_contiguous()
+    ):
+        return None
+    if bias is not None:
+        if not isinstance(bias, Tensor) or bias.dim() != 1:
+            return None
+        if bias.shape[0] != channels or bias.dtype != dtype or bias.device != device:
+            return None
+        if not bias.is_contiguous():
+            return None
+    if triton.knobs.runtime.launch_enter_hook.calls or (
+        triton.knobs.runtime.launch_exit_hook.calls
+    ):
+        return None
+    alignment = (
+        grad_output.data_ptr() % 16,
+        h_res.data_ptr() % 16,
+        original_residual.data_ptr() % 16,
+        h_post.data_ptr() % 16,
+        x.data_ptr() % 16,
+    )
+    if bias is not None:
+        alignment += (bias.data_ptr() % 16,)
+    stream = _current_stream(device.index)
+    return (
+        tuple(original_residual.shape),
+        dtype,
+        device,
+        bias is not None,
+        alignment,
+        stream,
+    )
+
+
+def _launch_backward_plan(
+    plan, stream, grad_output, h_res, original_residual, h_post, x, bias
+):
+    (
+        small_compiled,
+        small_grid,
+        small_constants,
+        small_bias_fused,
+        bias_compiled,
+        bias_grid,
+        bias_constants,
+        expected_alignment,
+    ) = plan
+    g_hr = torch.empty(h_res.shape, dtype=h_res.dtype, device=h_res.device)
+    g_res = torch.empty(
+        original_residual.shape,
+        dtype=original_residual.dtype,
+        device=original_residual.device,
+    )
+    g_hp = torch.empty(h_post.shape, dtype=h_post.dtype, device=h_post.device)
+    g_x = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    g_bias = (
+        torch.empty(bias.shape, dtype=bias.dtype, device=bias.device)
+        if bias is not None
+        else None
+    )
+    alignment = (
+        g_hr.data_ptr() % 16,
+        g_res.data_ptr() % 16,
+        g_hp.data_ptr() % 16,
+        g_x.data_ptr() % 16,
+        g_bias.data_ptr() % 16 if g_bias is not None else None,
+    )
+    if alignment != expected_alignment:
+        return None
+    bias_arg = bias if bias is not None else x
+    with _device_context(original_residual.device):
+        if small_bias_fused:
+            args = (
+                grad_output,
+                h_res,
+                original_residual,
+                h_post,
+                x,
+                bias_arg,
+                g_hr,
+                g_res,
+                g_hp,
+                g_x,
+                g_bias,
+            ) + small_constants
+        else:
+            args = (
+                grad_output,
+                h_res,
+                original_residual,
+                h_post,
+                x,
+                bias_arg,
+                g_hr,
+                g_res,
+                g_hp,
+                g_x,
+            ) + small_constants
+        small_compiled.run(
+            small_grid,
+            1,
+            1,
+            stream,
+            small_compiled.function,
+            small_compiled.packed_metadata,
+            None,
+            None,
+            None,
+            *args,
+        )
+        if bias_compiled is not None:
+            bias_args = (g_x, g_bias) + bias_constants
+            bias_compiled.run(
+                bias_grid,
+                1,
+                1,
+                stream,
+                bias_compiled.function,
+                bias_compiled.packed_metadata,
+                None,
+                None,
+                None,
+                *bias_args,
+            )
+    return g_hr, g_res, g_hp, g_x, g_bias
+
+
+def _register_backward_plan(
+    key,
+    grad_output,
+    h_res,
+    original_residual,
+    h_post,
+    x,
+    bias,
+    g_hr,
+    g_res,
+    g_hp,
+    g_x,
+    g_bias,
+    sb,
+    channels,
+    n,
+    small_bias_fused,
+    block_c,
+    block_s,
+):
+    if key in _BACKWARD_PLAN_CACHE:
+        return
+    stride_c_s = n * channels
+    stride_hr_s = n * n
+    bias_arg = bias if bias is not None else x
+    if small_bias_fused:
+        small_grid = 1
+        small_constants = (
+            sb,
+            channels,
+            n,
+            stride_c_s,
+            channels,
+            1,
+            stride_hr_s,
+            n,
+            1,
+            stride_c_s,
+            channels,
+            1,
+            block_c,
+            block_s,
+            sb > 1,
+        )
+        try:
+            small_compiled = _triton_hpb_bwd_small_bias_kernel.warmup(
+                grad_output,
+                h_res,
+                original_residual,
+                h_post,
+                x,
+                bias_arg,
+                g_hr,
+                g_res,
+                g_hp,
+                g_x,
+                g_bias,
+                *small_constants,
+                grid=(small_grid, 1, 1),
+                num_warps=4,
+            )
+        except Exception:
+            return
+    else:
+        small_grid = triton.cdiv(sb, block_s)
+        small_constants = (
+            sb,
+            channels,
+            n,
+            stride_c_s,
+            channels,
+            1,
+            stride_hr_s,
+            n,
+            1,
+            stride_c_s,
+            channels,
+            1,
+            bias is not None,
+            block_c,
+            block_s,
+        )
+        try:
+            small_compiled = _triton_hpb_bwd_small_kernel.warmup(
+                grad_output,
+                h_res,
+                original_residual,
+                h_post,
+                x,
+                bias_arg,
+                g_hr,
+                g_res,
+                g_hp,
+                g_x,
+                *small_constants,
+                grid=(small_grid, 1, 1),
+                num_warps=4,
+            )
+        except Exception:
+            return
+    bias_compiled = None
+    bias_grid = 0
+    bias_constants = ()
+    if bias is not None and not small_bias_fused:
+        bias_grid = triton.cdiv(channels, 512)
+        bias_constants = (sb, channels, 512, _BIAS_BLOCK_S)
+        try:
+            bias_compiled = _triton_hpb_bias_single_kernel.warmup(
+                g_x,
+                g_bias,
+                *bias_constants,
+                grid=(bias_grid, 1, 1),
+                num_warps=4,
+            )
+        except Exception:
+            return
+    alignment = (
+        g_hr.data_ptr() % 16,
+        g_res.data_ptr() % 16,
+        g_hp.data_ptr() % 16,
+        g_x.data_ptr() % 16,
+        g_bias.data_ptr() % 16 if g_bias is not None else None,
+    )
+    _BACKWARD_PLAN_CACHE[key] = (
+        small_compiled,
+        small_grid,
+        small_constants,
+        small_bias_fused,
+        bias_compiled,
+        bias_grid,
+        bias_constants,
+        alignment,
+    )
+
+
+def _specialization(kernel, args):
+    cache_key, constexpr = _kernel_signature(kernel)
+    specialization = []
+    for is_constexpr, arg in zip(constexpr, args):
+        if is_constexpr:
+            specialization.append(arg)
+        elif hasattr(arg, "data_ptr"):
+            specialization.append((arg.dtype, arg.data_ptr() % 16))
+        elif isinstance(arg, int):
+            specialization.append((arg == 1, arg % 16 == 0))
+        else:
+            specialization.append((type(arg), arg))
+    return cache_key, tuple(specialization)
 
 
 def _run_fixed_entry(entry, grid, stream, fast_launch, args):
@@ -77,22 +416,13 @@ def _run_fixed_entry(entry, grid, stream, fast_launch, args):
 
 
 def _launch_fixed(kernel, grid, *args, num_warps):
-    specialization = []
-    for param, arg in zip(kernel.params, args):
-        if param.is_constexpr:
-            specialization.append(arg)
-        elif hasattr(arg, "data_ptr"):
-            specialization.append((arg.dtype, arg.data_ptr() % 16))
-        elif isinstance(arg, int):
-            specialization.append((arg == 1, arg % 16 == 0))
-        else:
-            specialization.append((type(arg), arg))
+    cache_key, specialization = _specialization(kernel, args)
     device = torch_device_fn.current_device()
-    stream = driver.active.get_current_stream(device)
+    stream = _current_stream(device)
     fast_launch = not triton.knobs.runtime.launch_enter_hook.calls and not (
         triton.knobs.runtime.launch_exit_hook.calls
     )
-    key = (kernel.cache_key, device, grid, num_warps, tuple(specialization))
+    key = (cache_key, device, grid, num_warps, specialization)
     entry = _FIXED_LAUNCH_CACHE.get(key)
     if entry is None:
         compiled = kernel.warmup(*args, grid=grid, num_warps=num_warps)
@@ -102,25 +432,15 @@ def _launch_fixed(kernel, grid, *args, num_warps):
 
 
 def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
-    specialization = []
-    for param, arg in zip(kernel.params, args):
-        if param.is_constexpr:
-            specialization.append(arg)
-        elif hasattr(arg, "data_ptr"):
-            specialization.append((arg.dtype, arg.data_ptr() % 16))
-        elif isinstance(arg, int):
-            specialization.append((arg == 1, arg % 16 == 0))
-        else:
-            specialization.append((type(arg), arg))
-    specialization = tuple(specialization)
+    cache_key, specialization = _specialization(kernel, args)
     device = torch_device_fn.current_device()
-    stream = driver.active.get_current_stream(device)
+    stream = _current_stream(device)
     fast_launch = not triton.knobs.runtime.launch_enter_hook.calls and not (
         triton.knobs.runtime.launch_exit_hook.calls
     )
     for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
         grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
-        key = (kernel.cache_key, device, grid, num_warps, specialization)
+        key = (cache_key, device, grid, num_warps, specialization)
         entry = _FIXED_LAUNCH_CACHE.get(key)
         batch_args = args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
         if entry is None:
@@ -814,262 +1134,6 @@ def _dot_eligible(channels, n):
     return n <= 16 and (channels >= 256 or (n in (1, 2, 4) and channels >= 64))
 
 
-def _native_bwd_key(
-    grad_output, h_res, original_residual, h_post, x, bias, n, sb, channels
-):
-    small = 0 < sb <= 8 and channels <= 1024 and n <= 4
-    if not small:
-        if n != 4 or not _dot_eligible(channels, n):
-            return None
-        if sb <= 0 or sb > _NATIVE_BWD_MAX_SB or sb % 16 != 0:
-            return None
-        if bias is not None and sb > _NATIVE_BWD_MAX_SB_BIAS:
-            return None
-    dtype = original_residual.dtype
-    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        return None
-    device = original_residual.device
-    if device.type != "npu":
-        return None
-    for tensor in (grad_output, h_res, h_post, x):
-        if tensor.dtype != dtype or tensor.device != device:
-            return None
-    if bias is not None and (
-        bias.dtype != dtype
-        or bias.device != device
-        or bias.dim() != 1
-        or bias.shape[0] != channels
-    ):
-        return None
-    if triton.knobs.runtime.launch_enter_hook.calls or (
-        triton.knobs.runtime.launch_exit_hook.calls
-    ):
-        return None
-    with _device_context(device):
-        stream = _native_bwd.current_stream(device.index)
-    return (tuple(original_residual.shape), dtype, device, bias is not None, stream)
-
-
-def _register_native_bwd_plan(
-    key, grad_output, h_res, original_residual, h_post, x, bias, sb, channels, device
-):
-    has_bias = bias is not None
-    go_flat = grad_output.contiguous()
-    hr_flat = h_res.contiguous()
-    orig_flat = original_residual.contiguous()
-    hp_flat = h_post.contiguous()
-    x_flat = x.contiguous()
-    bias_flat = bias.contiguous() if has_bias else x_flat
-    g_res = torch.empty_like(orig_flat)
-    g_x = torch.empty_like(x_flat)
-    g_hr = torch.empty_like(hr_flat)
-    g_hp = torch.empty_like(hp_flat)
-    g_bias = torch.empty_like(bias_flat) if has_bias else g_x
-    dot_block_c = 1024 if h_res.dtype == torch.float32 else _DOT_BLOCK_C
-    c_blocks = triton.cdiv(channels, dot_block_c)
-    vector_block_c = 1024 if sb > 8192 and h_res.dtype != torch.float32 else 2048
-    if c_blocks == 1:
-        vector_block_c = min(vector_block_c, max(64, triton.next_power_of_2(channels)))
-    compiled_a = _triton_hpb_bwd_a_vector4_kernel.warmup(
-        go_flat,
-        hr_flat,
-        hp_flat,
-        g_res,
-        g_x,
-        g_x,
-        0,
-        channels,
-        False,
-        vector_block_c,
-        grid=(sb, 1, 1),
-        num_warps=4,
-    )
-    compiled_b = _triton_hpb_bwd_b_vector4_kernel.warmup(
-        go_flat,
-        orig_flat,
-        x_flat,
-        bias_flat,
-        g_hr,
-        g_hp,
-        sb,
-        channels,
-        has_bias,
-        min(
-            1024 if channels >= 4096 else 512, max(64, triton.next_power_of_2(channels))
-        ),
-        grid=(sb, 1, 1),
-        num_warps=4,
-    )
-    grid_bias = triton.cdiv(channels, 512)
-    compiled_bias = None
-    if has_bias:
-        compiled_bias = _triton_hpb_bias_single_kernel.warmup(
-            g_x,
-            g_bias,
-            sb,
-            channels,
-            512,
-            _BIAS_BLOCK_S,
-            grid=(grid_bias, 1, 1),
-            num_warps=4,
-        )
-    tensors = (
-        go_flat,
-        hr_flat,
-        orig_flat,
-        hp_flat,
-        x_flat,
-        bias_flat,
-        g_res,
-        g_x,
-        g_hr,
-        g_hp,
-    )
-    return _native_bwd.register_plan(
-        key,
-        compiled_a,
-        sb,
-        compiled_b,
-        sb,
-        compiled_bias,
-        grid_bias,
-        tensors,
-        device,
-    )
-
-
-def _register_native_small_plan(
-    key, grad_output, h_res, original_residual, h_post, x, bias, sb, channels, n, device
-):
-    has_bias = bias is not None
-    go_flat = grad_output.contiguous()
-    hr_flat = h_res.contiguous()
-    orig_flat = original_residual.contiguous()
-    hp_flat = h_post.contiguous()
-    x_flat = x.contiguous()
-    bias_flat = bias.contiguous() if has_bias else x_flat
-    g_res = torch.empty_like(orig_flat)
-    g_x = torch.empty_like(x_flat)
-    g_hr = torch.empty_like(hr_flat)
-    g_hp = torch.empty_like(hp_flat)
-    g_bias = torch.empty_like(bias_flat) if has_bias else g_x
-    small_bias_fused = has_bias and (sb == 1 or (sb == 2 and n <= 2))
-    compiled_bias = None
-    grid_bias = 0
-    stride_c_s = n * channels
-    stride_hr_s = n * n
-    int_args_small = {
-        "sb": sb,
-        "stride_go_s": stride_c_s,
-        "stride_go_n": channels,
-        "stride_hr_s": stride_hr_s,
-        "stride_hr_i": n,
-        "stride_orig_s": stride_c_s,
-        "stride_orig_n": channels,
-    }
-    if small_bias_fused:
-        block_s = 2 if n <= 2 else (sb if n == 4 else 1)
-        compiled_small = _triton_hpb_bwd_small_bias_kernel.warmup(
-            go_flat,
-            hr_flat,
-            orig_flat,
-            hp_flat,
-            x_flat,
-            bias_flat,
-            g_hr,
-            g_res,
-            g_hp,
-            g_x,
-            g_bias,
-            sb,
-            channels,
-            n,
-            stride_c_s,
-            channels,
-            1,
-            stride_hr_s,
-            n,
-            1,
-            stride_c_s,
-            channels,
-            1,
-            64,
-            block_s,
-            sb > 1,
-            grid=(1, 1, 1),
-            num_warps=4,
-        )
-        grid_small = 1
-    else:
-        block_s = 2 if n <= 2 else 1
-        grid_small = triton.cdiv(sb, block_s)
-        compiled_small = _triton_hpb_bwd_small_kernel.warmup(
-            go_flat,
-            hr_flat,
-            orig_flat,
-            hp_flat,
-            x_flat,
-            bias_flat,
-            g_hr,
-            g_res,
-            g_hp,
-            g_x,
-            sb,
-            channels,
-            n,
-            stride_c_s,
-            channels,
-            1,
-            stride_hr_s,
-            n,
-            1,
-            stride_c_s,
-            channels,
-            1,
-            has_bias,
-            64,
-            block_s,
-            grid=(grid_small, 1, 1),
-            num_warps=4,
-        )
-        if has_bias:
-            grid_bias = triton.cdiv(channels, 512)
-            compiled_bias = _triton_hpb_bias_single_kernel.warmup(
-                g_x,
-                g_bias,
-                sb,
-                channels,
-                512,
-                _BIAS_BLOCK_S,
-                grid=(grid_bias, 1, 1),
-                num_warps=4,
-            )
-    tensors = (
-        go_flat,
-        hr_flat,
-        orig_flat,
-        hp_flat,
-        x_flat,
-        bias_flat,
-        g_res,
-        g_x,
-        g_hr,
-        g_hp,
-    )
-    return _native_bwd.register_small_plan(
-        key,
-        compiled_small,
-        grid_small,
-        small_bias_fused,
-        int_args_small,
-        compiled_bias,
-        grid_bias,
-        {"sb": sb},
-        tensors,
-        device,
-    )
-
-
 def _grid_a_config(sb, channels):
     config = _FIXED_CONFIG.copy()
     config["BLOCK_C"] = min(
@@ -1140,17 +1204,27 @@ def fused_h_post_bda_backward(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
     """Return gradients for the five inputs of the H_post BDA forward operator."""
     logger.debug("TRAIN_ASCEND FUSED_H_POST_BDA_BACKWARD")
-    if not triton.knobs.runtime.launch_enter_hook.calls and not (
-        triton.knobs.runtime.launch_exit_hook.calls
-    ):
-        result = _native_bwd.launch_cached(
-            grad_output, h_res, original_residual, h_post, x, bias
-        )
-        if result is not None:
-            return result
+    plan_key = _backward_plan_key(
+        grad_output, h_res, original_residual, h_post, x, bias
+    )
+    if plan_key is not None:
+        plan = _BACKWARD_PLAN_CACHE.get(plan_key)
+        if plan is not None:
+            result = _launch_backward_plan(
+                plan,
+                plan_key[-1],
+                grad_output,
+                h_res,
+                original_residual,
+                h_post,
+                x,
+                bias,
+            )
+            if result is not None:
+                return result
     s, b, n, channels = _validate_inputs(h_res, original_residual, h_post, x, bias)
     if tuple(grad_output.shape) != (s, b, n, channels):
-        raise ValueError("grad_output must have the same shape as original_residual")
+        raise ValueError("grad_output must have shape [s, b, n, C]")
     if (
         grad_output.device != original_residual.device
         or grad_output.dtype != original_residual.dtype
@@ -1160,70 +1234,6 @@ def fused_h_post_bda_backward(
         )
 
     sb = s * b
-    native_key = _native_bwd_key(
-        grad_output, h_res, original_residual, h_post, x, bias, n, sb, channels
-    )
-    if native_key is not None:
-        plan = _native_bwd.get_plan(native_key)
-        small_native = sb <= 8 and channels <= 1024 and n <= 4
-        if plan is None:
-            try:
-                if small_native:
-                    plan = _register_native_small_plan(
-                        native_key,
-                        grad_output,
-                        h_res,
-                        original_residual,
-                        h_post,
-                        x,
-                        bias,
-                        sb,
-                        channels,
-                        n,
-                        h_res.device,
-                    )
-                else:
-                    plan = _register_native_bwd_plan(
-                        native_key,
-                        grad_output,
-                        h_res,
-                        original_residual,
-                        h_post,
-                        x,
-                        bias,
-                        sb,
-                        channels,
-                        h_res.device,
-                    )
-            except Exception:
-                plan = None
-        if plan is not None:
-            with _device_context(h_res.device):
-                stream = _native_bwd.current_stream(h_res.device.index)
-                if small_native:
-                    result = _native_bwd.launch_small_plan(
-                        plan,
-                        stream,
-                        grad_output,
-                        h_res,
-                        original_residual,
-                        h_post,
-                        x,
-                        bias,
-                    )
-                else:
-                    result = _native_bwd.launch_plan(
-                        plan,
-                        stream,
-                        grad_output,
-                        h_res,
-                        original_residual,
-                        h_post,
-                        x,
-                        bias,
-                    )
-            if result is not None:
-                return result
     g_hr = torch.empty(s, b, n, n, dtype=h_res.dtype, device=h_res.device)
     g_res = torch.empty(
         s, b, n, channels, dtype=original_residual.dtype, device=h_res.device
@@ -1564,4 +1574,26 @@ def fused_h_post_bda_backward(
 
     if not bias_fused:
         g_bias = _bias_gradient(g_x, sb, channels, bias)
+    if plan_key is not None and small_fused:
+        with _device_context(h_res.device):
+            _register_backward_plan(
+                plan_key,
+                go_flat,
+                hr_flat,
+                orig_flat,
+                hp_flat,
+                x_flat,
+                bias,
+                g_hr,
+                g_res,
+                g_hp,
+                g_x,
+                g_bias,
+                sb,
+                channels,
+                n,
+                small_bias_fused,
+                config["BLOCK_C"],
+                config["BLOCK_S"],
+            )
     return g_hr, g_res, g_hp, g_x, g_bias
