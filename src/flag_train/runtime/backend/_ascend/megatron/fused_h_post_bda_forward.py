@@ -44,166 +44,12 @@ _MAX_CORE_DIM = 65535
 _DOT_BLOCK_C = 2048
 _DOT_LAUNCH_TILES = 4096
 _FIXED_LAUNCH_CACHE = {}
-_FORWARD_PLAN_CACHE = {}
-_KERNEL_SIGNATURES = {}
-_RAW_STREAM_NO_WAIT = getattr(
-    __import__("torch_npu")._C, "_npu_getCurrentRawStreamNoWait", None
-)
-
-
-def _kernel_signature(kernel):
-    signature = _KERNEL_SIGNATURES.get(kernel)
-    if signature is None:
-        signature = (
-            kernel.cache_key,
-            tuple(param.is_constexpr for param in kernel.params),
-        )
-        _KERNEL_SIGNATURES[kernel] = signature
-    return signature
-
-
-def _current_stream(device):
-    if _RAW_STREAM_NO_WAIT is not None:
-        return _RAW_STREAM_NO_WAIT(device)
-    return driver.active.get_current_stream(device)
-
-
-def _forward_plan_key(h_res, original_residual, h_post, x, bias):
-    if not isinstance(original_residual, Tensor) or original_residual.dim() != 4:
-        return None
-    s, b, n, channels = original_residual.shape
-    sb = s * b
-    if sb <= 0 or sb > _DOT_LAUNCH_TILES or channels <= 0:
-        return None
-    if n <= 0 or n > 16 or n & (n - 1):
-        return None
-    dtype = original_residual.dtype
-    device = original_residual.device
-    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        return None
-    if device.type != "npu":
-        return None
-    if channels > (1024 if dtype == torch.float32 else _DOT_BLOCK_C):
-        return None
-    tensors = (h_res, original_residual, h_post, x)
-    if any(not isinstance(tensor, Tensor) for tensor in tensors):
-        return None
-    if (
-        h_res.shape != (s, b, n, n)
-        or h_post.shape != (s, b, n)
-        or x.shape != (s, b, channels)
-    ):
-        return None
-    if h_res.dtype != dtype or h_post.dtype != dtype or x.dtype != dtype:
-        return None
-    if h_res.device != device or h_post.device != device or x.device != device:
-        return None
-    if not (
-        h_res.is_contiguous()
-        and original_residual.is_contiguous()
-        and h_post.is_contiguous()
-        and x.is_contiguous()
-    ):
-        return None
-    if bias is not None:
-        if not isinstance(bias, Tensor) or bias.dim() != 1:
-            return None
-        if bias.shape[0] != channels or bias.dtype != dtype or bias.device != device:
-            return None
-        if not bias.is_contiguous():
-            return None
-    if triton.knobs.runtime.launch_enter_hook.calls or (
-        triton.knobs.runtime.launch_exit_hook.calls
-    ):
-        return None
-    if bias is None:
-        alignment = (
-            h_res.data_ptr() % 16,
-            original_residual.data_ptr() % 16,
-            h_post.data_ptr() % 16,
-            x.data_ptr() % 16,
-        )
-    else:
-        alignment = (
-            h_res.data_ptr() % 16,
-            original_residual.data_ptr() % 16,
-            h_post.data_ptr() % 16,
-            x.data_ptr() % 16,
-            bias.data_ptr() % 16,
-        )
-    stream = _current_stream(device.index)
-    return (
-        tuple(original_residual.shape),
-        dtype,
-        device,
-        bias is not None,
-        alignment,
-        stream,
-    )
-
-
-def _launch_forward_plan(plan, stream, h_res, original_residual, h_post, x, bias):
-    compiled, grid, constants, out_alignment = plan
-    out = torch.empty(
-        original_residual.shape,
-        dtype=original_residual.dtype,
-        device=original_residual.device,
-    )
-    if out.data_ptr() % 16 != out_alignment:
-        return None
-    bias_arg = bias if bias is not None else x
-    args = (h_res, original_residual, h_post, x, bias_arg, out, 0) + constants
-    with _device_context(original_residual.device):
-        compiled.run(
-            grid,
-            1,
-            1,
-            stream,
-            compiled.function,
-            compiled.packed_metadata,
-            None,
-            None,
-            None,
-            *args,
-        )
-    return out
-
-
-def _register_forward_plan(
-    key, h_res, original_residual, h_post, x, bias, out, channels, n, dot_block_c
-):
-    if key in _FORWARD_PLAN_CACHE:
-        return
-    constants = (channels, n, max(4, n), bias is not None, dot_block_c, 1)
-    sb = original_residual.shape[0] * original_residual.shape[1]
-    try:
-        compiled = _triton_hpb_fwd_dot_kernel.warmup(
-            h_res,
-            original_residual,
-            h_post,
-            x,
-            bias if bias is not None else x,
-            out,
-            0,
-            *constants,
-            grid=(sb, 1, 1),
-            num_warps=4,
-        )
-    except Exception:
-        return
-    _FORWARD_PLAN_CACHE[key] = (
-        compiled,
-        sb,
-        constants,
-        out.data_ptr() % 16,
-    )
 
 
 def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
-    cache_key, constexpr = _kernel_signature(kernel)
     specialization = []
-    for is_constexpr, arg in zip(constexpr, args):
-        if is_constexpr:
+    for param, arg in zip(kernel.params, args):
+        if param.is_constexpr:
             specialization.append(arg)
         elif hasattr(arg, "data_ptr"):
             specialization.append((arg.dtype, arg.data_ptr() % 16))
@@ -213,13 +59,13 @@ def _launch_fixed_tiles(kernel, num_tiles, *args, offset_index, num_warps):
             specialization.append((type(arg), arg))
     specialization = tuple(specialization)
     device = torch_device_fn.current_device()
-    stream = _current_stream(device)
+    stream = driver.active.get_current_stream(device)
     fast_launch = not triton.knobs.runtime.launch_enter_hook.calls and not (
         triton.knobs.runtime.launch_exit_hook.calls
     )
     for tile_offset in range(0, num_tiles, _DOT_LAUNCH_TILES):
         grid = (min(num_tiles - tile_offset, _DOT_LAUNCH_TILES),)
-        key = (cache_key, device, grid, num_warps, specialization)
+        key = (kernel.cache_key, device, grid, num_warps, specialization)
         entry = _FIXED_LAUNCH_CACHE.get(key)
         batch_args = args[:offset_index] + (tile_offset,) + args[offset_index + 1 :]
         if entry is None:
@@ -747,21 +593,6 @@ def fused_h_post_bda_forward(
 ) -> Tensor:
     """Compute ``H_res.T @ original_residual + H_post * (x + bias)``."""
     logger.debug("TRAIN_ASCEND FUSED_H_POST_BDA_FORWARD")
-    plan_key = _forward_plan_key(h_res, original_residual, h_post, x, bias)
-    if plan_key is not None:
-        plan = _FORWARD_PLAN_CACHE.get(plan_key)
-        if plan is not None:
-            out = _launch_forward_plan(
-                plan,
-                plan_key[-1],
-                h_res,
-                original_residual,
-                h_post,
-                x,
-                bias,
-            )
-            if out is not None:
-                return out
     s, b, n, channels = _validate_inputs(h_res, original_residual, h_post, x, bias)
     sb = s * b
     out = torch.empty(s, b, n, channels, dtype=h_res.dtype, device=h_res.device)
@@ -909,19 +740,6 @@ def fused_h_post_bda_forward(
                     offset_index=6,
                     num_warps=4,
                 )
-                if plan_key is not None:
-                    _register_forward_plan(
-                        plan_key,
-                        hr_flat,
-                        orig_flat,
-                        hp_flat,
-                        x_flat,
-                        bias if bias is not None else None,
-                        out,
-                        channels,
-                        n,
-                        dot_block_c,
-                    )
         return out
 
     hr_flat = h_res.contiguous().view(sb, n, n)
