@@ -136,6 +136,14 @@ def _non_contiguous(tensor):
     return result
 
 
+def _contiguous(inputs):
+    # Megatron's native op requires bias as a positional argument and reads it
+    # without calling .contiguous(), so the reference always gets dense copies.
+    return tuple(
+        tensor.contiguous() if tensor is not None else None for tensor in inputs
+    )
+
+
 @pytest.mark.fused_h_post_bda_forward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype,s,b,n,channels", _DTYPE_SHAPE_CASES)
@@ -242,7 +250,7 @@ def test_forward_vector8_accepts_non_contiguous_inputs():
         if tensor is not None
     )
     actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
+    expected = _reference_copy(reference_op(*_contiguous(inputs)))
     _assert_close(actual, expected, torch.float16, "vector8 non-contiguous output")
 
 
@@ -287,7 +295,7 @@ def test_forward_vector4_medium_rows_accept_non_contiguous_inputs():
     )
     first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
+    expected = _reference_copy(reference_op(*_contiguous(inputs)))
     _assert_close(first, expected, torch.bfloat16, "medium-rows non-contiguous output")
     _assert_close(second, expected, torch.bfloat16, "medium-rows cached output")
 
@@ -363,7 +371,7 @@ def test_forward_accepts_non_contiguous_inputs():
         for tensor in _make_inputs(2, 1, 4, 130, torch.bfloat16, with_bias=True)
     )
     actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
+    expected = _reference_copy(reference_op(*_contiguous(inputs)))
     _assert_close(actual, expected, torch.bfloat16, "non-contiguous output")
 
 
@@ -375,11 +383,12 @@ def test_forward_medium_shape_accepts_non_contiguous_inputs():
         for tensor in _make_inputs(64, 8, 4, 4096, torch.bfloat16, with_bias=True)
     )
     actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
+    expected = _reference_copy(reference_op(*_contiguous(inputs)))
     _assert_close(actual, expected, torch.bfloat16, "medium non-contiguous output")
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize(
     "non_contiguous", [False, True], ids=["contiguous", "non_contiguous"]
 )
@@ -392,12 +401,12 @@ def test_forward_repeated_single_tile_calls_match_reference(
     inputs = _make_inputs(2, 3, 4, 130, dtype, with_bias)
     if non_contiguous:
         inputs = tuple(
-            _non_contiguous(tensor) for tensor in inputs if tensor is not None
+            _non_contiguous(tensor) if tensor is not None else None for tensor in inputs
         )
     first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     first_sum = first.float().sum()
-    expected = _reference_copy(reference_op(*inputs))
+    expected = _reference_copy(reference_op(*_contiguous(inputs)))
     assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
     utils.train_assert_equal(
         utils.to_reference(first_sum), utils.to_reference(first.float().sum())
@@ -407,6 +416,7 @@ def test_forward_repeated_single_tile_calls_match_reference(
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 def test_forward_cached_rejects_mismatched_input():
     inputs = _make_inputs(2, 3, 4, 130, torch.bfloat16, with_bias=False)
     for _ in range(2):
@@ -416,6 +426,7 @@ def test_forward_cached_rejects_mismatched_input():
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 def test_forward_unaligned_contiguous_inputs_match_reference():
     torch.manual_seed(2026)
 

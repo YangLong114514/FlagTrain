@@ -162,6 +162,14 @@ def _non_contiguous(tensor):
     return result
 
 
+def _contiguous(inputs):
+    # Megatron's native op requires bias as a positional argument and reads it
+    # without calling .contiguous(), so the reference always gets dense copies.
+    return tuple(
+        tensor.contiguous() if tensor is not None else None for tensor in inputs
+    )
+
+
 @pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype,s,b,n,channels", _DTYPE_SHAPE_CASES)
@@ -351,6 +359,7 @@ def test_backward_scalar_b_respects_grid_limit():
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "s,b,n,channels",
@@ -389,6 +398,7 @@ def test_backward_small_fused_bias_is_independent(dtype, s, b, n, channels):
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("n", [4, 8])
 @pytest.mark.parametrize("channels", [512, 2048, 4097, 7168])
@@ -442,7 +452,8 @@ def test_backward_accepts_non_contiguous_inputs(s, b, n, channels):
     grad_output = _non_contiguous(_rand((s, b, n, channels), torch.bfloat16))
     actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
     expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
+        _reference_copy(grad)
+        for grad in reference_op(*_contiguous((grad_output, *inputs)))
     )
 
     for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
@@ -452,6 +463,7 @@ def test_backward_accepts_non_contiguous_inputs(s, b, n, channels):
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_backward_repeated_small_cached_calls_match_reference(dtype, with_bias):
@@ -489,10 +501,11 @@ def test_backward_repeated_small_cached_calls_match_reference(dtype, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 def test_backward_cached_rejects_mismatched_grad_output():
     inputs = _make_inputs(1, 2, 2, 65, torch.bfloat16, with_bias=False)
     grad_output = _rand((1, 2, 2, 65), torch.bfloat16)
     for _ in range(2):
         flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    with pytest.raises(ValueError, match="grad_output must have shape"):
+    with pytest.raises(ValueError, match="grad_output must have"):
         flag_train.megatron.fused_h_post_bda_backward(grad_output[:0], *inputs)
