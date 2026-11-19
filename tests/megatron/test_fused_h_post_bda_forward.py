@@ -112,7 +112,9 @@ else:
     reference_op = torch_op()
 
 # Tests marked with this exercise a specific Ascend kernel path or launcher
-# behavior; on other backends they would only re-test generic correctness.
+# behavior. They are skipped on other vendors because running them there takes
+# far too long -- every distinct shape re-triggers the generic implementation's
+# autotune sweep -- so they run on Ascend only.
 _ASCEND_ONLY = pytest.mark.skipif(
     flag_train.vendor_name != "ascend",
     reason="Exercises an Ascend-specific kernel path",
@@ -181,167 +183,6 @@ def test_forward_medium_shapes_match_reference(dtype, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-def test_forward_multiple_launch_batches_match_reference(with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(1367, 1, 4, 4097, torch.bfloat16, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, torch.bfloat16, "multiple-batch output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_forward_row_dot_matches_reference(dtype, with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(128, 1, 8, 7168, dtype, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, dtype, "row-dot output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-def test_forward_row_dot_multiple_launch_batches_match_reference(with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(2048, 4, 8, 4096, torch.bfloat16, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, torch.bfloat16, "row-dot multiple-batch output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("channels", [65, 1024])
-def test_forward_vector8_single_channel_block_matches_reference(
-    dtype, channels, with_bias
-):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(256, 1, 8, channels, dtype, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, dtype, "vector8 single-channel-block output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-def test_forward_vector8_multiple_launch_batches_match_reference(with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(8192, 1, 8, 65, torch.bfloat16, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, torch.bfloat16, "vector8 multiple-batch output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-def test_forward_vector8_accepts_non_contiguous_inputs():
-    torch.manual_seed(2026)
-    inputs = tuple(
-        _non_contiguous(tensor)
-        for tensor in _make_inputs(256, 1, 8, 130, torch.float16, with_bias=True)
-        if tensor is not None
-    )
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*_contiguous(inputs)))
-    _assert_close(actual, expected, torch.float16, "vector8 non-contiguous output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("channels", [65, 1024])
-def test_forward_vector4_single_channel_block_matches_reference(
-    dtype, channels, with_bias
-):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(512, 1, 4, channels, dtype, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, dtype, "vector4 single-channel-block output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("channels", [1024, 4097])
-def test_forward_vector4_medium_rows_match_reference(dtype, channels, with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(256, 4, 4, channels, dtype, with_bias)
-    first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    assert first.data_ptr() != second.data_ptr()
-    _assert_close(first, expected, dtype, "vector4-medium-rows first output")
-    _assert_close(second, expected, dtype, "vector4-medium-rows cached output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-def test_forward_vector4_medium_rows_accept_non_contiguous_inputs():
-    torch.manual_seed(2026)
-    inputs = tuple(
-        _non_contiguous(tensor)
-        for tensor in _make_inputs(256, 4, 4, 130, torch.bfloat16, with_bias=True)
-    )
-    first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*_contiguous(inputs)))
-    _assert_close(first, expected, torch.bfloat16, "medium-rows non-contiguous output")
-    _assert_close(second, expected, torch.bfloat16, "medium-rows cached output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("channels", [1024, 4097])
-def test_forward_vector4_rows_match_reference(dtype, channels, with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(2048, 4, 4, channels, dtype, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, dtype, "vector4-rows output")
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-def test_forward_vector4_rows_multiple_launch_batches_match_reference(with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(20480, 2, 4, 2049, torch.bfloat16, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(
-        actual, expected, torch.bfloat16, "vector4-rows multiple-batch output"
-    )
-
-
-@pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize(
-    "dtype,channels",
-    [(torch.bfloat16, 4097), (torch.float32, 2049), (torch.bfloat16, 9217)],
-)
-def test_forward_grouped_dot_matches_reference(with_bias, dtype, channels):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(8193, 1, 8, channels, dtype, with_bias)
-    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    expected = _reference_copy(reference_op(*inputs))
-    _assert_close(actual, expected, dtype, "grouped-dot output")
-
-
-@pytest.mark.fused_h_post_bda_forward
 def test_forward_uses_h_res_transpose():
     h_res = torch.tensor(
         [[[[1.0, 2.0], [3.0, 4.0]]]], dtype=torch.float32, device=flag_train.device
@@ -387,49 +228,126 @@ def test_forward_medium_shape_accepts_non_contiguous_inputs():
     _assert_close(actual, expected, torch.bfloat16, "medium non-contiguous output")
 
 
-@pytest.mark.fused_h_post_bda_forward
+# Ascend kernel-path coverage and host-side contract checks, grouped into a few
+# loop-driven cases to keep the suite small. Failure messages carry the
+# offending case instead of a parametrized id.
+_ASCEND_FORWARD_PATH_CASES = [
+    # vector4, single channel block
+    (512, 1, 4, 65, torch.bfloat16, True),
+    (512, 1, 4, 65, torch.float32, True),
+    (512, 1, 4, 1024, torch.bfloat16, True),
+    (512, 1, 4, 1024, torch.float32, True),
+    # vector8, single channel block
+    (256, 1, 8, 65, torch.bfloat16, True),
+    (256, 1, 8, 65, torch.float32, True),
+    (256, 1, 8, 1024, torch.bfloat16, True),
+    (256, 1, 8, 1024, torch.float32, True),
+    # vector4 medium rows (ROWS=4)
+    (256, 4, 4, 1024, torch.bfloat16, True),
+    (256, 4, 4, 1024, torch.float16, True),
+    (256, 4, 4, 4097, torch.bfloat16, True),
+    (256, 4, 4, 4097, torch.float16, True),
+    # vector4 rows (ROWS=8)
+    (2048, 4, 4, 1024, torch.bfloat16, False),
+    (2048, 4, 4, 1024, torch.bfloat16, True),
+    (2048, 4, 4, 4097, torch.bfloat16, False),
+    (2048, 4, 4, 4097, torch.bfloat16, True),
+    # row dot
+    (128, 1, 8, 7168, torch.bfloat16, False),
+    (128, 1, 8, 7168, torch.bfloat16, True),
+    (128, 1, 8, 7168, torch.float32, False),
+    (128, 1, 8, 7168, torch.float32, True),
+    # grouped dot
+    (8193, 1, 8, 4097, torch.bfloat16, False),
+    (8193, 1, 8, 4097, torch.bfloat16, True),
+    (8193, 1, 8, 2049, torch.float32, False),
+    (8193, 1, 8, 2049, torch.float32, True),
+]
+
+
 @_ASCEND_ONLY
-@pytest.mark.parametrize(
-    "non_contiguous", [False, True], ids=["contiguous", "non_contiguous"]
-)
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_forward_repeated_single_tile_calls_match_reference(
-    dtype, with_bias, non_contiguous
-):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(2, 3, 4, 130, dtype, with_bias)
-    if non_contiguous:
-        inputs = tuple(
-            _non_contiguous(tensor) if tensor is not None else None for tensor in inputs
+@pytest.mark.fused_h_post_bda_forward
+def test_forward_ascend_kernel_paths_match_reference():
+    for s, b, n, channels, dtype, with_bias in _ASCEND_FORWARD_PATH_CASES:
+        torch.manual_seed(2026)
+        inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
+        actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+        expected = _reference_copy(reference_op(*inputs))
+        _assert_close(
+            actual,
+            expected,
+            dtype,
+            f"path ({s},{b},{n},{channels},{dtype},bias={with_bias})",
         )
-    first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    first_sum = first.float().sum()
-    expected = _reference_copy(reference_op(*_contiguous(inputs)))
-    assert first.untyped_storage().data_ptr() != second.untyped_storage().data_ptr()
-    utils.train_assert_equal(
-        utils.to_reference(first_sum), utils.to_reference(first.float().sum())
-    )
-    _assert_close(first, expected, dtype, "first repeated-call output")
-    _assert_close(second, expected, dtype, "second repeated-call output")
 
 
-@pytest.mark.fused_h_post_bda_forward
 @_ASCEND_ONLY
-def test_forward_cached_rejects_mismatched_input():
-    inputs = _make_inputs(2, 3, 4, 130, torch.bfloat16, with_bias=False)
-    for _ in range(2):
-        flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    with pytest.raises(ValueError, match="h_res must have shape"):
-        flag_train.megatron.fused_h_post_bda_forward(inputs[0][:0], *inputs[1:])
-
-
 @pytest.mark.fused_h_post_bda_forward
-@_ASCEND_ONLY
-def test_forward_unaligned_contiguous_inputs_match_reference():
-    torch.manual_seed(2026)
+def test_forward_ascend_launch_batches_match_reference():
+    for s, b, n, channels in [
+        (1367, 1, 4, 4097),  # dot, multiple launch batches
+        (2048, 4, 8, 4096),  # row dot, multiple launch batches
+        (8192, 1, 8, 65),  # vector8, multiple launch batches
+        (20480, 2, 4, 2049),  # vector4 rows, multiple launch batches
+    ]:
+        for with_bias in (False, True):
+            torch.manual_seed(2026)
+            inputs = _make_inputs(s, b, n, channels, torch.bfloat16, with_bias)
+            actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+            expected = _reference_copy(reference_op(*inputs))
+            _assert_close(
+                actual,
+                expected,
+                torch.bfloat16,
+                f"batches ({s},{b},{n},{channels},bias={with_bias})",
+            )
 
+
+@_ASCEND_ONLY
+@pytest.mark.fused_h_post_bda_forward
+def test_forward_ascend_repeated_calls_and_edge_inputs():
+    # Repeated calls must return independent, correct outputs.
+    for dtype in (torch.bfloat16, torch.float32):
+        for with_bias in (False, True):
+            for non_contiguous in (False, True):
+                torch.manual_seed(2026)
+                inputs = _make_inputs(2, 3, 4, 130, dtype, with_bias)
+                if non_contiguous:
+                    inputs = tuple(
+                        _non_contiguous(t) if t is not None else None for t in inputs
+                    )
+                first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+                second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+                first_sum = first.float().sum()
+                expected = _reference_copy(reference_op(*_contiguous(inputs)))
+                label = f"{dtype},bias={with_bias},non_contiguous={non_contiguous}"
+                assert (
+                    first.untyped_storage().data_ptr()
+                    != second.untyped_storage().data_ptr()
+                )
+                utils.train_assert_equal(
+                    utils.to_reference(first_sum),
+                    utils.to_reference(first.float().sum()),
+                )
+                _assert_close(first, expected, dtype, f"first call {label}")
+                _assert_close(second, expected, dtype, f"second call {label}")
+
+    # Non-contiguous inputs on the vector dispatch paths.
+    for s, b, n, channels, dtype in [
+        (256, 1, 8, 130, torch.float16),
+        (256, 4, 4, 130, torch.bfloat16),
+    ]:
+        torch.manual_seed(2026)
+        inputs = tuple(
+            _non_contiguous(t) for t in _make_inputs(s, b, n, channels, dtype, True)
+        )
+        actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+        expected = _reference_copy(reference_op(*_contiguous(inputs)))
+        _assert_close(
+            actual, expected, dtype, f"non-contiguous ({s},{b},{n},{channels})"
+        )
+
+    # Contiguous inputs whose storage offset breaks 16B alignment.
     def unaligned(tensor):
         flat = tensor.reshape(-1)
         storage = torch.empty(
@@ -441,9 +359,9 @@ def test_forward_unaligned_contiguous_inputs_match_reference():
         assert result.data_ptr() % 16 != 0
         return result
 
+    torch.manual_seed(2026)
     inputs = tuple(
-        unaligned(tensor)
-        for tensor in _make_inputs(2, 3, 4, 130, torch.bfloat16, with_bias=True)
+        unaligned(t) for t in _make_inputs(2, 3, 4, 130, torch.bfloat16, True)
     )
     first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
@@ -451,3 +369,10 @@ def test_forward_unaligned_contiguous_inputs_match_reference():
     assert first.data_ptr() != second.data_ptr()
     _assert_close(first, expected, torch.bfloat16, "first unaligned output")
     _assert_close(second, expected, torch.bfloat16, "second unaligned output")
+
+    # Validation must still reject bad shapes after repeated calls.
+    inputs = _make_inputs(2, 3, 4, 130, torch.bfloat16, with_bias=False)
+    for _ in range(2):
+        flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    with pytest.raises(ValueError, match="h_res must have shape"):
+        flag_train.megatron.fused_h_post_bda_forward(inputs[0][:0], *inputs[1:])

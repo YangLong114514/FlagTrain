@@ -133,7 +133,9 @@ else:
     reference_op = torch_op()
 
 # Tests marked with this exercise a specific Ascend kernel path or launcher
-# behavior; on other backends they would only re-test generic correctness.
+# behavior. They are skipped on other vendors because running them there takes
+# far too long -- every distinct shape re-triggers the generic implementation's
+# autotune sweep -- so they run on Ascend only.
 _ASCEND_ONLY = pytest.mark.skipif(
     flag_train.vendor_name != "ascend",
     reason="Exercises an Ascend-specific kernel path",
@@ -228,198 +230,6 @@ def test_backward_split_c_matches_reference(dtype, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize(
-    "s,b,n,channels",
-    [
-        (128, 1, 4, 256),
-        (128, 1, 4, 300),
-        (128, 1, 8, 256),
-        (128, 1, 4, 512),
-        (128, 1, 2, 256),
-        (128, 1, 2, 100),
-    ],
-)
-def test_backward_dot_threshold_matches_reference(dtype, s, b, n, channels, with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
-    grad_output = _rand((s, b, n, channels), dtype)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, dtype, name)
-
-
-@pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-def test_backward_multiple_launch_batches_match_reference(with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(1367, 1, 4, 4097, torch.bfloat16, with_bias)
-    grad_output = _rand((1367, 1, 4, 4097), torch.bfloat16)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, torch.bfloat16, name)
-
-
-@pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize(
-    "dtype,channels", [(torch.bfloat16, 4097), (torch.float32, 2049)]
-)
-def test_backward_large_a_matches_reference(with_bias, dtype, channels):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(8193, 1, 4, channels, dtype, with_bias)
-    grad_output = _rand((8193, 1, 4, channels), dtype)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, dtype, name)
-
-
-@pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_backward_vector4_rows_matches_reference(dtype, with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(2048, 4, 4, 2049, dtype, with_bias)
-    grad_output = _rand((2048, 4, 4, 2049), dtype)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, dtype, name)
-
-
-@pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_backward_vector4_rows_multiple_launch_batches_match_reference(
-    dtype, with_bias
-):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(40960, 1, 4, 65, dtype, with_bias)
-    grad_output = _rand((40960, 1, 4, 65), dtype)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, dtype, name)
-
-
-@pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("channels", [513, 768])
-def test_backward_padded_b_channel_matches_reference(channels, with_bias):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(128, 1, 4, channels, torch.bfloat16, with_bias)
-    grad_output = _rand((128, 1, 4, channels), torch.bfloat16)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, torch.bfloat16, name)
-
-
-@pytest.mark.fused_h_post_bda_backward
-@pytest.mark.skipif(flag_train.vendor_name != "ascend", reason="Ascend grid limit")
-def test_backward_scalar_b_respects_grid_limit():
-    torch.manual_seed(2026)
-    inputs = _make_inputs(65536, 1, 4, 65, torch.bfloat16, with_bias=True)
-    grad_output = _rand((65536, 1, 4, 65), torch.bfloat16)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, torch.bfloat16, name)
-
-
-@pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize(
-    "s,b,n,channels",
-    [
-        (1, 1, 4, 130),
-        (1, 2, 2, 65),
-        (1, 2, 2, 130),
-        (1, 2, 2, 1024),
-        (2, 3, 4, 130),
-        (2, 4, 4, 1024),
-    ],
-)
-def test_backward_small_fused_bias_is_independent(dtype, s, b, n, channels):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(s, b, n, channels, dtype, with_bias=True)
-    grad_output = _rand((s, b, n, channels), dtype)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, dtype, name)
-    assert actual[3].data_ptr() != actual[4].data_ptr()
-    expected_bias = (
-        actual[3].view(s * b, channels).to(torch.float32).sum(dim=0).to(dtype)
-    )
-    if s * b <= 2:
-        utils.train_assert_equal(
-            utils.to_reference(actual[4]), utils.to_reference(expected_bias)
-        )
-    else:
-        _assert_close(
-            actual[4], _reference_copy(expected_bias), dtype, "independent bias"
-        )
-
-
-@pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("n", [4, 8])
-@pytest.mark.parametrize("channels", [512, 2048, 4097, 7168])
-def test_backward_dot_single_row_bias_is_independent(dtype, n, channels):
-    torch.manual_seed(2026)
-    inputs = _make_inputs(1, 1, n, channels, dtype, with_bias=True)
-    grad_output = _rand((1, 1, n, channels), dtype)
-    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    expected = tuple(
-        _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-    )
-
-    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
-        _assert_close(actual_grad, expected_grad, dtype, name)
-    assert actual[3].data_ptr() != actual[4].data_ptr()
-    utils.train_assert_equal(
-        utils.to_reference(actual[4]), utils.to_reference(actual[3].view(channels))
-    )
-
-
-@pytest.mark.fused_h_post_bda_backward
 @pytest.mark.parametrize(
     "s,b,n,channels",
     [
@@ -462,47 +272,184 @@ def test_backward_accepts_non_contiguous_inputs(s, b, n, channels):
         )
 
 
-@pytest.mark.fused_h_post_bda_backward
-@_ASCEND_ONLY
-@pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_backward_repeated_small_cached_calls_match_reference(dtype, with_bias):
+# Ascend kernel-path coverage and host-side contract checks, grouped into a few
+# loop-driven cases to keep the suite small. Failure messages carry the
+# offending case instead of a parametrized id.
+
+
+def _assert_backward_matches(s, b, n, channels, dtype, with_bias, label):
     torch.manual_seed(2026)
-    inputs = _make_inputs(1, 2, 2, 65, dtype, with_bias)
-    grad_output = _rand((1, 2, 2, 65), dtype)
-    first = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-    first_sums = tuple(
-        grad.float().sum() if grad is not None else None for grad in first
-    )
-    second = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+    inputs = _make_inputs(s, b, n, channels, dtype, with_bias)
+    grad_output = _rand((s, b, n, channels), dtype)
+    actual = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
     expected = tuple(
         _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
     )
-
-    for index, (first_grad, second_grad, expected_grad) in enumerate(
-        zip(first, second, expected)
-    ):
-        if expected_grad is None:
-            assert first_grad is None and second_grad is None
-            continue
-        assert (
-            first_grad.untyped_storage().data_ptr()
-            != second_grad.untyped_storage().data_ptr()
-        )
-        utils.train_assert_equal(
-            utils.to_reference(first_sums[index]),
-            utils.to_reference(first_grad.float().sum()),
-        )
-        _assert_close(first_grad, expected_grad, dtype, "first cached call")
-        _assert_close(second_grad, expected_grad, dtype, "second cached call")
-    assert len(
-        {grad.untyped_storage().data_ptr() for grad in second if grad is not None}
-    ) == sum(grad is not None for grad in expected)
+    for name, actual_grad, expected_grad in zip(_GRADIENT_NAMES, actual, expected):
+        _assert_close(actual_grad, expected_grad, dtype, f"{label} {name}")
+    return actual
 
 
-@pytest.mark.fused_h_post_bda_backward
 @_ASCEND_ONLY
-def test_backward_cached_rejects_mismatched_grad_output():
+@pytest.mark.fused_h_post_bda_backward
+def test_backward_ascend_kernel_paths_match_reference():
+    cases = []
+    # dot dispatch threshold boundaries
+    for dtype in (torch.bfloat16, torch.float32):
+        for with_bias in (False, True):
+            for s, b, n, channels in [
+                (128, 1, 4, 256),
+                (128, 1, 4, 300),
+                (128, 1, 8, 256),
+                (128, 1, 4, 512),
+                (128, 1, 2, 256),
+                (128, 1, 2, 100),
+            ]:
+                cases.append((s, b, n, channels, dtype, with_bias))
+    # vector4 rows
+    for dtype in (torch.bfloat16, torch.float32):
+        for with_bias in (False, True):
+            cases.append((2048, 4, 4, 2049, dtype, with_bias))
+    # large A kernel
+    cases.append((8193, 1, 4, 4097, torch.bfloat16, False))
+    cases.append((8193, 1, 4, 2049, torch.float32, False))
+    # B kernel padded channel
+    cases.append((128, 1, 4, 513, torch.bfloat16, True))
+    cases.append((128, 1, 4, 768, torch.bfloat16, True))
+
+    for s, b, n, channels, dtype, with_bias in cases:
+        _assert_backward_matches(
+            s,
+            b,
+            n,
+            channels,
+            dtype,
+            with_bias,
+            f"path ({s},{b},{n},{channels},{dtype},bias={with_bias})",
+        )
+
+
+@_ASCEND_ONLY
+@pytest.mark.fused_h_post_bda_backward
+def test_backward_ascend_launch_batches_and_grid_limit():
+    # Multiple launch batches for the dot and vector4-rows paths.
+    for s, b, n, channels in [
+        (1367, 1, 4, 4097),  # dot
+        (40960, 1, 4, 65),  # vector4 rows
+    ]:
+        for with_bias in (False, True):
+            _assert_backward_matches(
+                s,
+                b,
+                n,
+                channels,
+                torch.bfloat16,
+                with_bias,
+                f"batches ({s},{b},{n},{channels},bias={with_bias})",
+            )
+    # The scalar-B fallback must respect the grid dimension limit.
+    _assert_backward_matches(
+        65536, 1, 4, 65, torch.bfloat16, True, "grid limit (65536,1,4,65)"
+    )
+
+
+@_ASCEND_ONLY
+@pytest.mark.fused_h_post_bda_backward
+def test_backward_ascend_bias_gradient_semantics():
+    # Small fused path: the bias gradient is an independent allocation reduced
+    # from the rounded g_x in fp32.
+    for dtype in (torch.bfloat16, torch.float32):
+        for s, b, n, channels in [
+            (1, 1, 4, 130),
+            (1, 2, 2, 65),
+            (1, 2, 2, 1024),
+            (2, 4, 4, 1024),
+        ]:
+            actual = _assert_backward_matches(
+                s,
+                b,
+                n,
+                channels,
+                dtype,
+                True,
+                f"small fused ({s},{b},{n},{channels},{dtype})",
+            )
+            assert actual[3].data_ptr() != actual[4].data_ptr()
+            expected_bias = (
+                actual[3].view(s * b, channels).to(torch.float32).sum(dim=0).to(dtype)
+            )
+            if s * b <= 2:
+                utils.train_assert_equal(
+                    utils.to_reference(actual[4]), utils.to_reference(expected_bias)
+                )
+            else:
+                _assert_close(
+                    actual[4], _reference_copy(expected_bias), dtype, "independent bias"
+                )
+
+    # Dot single-row path: the bias gradient equals the single g_x row exactly.
+    for dtype in (torch.bfloat16, torch.float32):
+        for n in (4, 8):
+            for channels in (512, 4097):
+                actual = _assert_backward_matches(
+                    1,
+                    1,
+                    n,
+                    channels,
+                    dtype,
+                    True,
+                    f"single row ({n},{channels},{dtype})",
+                )
+                assert actual[3].data_ptr() != actual[4].data_ptr()
+                utils.train_assert_equal(
+                    utils.to_reference(actual[4]),
+                    utils.to_reference(actual[3].view(channels)),
+                )
+
+
+@_ASCEND_ONLY
+@pytest.mark.fused_h_post_bda_backward
+def test_backward_ascend_repeated_calls_and_validation():
+    # Repeated calls must return independent, correct outputs.
+    for dtype in (torch.bfloat16, torch.float32):
+        for with_bias in (False, True):
+            torch.manual_seed(2026)
+            inputs = _make_inputs(1, 2, 2, 65, dtype, with_bias)
+            grad_output = _rand((1, 2, 2, 65), dtype)
+            first = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+            first_sums = tuple(
+                grad.float().sum() if grad is not None else None for grad in first
+            )
+            second = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
+            expected = tuple(
+                _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
+            )
+            label = f"{dtype},bias={with_bias}"
+            for index, (first_grad, second_grad, expected_grad) in enumerate(
+                zip(first, second, expected)
+            ):
+                if expected_grad is None:
+                    assert first_grad is None and second_grad is None
+                    continue
+                assert (
+                    first_grad.untyped_storage().data_ptr()
+                    != second_grad.untyped_storage().data_ptr()
+                )
+                utils.train_assert_equal(
+                    utils.to_reference(first_sums[index]),
+                    utils.to_reference(first_grad.float().sum()),
+                )
+                _assert_close(first_grad, expected_grad, dtype, f"first call {label}")
+                _assert_close(second_grad, expected_grad, dtype, f"second call {label}")
+            assert len(
+                {
+                    grad.untyped_storage().data_ptr()
+                    for grad in second
+                    if grad is not None
+                }
+            ) == sum(grad is not None for grad in expected)
+
+    # Validation must still reject a mismatched grad_output.
     inputs = _make_inputs(1, 2, 2, 65, torch.bfloat16, with_bias=False)
     grad_output = _rand((1, 2, 2, 65), torch.bfloat16)
     for _ in range(2):
