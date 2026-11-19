@@ -132,6 +132,13 @@ if flag_train.vendor_name == "ascend":
 else:
     reference_op = torch_op()
 
+# Tests marked with this exercise a specific Ascend kernel path or launcher
+# behavior; on other backends they would only re-test generic correctness.
+_ASCEND_ONLY = pytest.mark.skipif(
+    flag_train.vendor_name != "ascend",
+    reason="Exercises an Ascend-specific kernel path",
+)
+
 
 def _assert_close(actual, expected, dtype, name):
     if actual is None or expected is None:
@@ -213,6 +220,7 @@ def test_backward_split_c_matches_reference(dtype, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
@@ -240,6 +248,7 @@ def test_backward_dot_threshold_matches_reference(dtype, s, b, n, channels, with
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 def test_backward_multiple_launch_batches_match_reference(with_bias):
     torch.manual_seed(2026)
@@ -255,6 +264,7 @@ def test_backward_multiple_launch_batches_match_reference(with_bias):
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize(
     "dtype,channels", [(torch.bfloat16, 4097), (torch.float32, 2049)]
@@ -273,6 +283,7 @@ def test_backward_large_a_matches_reference(with_bias, dtype, channels):
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_backward_vector4_rows_matches_reference(dtype, with_bias):
@@ -289,6 +300,7 @@ def test_backward_vector4_rows_matches_reference(dtype, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_backward_vector4_rows_multiple_launch_batches_match_reference(
@@ -307,6 +319,7 @@ def test_backward_vector4_rows_multiple_launch_batches_match_reference(
 
 
 @pytest.mark.fused_h_post_bda_backward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("channels", [513, 768])
 def test_backward_padded_b_channel_matches_reference(channels, with_bias):

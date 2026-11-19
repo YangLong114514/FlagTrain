@@ -111,6 +111,13 @@ if flag_train.vendor_name == "ascend":
 else:
     reference_op = torch_op()
 
+# Tests marked with this exercise a specific Ascend kernel path or launcher
+# behavior; on other backends they would only re-test generic correctness.
+_ASCEND_ONLY = pytest.mark.skipif(
+    flag_train.vendor_name != "ascend",
+    reason="Exercises an Ascend-specific kernel path",
+)
+
 
 def _assert_close(actual, expected, dtype, name):
     atol, _ = _tolerances(dtype)
@@ -166,6 +173,7 @@ def test_forward_medium_shapes_match_reference(dtype, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 def test_forward_multiple_launch_batches_match_reference(with_bias):
     torch.manual_seed(2026)
@@ -176,6 +184,7 @@ def test_forward_multiple_launch_batches_match_reference(with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_forward_row_dot_matches_reference(dtype, with_bias):
@@ -187,6 +196,7 @@ def test_forward_row_dot_matches_reference(dtype, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 def test_forward_row_dot_multiple_launch_batches_match_reference(with_bias):
     torch.manual_seed(2026)
@@ -197,6 +207,7 @@ def test_forward_row_dot_multiple_launch_batches_match_reference(with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("channels", [65, 1024])
@@ -211,6 +222,7 @@ def test_forward_vector8_single_channel_block_matches_reference(
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 def test_forward_vector8_multiple_launch_batches_match_reference(with_bias):
     torch.manual_seed(2026)
@@ -221,6 +233,7 @@ def test_forward_vector8_multiple_launch_batches_match_reference(with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 def test_forward_vector8_accepts_non_contiguous_inputs():
     torch.manual_seed(2026)
     inputs = tuple(
@@ -234,6 +247,7 @@ def test_forward_vector8_accepts_non_contiguous_inputs():
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("channels", [65, 1024])
@@ -248,6 +262,7 @@ def test_forward_vector4_single_channel_block_matches_reference(
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("channels", [1024, 4097])
@@ -263,6 +278,7 @@ def test_forward_vector4_medium_rows_match_reference(dtype, channels, with_bias)
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 def test_forward_vector4_medium_rows_accept_non_contiguous_inputs():
     torch.manual_seed(2026)
     inputs = tuple(
@@ -277,6 +293,7 @@ def test_forward_vector4_medium_rows_accept_non_contiguous_inputs():
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("channels", [1024, 4097])
@@ -289,6 +306,7 @@ def test_forward_vector4_rows_match_reference(dtype, channels, with_bias):
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 def test_forward_vector4_rows_multiple_launch_batches_match_reference(with_bias):
     torch.manual_seed(2026)
@@ -301,6 +319,7 @@ def test_forward_vector4_rows_multiple_launch_batches_match_reference(with_bias)
 
 
 @pytest.mark.fused_h_post_bda_forward
+@_ASCEND_ONLY
 @pytest.mark.parametrize("with_bias", [False, True], ids=["no_bias", "with_bias"])
 @pytest.mark.parametrize(
     "dtype,channels",
