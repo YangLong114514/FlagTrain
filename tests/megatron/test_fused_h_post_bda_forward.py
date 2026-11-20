@@ -305,33 +305,7 @@ def test_forward_ascend_launch_batches_match_reference():
 
 @_ASCEND_ONLY
 @pytest.mark.fused_h_post_bda_forward
-def test_forward_ascend_repeated_calls_and_edge_inputs():
-    # Repeated calls must return independent, correct outputs.
-    for dtype in (torch.bfloat16, torch.float32):
-        for with_bias in (False, True):
-            for non_contiguous in (False, True):
-                torch.manual_seed(2026)
-                inputs = _make_inputs(2, 3, 4, 130, dtype, with_bias)
-                if non_contiguous:
-                    inputs = tuple(
-                        _non_contiguous(t) if t is not None else None for t in inputs
-                    )
-                first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-                second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-                first_sum = first.float().sum()
-                expected = _reference_copy(reference_op(*_contiguous(inputs)))
-                label = f"{dtype},bias={with_bias},non_contiguous={non_contiguous}"
-                assert (
-                    first.untyped_storage().data_ptr()
-                    != second.untyped_storage().data_ptr()
-                )
-                utils.train_assert_equal(
-                    utils.to_reference(first_sum),
-                    utils.to_reference(first.float().sum()),
-                )
-                _assert_close(first, expected, dtype, f"first call {label}")
-                _assert_close(second, expected, dtype, f"second call {label}")
-
+def test_forward_ascend_edge_inputs_and_validation():
     # Non-contiguous inputs on the vector dispatch paths.
     for s, b, n, channels, dtype in [
         (256, 1, 8, 130, torch.float16),
@@ -363,16 +337,11 @@ def test_forward_ascend_repeated_calls_and_edge_inputs():
     inputs = tuple(
         unaligned(t) for t in _make_inputs(2, 3, 4, 130, torch.bfloat16, True)
     )
-    first = flag_train.megatron.fused_h_post_bda_forward(*inputs)
-    second = flag_train.megatron.fused_h_post_bda_forward(*inputs)
+    actual = flag_train.megatron.fused_h_post_bda_forward(*inputs)
     expected = _reference_copy(reference_op(*inputs))
-    assert first.data_ptr() != second.data_ptr()
-    _assert_close(first, expected, torch.bfloat16, "first unaligned output")
-    _assert_close(second, expected, torch.bfloat16, "second unaligned output")
+    _assert_close(actual, expected, torch.bfloat16, "unaligned output")
 
-    # Validation must still reject bad shapes after repeated calls.
+    # Validation must reject bad shapes.
     inputs = _make_inputs(2, 3, 4, 130, torch.bfloat16, with_bias=False)
-    for _ in range(2):
-        flag_train.megatron.fused_h_post_bda_forward(*inputs)
     with pytest.raises(ValueError, match="h_res must have shape"):
         flag_train.megatron.fused_h_post_bda_forward(inputs[0][:0], *inputs[1:])

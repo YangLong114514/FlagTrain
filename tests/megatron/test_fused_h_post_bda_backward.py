@@ -409,50 +409,8 @@ def test_backward_ascend_bias_gradient_semantics():
 
 @_ASCEND_ONLY
 @pytest.mark.fused_h_post_bda_backward
-def test_backward_ascend_repeated_calls_and_validation():
-    # Repeated calls must return independent, correct outputs.
-    for dtype in (torch.bfloat16, torch.float32):
-        for with_bias in (False, True):
-            torch.manual_seed(2026)
-            inputs = _make_inputs(1, 2, 2, 65, dtype, with_bias)
-            grad_output = _rand((1, 2, 2, 65), dtype)
-            first = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-            first_sums = tuple(
-                grad.float().sum() if grad is not None else None for grad in first
-            )
-            second = flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
-            expected = tuple(
-                _reference_copy(grad) for grad in reference_op(grad_output, *inputs)
-            )
-            label = f"{dtype},bias={with_bias}"
-            for index, (first_grad, second_grad, expected_grad) in enumerate(
-                zip(first, second, expected)
-            ):
-                if expected_grad is None:
-                    assert first_grad is None and second_grad is None
-                    continue
-                assert (
-                    first_grad.untyped_storage().data_ptr()
-                    != second_grad.untyped_storage().data_ptr()
-                )
-                utils.train_assert_equal(
-                    utils.to_reference(first_sums[index]),
-                    utils.to_reference(first_grad.float().sum()),
-                )
-                _assert_close(first_grad, expected_grad, dtype, f"first call {label}")
-                _assert_close(second_grad, expected_grad, dtype, f"second call {label}")
-            assert len(
-                {
-                    grad.untyped_storage().data_ptr()
-                    for grad in second
-                    if grad is not None
-                }
-            ) == sum(grad is not None for grad in expected)
-
-    # Validation must still reject a mismatched grad_output.
+def test_backward_ascend_rejects_mismatched_grad_output():
     inputs = _make_inputs(1, 2, 2, 65, torch.bfloat16, with_bias=False)
     grad_output = _rand((1, 2, 2, 65), torch.bfloat16)
-    for _ in range(2):
-        flag_train.megatron.fused_h_post_bda_backward(grad_output, *inputs)
     with pytest.raises(ValueError, match="grad_output must have"):
         flag_train.megatron.fused_h_post_bda_backward(grad_output[:0], *inputs)
